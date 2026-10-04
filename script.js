@@ -2,16 +2,8 @@ const GFX_FONTS = { "__glcd": "AAAAAAA+W09bPj5rT2s+HD58PhwYPH48GBxXfVccHF5/XhwAG
 
 (() => {
     // ---------- state ----------
-    const LESSON1 = [
-        { t: 'rect', fill: false, x: 10, y: 10, w: 60, h: 40, c: 0xFFFF },
-        { t: 'rect', fill: true, x: 100, y: 10, w: 60, h: 40, c: 0xF800 },
-        { t: 'rrect', fill: true, x: 10, y: 70, w: 150, h: 40, r: 10, c: 0x07E0 },
-        { t: 'circle', fill: false, x: 86, y: 170, r: 30, c: 0xFFFF },
-        { t: 'circle', fill: true, x: 86, y: 170, r: 10, c: 0x001F },
-        { t: 'line', x0: 0, y0: 220, x1: 171, y1: 260, c: 0xFFE0 },
-        { t: 'tri', fill: true, x0: 86, y0: 270, x1: 60, y1: 310, x2: 112, y2: 310, c: 0xF81F },
-    ];
-    const S = { W: 172, H: 320, bg: 0x0000, shapes: LESSON1, sel: -1, tool: 'select', fill: false, color: 0xFFFF, radius: 8, zoom: 'auto', grid: true, codeMode: 'snippet', textFont: '', textSize: 2 };
+    const START = [];
+    const S = { W: 172, H: 320, bg: 0x0000, shapes: START, sel: -1, tool: 'select', fill: false, color: 0xFFFF, radius: 8, zoom: 'auto', grid: true, codeMode: 'snippet', textFont: '', textSize: 2 };
     const KEY = 'lcd-canvas-builder-v1';
     try { const d = JSON.parse(localStorage.getItem(KEY) || 'null'); if (d && Array.isArray(d.shapes)) Object.assign(S, d, { sel: -1 }); } catch (e) { }
     function save() { try { const { sel, ...rest } = S; localStorage.setItem(KEY, JSON.stringify(rest)); } catch (e) { } }
