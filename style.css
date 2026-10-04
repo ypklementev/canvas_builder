@@ -1,5 +1,6 @@
 /* Layout: tool rail | LCD stage in a bezel | inspector + live code. Stacks on phones. */
 @import url(https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap);
+
 :root {
     color-scheme: light;
     box-sizing: border-box;
@@ -27,6 +28,7 @@ img {
     display: none !important
 }
 
+/* Layout: tool rail | LCD stage in a bezel | inspector + live code. Stacks on phones. */
 :root {
     --bg: #e9ecf1;
     --panel: #f7f8fb;
@@ -43,6 +45,7 @@ img {
     --fn: #2f5fd0;
     --cm: #7b8496;
     --danger: #c23b3b;
+    --str: #1f7a4d;
     --sans: "IBM Plex Sans", system-ui, sans-serif;
     --mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
 }
@@ -64,6 +67,7 @@ img {
         --fn: #8fb0ff;
         --cm: #6f788a;
         --danger: #ff7a7a;
+        --str: #7fd1a2;
         color-scheme: dark
     }
 }
@@ -84,6 +88,7 @@ img {
     --fn: #8fb0ff;
     --cm: #6f788a;
     --danger: #ff7a7a;
+    --str: #7fd1a2;
     color-scheme: dark
 }
 
@@ -440,6 +445,25 @@ input[type=color] {
     color: var(--muted)
 }
 
+.txt {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 10px
+}
+
+.txt textarea {
+    min-height: 64px
+}
+
+.msg.warn {
+    color: var(--danger)
+}
+
+.msg.warn:empty {
+    display: none
+}
+
 .align {
     display: flex;
     gap: 4px;
@@ -514,6 +538,10 @@ input[type=color] {
 
 .t-fn {
     color: var(--fn)
+}
+
+.t-s {
+    color: var(--str)
 }
 
 .t-n {
