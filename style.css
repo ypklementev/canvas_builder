@@ -859,6 +859,75 @@ details summary {
     font-style: italic
 }
 
+/* board */
+.live-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--line);
+    flex: none
+}
+
+.live-dot[data-s=on] {
+    background: #2fa36b
+}
+
+.live-dot[data-s=warn] {
+    background: #e0a020
+}
+
+dialog#rxDlg {
+    width: min(760px, calc(100vw - 32px));
+    max-height: calc(100vh - 48px);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--panel);
+    color: var(--fg);
+    padding: 14px 16px;
+    display: none;
+    flex-direction: column;
+    gap: 10px
+}
+
+dialog#rxDlg[open] {
+    display: flex
+}
+
+dialog#rxDlg::backdrop {
+    background: rgba(0, 0, 0, .45)
+}
+
+.dlg-head {
+    display: flex;
+    gap: 8px;
+    align-items: center
+}
+
+.dlg-head .grow {
+    flex: 1
+}
+
+.dlg-head h2 {
+    font-size: 14px;
+    margin: 0
+}
+
+.dlg-code {
+    margin: 0;
+    padding: 10px 12px;
+    max-height: 60vh;
+    flex: 1
+}
+
+/* project fonts */
+.font-row {
+    gap: 6px
+}
+
+.font-row .grow {
+    flex: 1
+}
+
 @media (max-width:980px) {
 
     html,

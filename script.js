@@ -6,7 +6,7 @@
     // assets: {id: dataURL} of uploaded pictures, shape.src points here; not part of undo snapshots, so history stays small
     const START = [];
     const blankScreen = name => ({ name, shapes: [], groups: [], bg: 0x0000, bgPc: '' });
-    const S = { W: 172, H: 320, screens: [Object.assign(blankScreen('Main'), { shapes: START })], cur: 0, palette: [], assets: {}, nextG: 1, sel: [], tool: 'select', fill: false, color: 0xFFFF, colorPc: '', radius: 8, zoom: 'auto', grid: true, codeMode: 'snippet', textFont: '', textSize: 2, coordConsts: false, imgHeader: false };
+    const S = { W: 172, H: 320, screens: [Object.assign(blankScreen('Main'), { shapes: START })], cur: 0, palette: [], assets: {}, nextG: 1, sel: [], tool: 'select', fill: false, color: 0xFFFF, colorPc: '', radius: 8, zoom: 'auto', grid: true, codeMode: 'snippet', textFont: '', textSize: 2, coordConsts: false, imgHeader: false, fonts: [] };
     for (const k of ['shapes', 'groups', 'bg', 'bgPc']) Object.defineProperty(S, k, { get: () => S.screens[S.cur][k], set: v => { S.screens[S.cur][k] = v; }, enumerable: false });
     const KEY = 'lcd-canvas-builder-v3', OLD_KEYS = ['lcd-canvas-builder-v2', 'lcd-canvas-builder-v1'];
     try {
@@ -126,6 +126,7 @@
     }
     // ---------- text (same drawChar logic as Adafruit GFX) ----------
     const b64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+    const utf8 = new TextEncoder();
     const GLCD = b64(GFX_FONTS.__glcd);
     const FONT_DATA = {};
     for (const k in GFX_FONTS) {
@@ -133,21 +134,34 @@
         for (const g of f.g) if (g[1] && g[2]) { asc = Math.max(asc, -g[5]); desc = Math.max(desc, g[5] + g[2]); }
         FONT_DATA[k] = { first: f.f, last: f.l, ya: f.y, bmp: b64(f.b), g: f.g, asc, desc };
     }
-    function supported(font, ch) { const c = ch.charCodeAt(0); if (!font || !FONT_DATA[font]) return c >= 32 && c <= 126; const F = FONT_DATA[font]; return c >= F.first && c <= F.last; }
+    // project fonts (made from TTF/OTF) are CP1251: a character's code is the byte cp1251() gives on the board; unknown → '?'
+    const CP = new Map(); { const dec = new TextDecoder('windows-1251'); for (let b = 0x20; b <= 0xFF; b++) { const ch = dec.decode(Uint8Array.of(b)); if (b !== 0x7F && !(ch >= '\x80' && ch <= '\x9F')) CP.set(ch, b); } }
+    function registerFont(f) {
+        let asc = 0, desc = 0; for (const g of f.g) if (g[1] && g[2]) { asc = Math.max(asc, -g[5]); desc = Math.max(desc, g[5] + g[2]); }
+        FONT_DATA[f.n] = { first: f.f, last: f.l, ya: f.y, bmp: b64(f.b), g: f.g, asc, desc, cp: true, custom: true };
+    }
+    S.fonts.forEach(registerFont);
+    const codeOf = (F, ch) => F.cp ? (CP.get(ch) ?? -1) : ch.charCodeAt(0);
+    const glyphOf = (F, ch) => F.g[codeOf(F, ch) - F.first];
+    // the bytes write() gets: UTF-8 for the built-in and Adafruit fonts, CP1251 (after cp1251()) for project fonts
+    const fontBytes = (F, str) => F && F.cp ? [...str].map(ch => CP.get(ch) ?? 0x3F) : utf8.encode(str);
+    function supported(font, ch) {
+        const c = ch.charCodeAt(0); if (!font || !FONT_DATA[font]) return c >= 32 && c <= 126;
+        const F = FONT_DATA[font], g = glyphOf(F, ch); return !!g && (!F.cp || g[1] > 0 || g[3] > 0);
+    }
     function cleanText(font, t) { return [...t].filter(ch => ch === '\n' || supported(font, ch)).join(''); }
     function measureStr(font, size, str) {
         if (!str.length) return { l: 0, w: 0 };
         if (!font || !FONT_DATA[font]) return { l: 0, w: str.length * 6 * size - size };
         const F = FONT_DATA[font]; let x = 0, mn = Infinity, mx = -Infinity;
-        for (const ch of str) { const g = F.g[ch.charCodeAt(0) - F.first]; if (!g) continue; if (g[1] && g[2]) { mn = Math.min(mn, x + g[4]); mx = Math.max(mx, x + g[4] + g[1]); } x += g[3]; }
+        for (const ch of str) { const g = glyphOf(F, ch); if (!g) continue; if (g[1] && g[2]) { mn = Math.min(mn, x + g[4]); mx = Math.max(mx, x + g[4] + g[1]); } x += g[3]; }
         return mn === Infinity ? { l: 0, w: 0 } : { l: mn * size, w: (mx - mn) * size };
     }
     // how far print() moves the cursor: write() gets UTF-8 bytes; built-in font: 6 × size per byte, GFXfont: xAdvance × size, bytes outside first..last don't move it; '\r' is ignored
-    const utf8 = new TextEncoder();
     function advanceStr(font, size, str) {
-        const bytes = utf8.encode(str.replace(/\r/g, ''));
-        if (!font || !FONT_DATA[font]) return bytes.length * 6 * size;
-        const F = FONT_DATA[font]; let x = 0;
+        const F = font && FONT_DATA[font], bytes = fontBytes(F, str.replace(/\r/g, ''));
+        if (!F) return bytes.length * 6 * size;
+        let x = 0;
         for (const c of bytes) if (c >= F.first && c <= F.last) x += F.g[c - F.first][3];
         return x * size;
     }
@@ -194,7 +208,7 @@
         }
         const F = FONT_DATA[font];
         for (const ch of str) {
-            const g = F.g[ch.charCodeAt(0) - F.first]; if (!g) continue;
+            const g = glyphOf(F, ch); if (!g) continue;
             const [bo0, w, h, xa, xo, yo] = g; let bo = bo0, bits = 0, bit = 0;
             for (let yy = 0; yy < h; yy++)for (let xx = 0; xx < w; xx++) {
                 if (!(bit++ & 7)) bits = F.bmp[bo++];
@@ -204,10 +218,11 @@
         }
     }
     const cstr = t => t.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    const fontGroups = () => S.fonts.length ? [...FONT_GROUPS, ['Свои (кириллица)', S.fonts.map(f => f.n)]] : FONT_GROUPS;
     const FONT_GROUPS = [['Встроенный', ['']], ['Pixel', ['Picopixel', 'TomThumb', 'Org_01', 'Tiny3x3a2pt7b']],
-    ['Sans', Object.keys(FONT_DATA).filter(k => k.startsWith('FreeSans'))], ['Mono', Object.keys(FONT_DATA).filter(k => k.startsWith('FreeMono'))],
-    ['Serif', Object.keys(FONT_DATA).filter(k => k.startsWith('FreeSerif'))]];
-    const fontLabel = k => !k ? 'Встроенный 5×7' : k.replace(/(\d+)pt7b$/, ' $1pt').replace(/^Tiny3x3a2pt7b$/, 'Tiny3x3');
+    ['Sans', Object.keys(GFX_FONTS).filter(k => k.startsWith('FreeSans'))], ['Mono', Object.keys(GFX_FONTS).filter(k => k.startsWith('FreeMono'))],
+    ['Serif', Object.keys(GFX_FONTS).filter(k => k.startsWith('FreeSerif'))]];
+    const fontLabel = k => !k ? 'Встроенный 5×7' : k.replace(/(\d+)pt[78]b$/, ' $1pt').replace(/^Tiny3x3a2pt7b$/, 'Tiny3x3');
     const ptOf = k => +((k.match(/(\d+)pt7b$/) || [0, 0])[1]);
     FONT_GROUPS.slice(2).forEach(g => g[1].sort((a, b) => a.replace(/\d+pt7b/, '').localeCompare(b.replace(/\d+pt7b/, '')) || ptOf(a) - ptOf(b)));
 
@@ -229,7 +244,7 @@
     // Adafruit_GFX::getTextBounds(str, 0, 0, …) with wrap off (charBounds for the classic font and for GFXfont)
     function textBounds(font, size, str) {
         let x = 0, minx = 0x7FFF, miny = 0x7FFF, maxx = -1, maxy = -1; const F = font && FONT_DATA[font];
-        for (const c of utf8.encode(str)) {
+        for (const c of fontBytes(F, str)) {
             if (c === 10 || c === 13) continue;
             if (!F) { minx = Math.min(minx, x); miny = Math.min(miny, 0); maxx = Math.max(maxx, x + 6 * size - 1); maxy = Math.max(maxy, 8 * size - 1); x += 6 * size; }
             else if (c >= F.first && c <= F.last) {
@@ -604,6 +619,7 @@
             vx.strokeStyle = '#2f5fd0'; vx.lineWidth = 1; vx.strokeRect(x * scale + .5, y * scale + .5, w * scale - 1, h * scale - 1);
         }
         if (alt) drawMeasure();
+        if (LIVE.port) { LIVE.dirty = true; pump(); } // the board gets the newest frame, at most FPS per second
     }
 
     // ---------- Option/Alt distance overlay ----------
@@ -955,7 +971,7 @@
         if (gn) gn.addEventListener('change', () => { const v = gn.value.trim(); if (v && v !== grp.g.name) { push(); grp.g.name = v; } update(); });
     }
     function textInspector(s) {
-        const opts = FONT_GROUPS.map(([g, ks]) => `<optgroup label="${g}">${ks.map(k => `<option value="${k}"${k === s.font ? ' selected' : ''}>${fontLabel(k)}</option>`).join('')}</optgroup>`).join('');
+        const opts = fontGroups().map(([g, ks]) => `<optgroup label="${g}">${ks.map(k => `<option value="${k}"${k === s.font ? ' selected' : ''}>${fontLabel(k)}</option>`).join('')}</optgroup>`).join('');
         const seg = (id, key, items) => `<span class="seg" id="${id}">${items.map(([v, l, t]) => `<button data-v="${v}" title="${t}" aria-pressed="${s[key] === v}">${l}</button>`).join('')}</span>`;
         const fn = s.var ? (plan().shapes.get(s) || {}).fn || varFn(s.var) : '';
         const varRow = `<div class="row"><label class="set"><input type="checkbox" id="insVar"${s.var ? ' checked' : ''}> меняющийся текст</label>${s.var ? `<label class="set">id <input type="text" id="insVarId" value="${escA(s.var)}" style="width:96px" spellcheck="false"></label><span class="spec">${fn}(value)</span>` : ''}</div>`
@@ -1208,7 +1224,8 @@
         if (st.color !== col) { out.push(`canvas.setTextColor(${col});`); st.color = col; }
         for (const l of layoutText(s)) {
             const cx = e && e.pre ? plus(V(s, e, 'x'), l.cx - s.x) : l.cx, cy = e && e.pre ? plus(V(s, e, 'y'), l.cy - s.y) : l.cy;
-            out.push(`canvas.setCursor(${cx}, ${cy});`); out.push(`canvas.print("${cstr(l.t)}");`);
+            const lit = `"${cstr(l.t)}"`, cp = FONT_DATA[s.font] && FONT_DATA[s.font].cp && /[^\x00-\x7F]/.test(l.t);
+            out.push(`canvas.setCursor(${cx}, ${cy});`); out.push(`canvas.print(${cp ? `cp1251(${lit})` : lit});`);
         }
         return out;
     }
@@ -1257,6 +1274,7 @@
         return [`// меняющийся текст «${s.var}»${customName(s) ? ' — ' + s.name : ''}`, `void ${e.fn}(const char* value) {`,
             `  canvas.fillRect(${x}, ${y}, ${w}, ${h}, ${er});  // стереть область блока`,
             s.font ? `  canvas.setFont(&${s.font});` : '  canvas.setFont();  // встроенный 5×7', `  canvas.setTextSize(${s.size});`, `  canvas.setTextColor(${colStr(s)});`, '  canvas.setTextWrap(false);',
+            ...(FONT_DATA[s.font] && FONT_DATA[s.font].cp ? ['  value = cp1251(value);  // UTF-8 → CP1251 для шрифта с кириллицей'] : []),
             '  // выравнивание считается на плате через getTextBounds', '  int16_t bx, by; uint16_t bw, bh;', '  canvas.getTextBounds(value, 0, 0, &bx, &by, &bw, &bh);',
             `  canvas.setCursor(${cx}, ${cy});`, '  canvas.print(value);', '}'];
     }
@@ -1276,7 +1294,7 @@
         }
         const fonts = [...new Set(all.filter(o => o.s.t === 'text' && o.s.font).map(o => o.s.font))], consts = all.flatMap(o => constLines([o.s], P)).map(L);
         const out = [
-            L('#include <Waveshare_LCD147.h>'), L('#include <Adafruit_GFX.h>'), ...fonts.map(f => L(`#include <Fonts/${f}.h>`)), ...(header ? [L('#include "images.h"')] : []), L(''),
+            L('#include <Waveshare_LCD147.h>'), L('#include <Adafruit_GFX.h>'), ...fonts.map(f => L(FONT_DATA[f] && FONT_DATA[f].custom ? `#include "${f}.h"  // шрифт проекта, файл — в разделе «Шрифты»` : `#include <Fonts/${f}.h>`)), ...(header ? [L('#include "images.h"')] : []), L(''),
             L(`constexpr int W = ${S.W};   // ширина экрана`), L(`constexpr int H = ${S.H};   // высота экрана`), L(''),
             ...(pal.length ? [...pal, L('')] : []),
             ...(consts.length ? [L('// координаты именованных элементов'), ...consts, L('')] : []),
@@ -1394,7 +1412,7 @@
             }
             const fn = m[1], raw = m[2].trim();
             if (fn === 'print' || fn === 'println') {
-                const q = raw.match(/^"((?:\\.|[^"\\])*)"$/); if (!q && raw) { ctx.skipped++; continue; }
+                const q = raw.match(/^"((?:\\.|[^"\\])*)"$/) || raw.match(/^cp1251\s*\(\s*"((?:\\.|[^"\\])*)"\s*\)$/); if (!q && raw) { ctx.skipped++; continue; }
                 const fm = fontMetrics(ts.font, ts.size);
                 // '\n' (and println) works like Adafruit write('\n'): x = 0, y += line height
                 (cunesc(q ? q[1] : '') + (fn === 'println' ? '\n' : '')).split('\n').forEach((t, k) => {
@@ -1549,6 +1567,323 @@
     // after an internal copy the system clipboard gets the code of the copied shapes (and an old image there no longer wins on paste)
     for (const ev of ['copy', 'cut']) document.addEventListener(ev, e => { if (!sysCopy || !e.clipboardData) return; e.preventDefault(); e.clipboardData.setData('text/plain', clipText); });
 
+    // ---------- project fonts: TTF/OTF → GFXfont in CP1251 (0x20–0xFF), rasterised in the browser ----------
+    const DPI = 141; // like Adafruit fontconvert: «9pt» means the same pixel size as FreeSans9pt7b
+    const CP_DEC = new TextDecoder('windows-1251'), cpChar = b => CP_DEC.decode(Uint8Array.of(b));
+    async function makeFont(file, name, pt) {
+        const fam = 'lcbfont' + Date.now(), face = new FontFace(fam, await file.arrayBuffer());
+        await face.load(); document.fonts.add(face);
+        try {
+            const px = Math.round(pt * DPI / 72), size = px * 4, ox = px, by = px * 3;
+            const c = document.createElement('canvas'); c.width = c.height = size; const x = c.getContext('2d', { willReadFrequently: true });
+            const draw = (ch, fb) => { x.clearRect(0, 0, size, size); x.font = `${px}px "${fam}", ${fb}`; x.fillStyle = '#000'; x.textBaseline = 'alphabetic'; x.fillText(ch, ox, by); return x.getImageData(0, 0, size, size).data; };
+            x.font = `${px}px "${fam}"`; const m = x.measureText('Ag');
+            const ya = Math.round((m.fontBoundingBoxAscent || px) + (m.fontBoundingBoxDescent || px / 4));
+            const bytes = [], g = []; let missing = 0;
+            for (let code = 0x20; code <= 0xFF; code++) {
+                const ch = cpChar(code);
+                if (!CP.has(ch) || code === 0xAD) { g.push([bytes.length, 0, 0, 0, 0, 0]); continue; } // no character at this code: empty glyph
+                const a = draw(ch, 'monospace');
+                // a glyph the font doesn't have comes from the fallback font: monospace and serif fallbacks then differ
+                if (ch.trim()) { const b = draw(ch, 'serif'); let same = true; for (let i = 3; i < a.length; i += 4) if ((a[i] >= 128) !== (b[i] >= 128)) { same = false; break; } if (!same) { missing++; g.push([bytes.length, 0, 0, 0, 0, 0]); continue; } }
+                x.font = `${px}px "${fam}", monospace`; const xa = Math.round(x.measureText(ch).width);
+                let x0 = size, y0 = size, x1 = -1, y1 = -1;
+                for (let yy = 0; yy < size; yy++) for (let xx = 0; xx < size; xx++) if (a[(yy * size + xx) * 4 + 3] >= 128) { if (xx < x0) x0 = xx; if (xx > x1) x1 = xx; if (yy < y0) y0 = yy; if (yy > y1) y1 = yy; }
+                if (x1 < 0) { g.push([bytes.length, 0, 0, xa, 0, 0]); continue; }
+                // GFXfont bitmap: rows packed one after another, MSB first, each glyph starts on a byte
+                const off = bytes.length; let acc = 0, n = 0;
+                for (let yy = y0; yy <= y1; yy++) for (let xx = x0; xx <= x1; xx++) { acc = (acc << 1) | (a[(yy * size + xx) * 4 + 3] >= 128 ? 1 : 0); if (++n === 8) { bytes.push(acc); acc = n = 0; } }
+                if (n) bytes.push(acc << (8 - n));
+                g.push([off, x1 - x0 + 1, y1 - y0 + 1, xa, x0 - ox, y0 - by]);
+            }
+            if (bytes.length > 65535) throw new Error('шрифт слишком большой для GFXfont (больше 64 КБ битмапов) — уменьши размер');
+            if (!bytes.length) bytes.push(0);
+            let bin = ''; for (let k = 0; k < bytes.length; k += 4096) bin += String.fromCharCode(...bytes.slice(k, k + 4096));
+            return { n: name, f: 0x20, l: 0xFF, y: ya, b: btoa(bin), g, pt, src: file.name, missing };
+        } finally { document.fonts.delete(face); }
+    }
+    // cp1251(): UTF-8 → CP1251 on the board; lives in every font .h behind a guard
+    function cp1251Helper() {
+        const hi = []; for (let b = 0x80; b <= 0xBF; b++) { const ch = cpChar(b); hi.push(CP.has(ch) ? '0x' + ch.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0') : '0'); }
+        const rows = []; for (let k = 0; k < 64; k += 8) rows.push('    ' + hi.slice(k, k + 8).join(', ') + ',');
+        return ['#ifndef LCB_CP1251_HELPER', '#define LCB_CP1251_HELPER',
+            '// UTF-8 → CP1251: Adafruit GFX печатает по одному байту, а шрифт закодирован в CP1251.',
+            '// canvas.print(cp1251("Привет")); — результат живёт до следующего вызова cp1251().',
+            'inline const char* cp1251(const char* s) {', '  static char out[256];', '  static const uint16_t hi[64] = {  // символы 0x80–0xBF', ...rows, '  };',
+            '  size_t n = 0;', '  while (*s && n < sizeof(out) - 1) {', '    uint8_t c = *s++; uint32_t u;',
+            '    if (c < 0x80) u = c;', '    else if ((c & 0xE0) == 0xC0 && *s) u = ((c & 0x1F) << 6) | (*s++ & 0x3F);',
+            '    else if ((c & 0xF0) == 0xE0 && s[0] && s[1]) { u = ((c & 0x0F) << 12) | ((s[0] & 0x3F) << 6) | (s[1] & 0x3F); s += 2; }',
+            '    else { while ((*s & 0xC0) == 0x80) s++; out[n++] = \'?\'; continue; }',
+            "    char r = '?';", '    if (u < 0x80) r = (char)u;', '    else if (u >= 0x410 && u <= 0x44F) r = (char)(0xC0 + (u - 0x410));',
+            '    else for (int k = 0; k < 64; k++) if (hi[k] == u) { r = (char)(0x80 + k); break; }', '    out[n++] = r;', '  }', '  out[n] = 0;', '  return out;', '}', '#endif'];
+    }
+    function fontHeader(f) {
+        const N = f.n, bytes = b64(f.b), hex = (v, n = 2) => '0x' + v.toString(16).toUpperCase().padStart(n, '0'), rows = [];
+        for (let k = 0; k < bytes.length; k += 16) rows.push('  ' + Array.from(bytes.slice(k, k + 16), v => hex(v)).join(', ') + ',');
+        const gl = f.g.map((g, k) => { const code = f.f + k, ch = cpChar(code); return `  { ${String(g[0]).padStart(5)}, ${String(g[1]).padStart(3)}, ${String(g[2]).padStart(3)}, ${String(g[3]).padStart(3)}, ${String(g[4]).padStart(4)}, ${String(g[5]).padStart(4)} },  // ${hex(code)}${CP.has(ch) && ch.trim() && code !== 0xAD ? ` '${ch}'` : ''}`; });
+        return [`// ${N}: ${f.src || 'шрифт'}, ${f.pt}pt, кодировка CP1251 (0x20–0xFF). Создан в LCD Canvas Builder.`,
+            `// Подключение: положи файл рядом со скетчем, #include "${N}.h", затем canvas.setFont(&${N});`,
+            '// Строки с кириллицей печатай через cp1251(): canvas.print(cp1251("Привет"));',
+            '#pragma once', '#include <Adafruit_GFX.h>', '',
+            `const uint8_t ${N}Bitmaps[] PROGMEM = {`, ...rows, '};', '',
+            `const GFXglyph ${N}Glyphs[] PROGMEM = {`, '  // offset, w, h, xAdvance, xOffset, yOffset', ...gl, '};', '',
+            `const GFXfont ${N} PROGMEM = { (uint8_t *)${N}Bitmaps, (GFXglyph *)${N}Glyphs, ${hex(f.f)}, ${hex(f.l)}, ${f.y} };`, '',
+            ...cp1251Helper(), ''].join('\n');
+    }
+    const fontFile = document.getElementById('fontFile'), fontName = document.getElementById('fontName'), fontPt = document.getElementById('fontPt'), fontMsg = document.getElementById('fontMsg'), fontList = document.getElementById('fontList');
+    fontFile.addEventListener('change', () => { const f = fontFile.files[0]; if (f && !fontName.value.trim()) fontName.value = f.name.replace(/\.[^.]*$/, '').replace(/[-_ ]?(Regular|Roman)$/i, ''); });
+    document.getElementById('fontMake').addEventListener('click', async () => {
+        const file = fontFile.files[0], pt = Math.round(+fontPt.value);
+        if (!file) { fontMsg.textContent = 'Выбери файл шрифта (TTF, OTF, WOFF).'; return; }
+        if (!(pt >= 4 && pt <= 48)) { fontMsg.textContent = 'Размер — от 4 до 48 pt (у GFXfont смещения глифов в пределах ±127 px).'; return; }
+        const taken = new Set([...Object.keys(FONT_DATA), 'cp1251']); let n = pascalId(fontName.value.trim() || file.name.replace(/\.[^.]*$/, '')) + pt + 'pt8b', k = 2;
+        while (taken.has(n)) n = n.replace(/(_\d+)?$/, '_' + k++);
+        fontMsg.textContent = 'Растрирую…';
+        try {
+            const f = await makeFont(file, n, pt); S.fonts.push(f); registerFont(f);
+            const cyr = [...'АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя'].filter(ch => !supported(n, ch)).length;
+            fontMsg.textContent = `Готово: ${n}.` + (cyr ? ` В шрифте нет ${cyr} букв кириллицы — они будут пропущены.` : '') + (f.missing ? ` Пустых глифов: ${f.missing}.` : '');
+            const s = one(); if (s && s.t === 'text') { push(); s.font = n; if (s.size > 1) s.size = 1; S.textFont = n; S.textSize = s.size; }
+            update();
+        } catch (e) { fontMsg.textContent = 'Не получилось: ' + (e && e.message || e); }
+    });
+    function renderFonts() {
+        const html = S.fonts.map(f => `<div class="row font-row" data-f="${f.n}"><span class="spec">${f.n}</span><span class="msg">${f.src || ''} · ${b64(f.b).length.toLocaleString('ru')} Б</span><span class="grow"></span><button class="btn" data-a="dl" title="Скачать ${f.n}.h">.h</button><button class="btn" data-a="copy" title="Скопировать содержимое ${f.n}.h">Копировать</button><button class="btn danger" data-a="del">Удалить</button></div>`).join('');
+        if (fontList.innerHTML !== html) fontList.innerHTML = html;
+    }
+    fontList.addEventListener('click', e => {
+        const b = e.target.closest('[data-a]'), row = e.target.closest('[data-f]'); if (!b || !row) return;
+        const f = S.fonts.find(x => x.n === row.dataset.f); if (!f) return;
+        if (b.dataset.a === 'dl') download(f.n + '.h', fontHeader(f));
+        if (b.dataset.a === 'copy') navigator.clipboard.writeText(fontHeader(f)).then(() => { fontMsg.textContent = `Скопировано: ${f.n}.h`; }, () => download(f.n + '.h', fontHeader(f)));
+        if (b.dataset.a === 'del') {
+            const used = S.screens.some(sc => sc.shapes.some(s => s.t === 'text' && s.font === f.n));
+            if (used) { fontMsg.textContent = `${f.n} используется в тексте — сначала выбери там другой шрифт.`; return; }
+            S.fonts = S.fonts.filter(x => x !== f); delete FONT_DATA[f.n]; if (S.textFont === f.n) S.textFont = ''; fontMsg.textContent = ''; update();
+        }
+    });
+    function download(name, text) { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' })); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); }
+
+    // ---------- live preview on the board (Web Serial) ----------
+    // frame, little-endian: "LCDF" | W u16 | H u16 | flags u8 (bit 0 = RLE) | seq u8 | len u32 | payload[len] | Fletcher-16(payload) u16
+    // payload: RGB565 words in canvas.getBuffer() order; RLE: byte n, bit 7 set → the next word (n & 127) + 1 times, else n + 1 words as they are
+    // the board answers every frame with "OK <seq>" or "ERR <seq> <reason>"; while it hasn't answered only the newest frame waits
+    const LIVE = { port: null, writer: null, reader: null, busy: false, dirty: false, seq: 0, last: 0, done: [], timer: 0, waitT: 0, errs: 0, err: '', note: '', noReply: false };
+    const FPS = 18;
+    function frame565() {
+        const n = S.W * S.H, out = new Uint16Array(n);
+        for (let i = 0; i < n; i++) { const v = u32[i]; out[i] = ((v & 0xF8) << 8) | ((v >> 5) & 0x7E0) | ((v >> 19) & 0x1F); } // preview colours expand RGB565 losslessly, so this gives the exact words back
+        return out;
+    }
+    function rle(px) {
+        const out = new Uint8Array(px.length * 2 + Math.ceil(px.length / 128) + 8), n = px.length; let o = 0, i = 0;
+        const word = v => { out[o++] = v & 255; out[o++] = v >> 8; };
+        while (i < n) {
+            let r = 1; while (i + r < n && r < 128 && px[i + r] === px[i]) r++;
+            if (r >= 2) { out[o++] = 0x80 | (r - 1); word(px[i]); i += r; continue; }
+            let L = 1; while (i + L < n && L < 128 && !(i + L + 1 < n && px[i + L] === px[i + L + 1])) L++;
+            out[o++] = L - 1; for (let k = 0; k < L; k++) word(px[i + k]); i += L;
+        }
+        return out.subarray(0, o);
+    }
+    function fletcher16(b) { let s1 = 0, s2 = 0; for (let i = 0; i < b.length; i++) { s1 = (s1 + b[i]) % 255; s2 = (s2 + s1) % 255; } return (s2 << 8) | s1; }
+    function buildFrame(seq) {
+        const px = frame565(), raw = new Uint8Array(px.buffer), packed = rle(px), useRle = packed.length < raw.length, data = useRle ? packed : raw;
+        const f = new Uint8Array(14 + data.length + 2), dv = new DataView(f.buffer);
+        f.set([76, 67, 68, 70]); dv.setUint16(4, S.W, true); dv.setUint16(6, S.H, true); f[8] = useRle ? 1 : 0; f[9] = seq; dv.setUint32(10, data.length, true);
+        f.set(data, 14); dv.setUint16(14 + data.length, fletcher16(data), true);
+        return f;
+    }
+    function pump() {
+        if (!LIVE.writer || LIVE.busy || !LIVE.dirty) return;
+        const wait = LIVE.last + 1000 / FPS - performance.now();
+        if (wait > 0) { clearTimeout(LIVE.timer); LIVE.timer = setTimeout(pump, wait); return; }
+        LIVE.dirty = false; LIVE.busy = true; LIVE.last = performance.now(); LIVE.seq = (LIVE.seq + 1) & 255;
+        LIVE.writer.write(buildFrame(LIVE.seq)).catch(() => lost());
+        LIVE.waitT = setTimeout(() => { LIVE.busy = false; LIVE.noReply = true; LIVE.dirty = true; renderLive(); pump(); }, 2000);
+    }
+    function onLine(l) {
+        const m = l.match(/^(OK|ERR)\s+(\d+)\s*(.*)$/); if (!m || !LIVE.busy || +m[2] !== LIVE.seq) return;
+        clearTimeout(LIVE.waitT); LIVE.busy = false; LIVE.noReply = false;
+        if (m[1] === 'OK') LIVE.done.push(performance.now()); else { LIVE.errs++; LIVE.err = m[3]; LIVE.dirty = true; } // a broken frame is sent again
+        renderLive(); pump();
+    }
+    async function readLoop(port) {
+        const dec = new TextDecoder(); let buf = '';
+        try {
+            LIVE.reader = port.readable.getReader();
+            for (;;) {
+                const { value, done } = await LIVE.reader.read(); if (done) break;
+                buf += dec.decode(value, { stream: true }); let k;
+                while ((k = buf.indexOf('\n')) >= 0) { onLine(buf.slice(0, k).trim()); buf = buf.slice(k + 1); }
+                if (buf.length > 4096) buf = buf.slice(-256);
+            }
+        } catch (e) { } finally { if (LIVE.port === port) lost(); }
+    }
+    async function connect() {
+        if (!('serial' in navigator)) { LIVE.note = 'Web Serial есть только в Chrome и Edge на компьютере.'; renderLive(); return; }
+        let port;
+        try { port = await navigator.serial.requestPort(); } catch (e) { return; } // the chooser was closed
+        try { await port.open({ baudRate: 921600 }); }
+        catch (e) { LIVE.note = 'Порт не открылся: ' + e.message + ' Возможно, он занят Arduino IDE или монитором порта.'; renderLive(); return; }
+        Object.assign(LIVE, { port, writer: port.writable.getWriter(), busy: false, dirty: true, done: [], errs: 0, err: '', note: '', noReply: false });
+        readLoop(port); renderLive(); pump();
+    }
+    async function disconnect(note) {
+        const { port, writer, reader } = LIVE; if (!port) return;
+        clearTimeout(LIVE.timer); clearTimeout(LIVE.waitT);
+        Object.assign(LIVE, { port: null, writer: null, reader: null, busy: false, dirty: false, note: note || '' });
+        renderLive();
+        try { await reader?.cancel(); } catch (e) { } try { reader?.releaseLock(); } catch (e) { }
+        try { writer?.releaseLock(); } catch (e) { }
+        try { await port.close(); } catch (e) { }
+    }
+    function lost() { if (LIVE.port) disconnect('Плата отключилась (кабель вынут или плата перезагрузилась).'); }
+    if ('serial' in navigator) navigator.serial.addEventListener('disconnect', e => { if (e.target === LIVE.port) lost(); });
+    const liveBtn = document.getElementById('liveBtn'), liveStatus = document.getElementById('liveStatus'), liveDot = document.getElementById('liveDot'), liveWarn = document.getElementById('liveWarn');
+    liveBtn.addEventListener('click', () => LIVE.port ? disconnect() : connect());
+    function renderLive() {
+        const on = !!LIVE.port, now = performance.now(); LIVE.done = LIVE.done.filter(t => now - t < 1000);
+        liveBtn.textContent = on ? 'Отключить' : 'Подключить плату'; liveBtn.classList.toggle('primary', !on);
+        liveDot.dataset.s = !on ? 'off' : LIVE.noReply ? 'warn' : 'on'; liveWarn.hidden = !on;
+        liveStatus.textContent = !on ? (LIVE.note || 'не подключена')
+            : LIVE.noReply ? 'плата не отвечает — залит ли скетч-приёмник?'
+                : `подключена · ${LIVE.done.length} кадр/с · ${S.W}×${S.H}${LIVE.errs ? ` · ошибок: ${LIVE.errs} (${LIVE.err})` : ''}`;
+    }
+    setInterval(() => { if (LIVE.port) renderLive(); }, 500);
+    function receiverSketch() {
+        return `// LCD Canvas Builder — скетч-приёмник живого превью.
+// Принимает кадры из редактора по USB (Web Serial) и показывает их на экране.
+// Плата: Waveshare ESP32-S3-LCD-1.47B. В Arduino IDE: Tools → USB CDC On Boot → Enabled.
+//
+// Кадр (всё little-endian):
+//   "LCDF" | W u16 | H u16 | flags u8 (бит 0 — RLE) | seq u8 | len u32 | payload[len] | Fletcher-16(payload) u16
+// payload — слова RGB565 в порядке canvas.getBuffer(). RLE: байт n; если бит 7 = 1 —
+// следующее слово повторить (n & 127) + 1 раз, иначе дальше идут n + 1 слов как есть.
+// На каждый кадр плата отвечает "OK <seq>" или "ERR <seq> <причина>" (строкой).
+
+#include <Waveshare_LCD147.h>
+#include <Adafruit_GFX.h>
+
+constexpr int W = ${S.W};   // размер по умолчанию; кадр другого размера пересоздаёт холст
+constexpr int H = ${S.H};
+
+St7789* lcd;
+GFXcanvas16* canvas = nullptr;
+uint16_t cw = 0, ch = 0;
+
+enum State : uint8_t { WAIT_MAGIC, HEADER, PAYLOAD, CHECKSUM };
+State state = WAIT_MAGIC;
+uint8_t hdr[10], sum[2], got = 0;
+uint16_t fw, fh;
+uint8_t flags, seq;
+uint32_t len, done;
+uint16_t s1, s2;               // Fletcher-16
+uint16_t* px = nullptr;
+uint32_t pos, total;
+uint8_t lo, left;
+bool haveLo, run, bad;
+const char* why = "";
+uint32_t lastByte = 0;
+
+bool resize(uint16_t w, uint16_t h) {
+  if (canvas && w == cw && h == ch) return true;
+  delete canvas; canvas = nullptr; cw = ch = 0;
+  if (!w || !h || w > 1024 || h > 1024) return false;
+  canvas = new GFXcanvas16(w, h);
+  if (!canvas->getBuffer()) { delete canvas; canvas = nullptr; return false; }
+  cw = w; ch = h;
+  return true;
+}
+
+void startFrame() {
+  fw = hdr[0] | hdr[1] << 8; fh = hdr[2] | hdr[3] << 8; flags = hdr[4]; seq = hdr[5];
+  len = hdr[6] | hdr[7] << 8 | (uint32_t)hdr[8] << 16 | (uint32_t)hdr[9] << 24;
+  done = 0; s1 = s2 = 0; pos = 0; left = 0; haveLo = false; bad = false; why = "";
+  if (resize(fw, fh)) { px = canvas->getBuffer(); total = (uint32_t)cw * ch; }
+  else { px = nullptr; total = 0; bad = true; why = "size"; }
+  if (!bad && !(flags & 1) && len != total * 2) { bad = true; why = "length"; }
+}
+
+inline void put(uint16_t v) {
+  if (pos < total) px[pos++] = v;
+  else { bad = true; why = "overflow"; }
+}
+
+void payloadByte(uint8_t b) {
+  s1 = (s1 + b) % 255; s2 = (s2 + s1) % 255;
+  if (!px) return;
+  if ((flags & 1) && left == 0) { run = b & 0x80; left = (b & 0x7F) + 1; return; }  // управляющий байт RLE
+  if (!haveLo) { lo = b; haveLo = true; return; }
+  haveLo = false;
+  uint16_t v = lo | (uint16_t)b << 8;
+  if (!(flags & 1)) put(v);
+  else if (run) { while (left) { put(v); left--; } }
+  else { put(v); left--; }
+}
+
+void endFrame() {
+  if (!bad && (uint16_t)(sum[0] | sum[1] << 8) != (uint16_t)(s2 << 8 | s1)) { bad = true; why = "checksum"; }
+  if (!bad && pos != total) { bad = true; why = "short"; }
+  if (!bad) lcd->drawImage(0, 0, cw, ch, canvas->getBuffer());
+  if (bad) Serial.printf("ERR %u %s\\n", seq, why);
+  else Serial.printf("OK %u\\n", seq);
+}
+
+void feed(uint8_t b) {
+  static const uint8_t magic[4] = { 'L', 'C', 'D', 'F' };
+  switch (state) {
+    case WAIT_MAGIC:
+      if (b == magic[got]) { if (++got == 4) { state = HEADER; got = 0; } }
+      else got = (b == magic[0]) ? 1 : 0;
+      break;
+    case HEADER:
+      hdr[got++] = b;
+      if (got == 10) { startFrame(); got = 0; state = len ? PAYLOAD : CHECKSUM; }
+      break;
+    case PAYLOAD:
+      payloadByte(b);
+      if (++done == len) state = CHECKSUM;
+      break;
+    case CHECKSUM:
+      sum[got++] = b;
+      if (got == 2) { endFrame(); got = 0; state = WAIT_MAGIC; }
+      break;
+  }
+}
+
+void setup() {
+  Serial.setRxBufferSize(32768);
+  Serial.begin(921600);
+  lcd = &Waveshare147::begin();
+  if (resize(W, H)) {
+    canvas->fillScreen(0x0000);
+    canvas->setTextColor(0xFFFF);
+    canvas->setCursor(4, 4); canvas->print("LCD Canvas Builder");
+    canvas->setCursor(4, 16); canvas->print("waiting for frames...");
+    lcd->drawImage(0, 0, cw, ch, canvas->getBuffer());
+  }
+}
+
+void loop() {
+  static uint8_t buf[1024];
+  int n = Serial.available();
+  if (n > 0) {
+    n = Serial.read(buf, n < (int)sizeof(buf) ? n : (int)sizeof(buf));
+    for (int i = 0; i < n; i++) feed(buf[i]);
+    lastByte = millis();
+  } else if (state != WAIT_MAGIC && millis() - lastByte > 500) {
+    state = WAIT_MAGIC; got = 0;   // обрыв посреди кадра — ждём следующий
+  }
+}
+`;
+    }
+    const rxDlg = document.getElementById('rxDlg');
+    document.getElementById('rxBtn').addEventListener('click', () => { document.getElementById('rxCode').textContent = receiverSketch(); rxDlg.showModal(); });
+    document.getElementById('rxCopy').addEventListener('click', () => navigator.clipboard.writeText(receiverSketch()).then(() => { document.getElementById('rxMsg').textContent = 'Скопировано.'; }, () => { document.getElementById('rxMsg').textContent = 'Не удалось скопировать — скачай файлом.'; }));
+    document.getElementById('rxDl').addEventListener('click', () => download('lcd_canvas_receiver.ino', receiverSketch()));
+    document.getElementById('rxClose').addEventListener('click', () => rxDlg.close());
+
     // status & keyboard
     const statusEl = document.getElementById('status'), hintEl = document.getElementById('hint');
     function status() {
@@ -1582,7 +1917,7 @@
     // ---------- update ----------
     function update(fast) {
         syncPalette();
-        render(); status(); renderCode(); renderLayers(); renderPalette(); renderBgPc(); renderTabs();
+        render(); status(); renderCode(); renderLayers(); renderPalette(); renderBgPc(); renderTabs(); renderFonts();
         if (!fast || !insBody.contains(document.activeElement)) renderInspector();
         else { const s = one(); if (s) insBody.querySelectorAll('input[data-k]').forEach(inp => { if (inp !== document.activeElement) inp.value = s[inp.dataset.k]; }); }
         rail.querySelectorAll('[data-tool]').forEach(b => b.setAttribute('aria-pressed', b.dataset.tool === S.tool));

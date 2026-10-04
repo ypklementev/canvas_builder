@@ -76,6 +76,17 @@
         <div class="layers" id="layers"></div>
       </section>
 
+      <section class="sec" id="liveSec">
+        <h2>Плата
+          <span class="r">
+            <button class="btn" id="rxBtn" title="Скетч для платы, который принимает кадры из редактора">Скетч-приёмник</button>
+            <button class="btn primary" id="liveBtn">Подключить плату</button>
+          </span>
+        </h2>
+        <div class="row"><span class="live-dot" id="liveDot" data-s="off"></span><span class="msg" id="liveStatus" role="status">не подключена</span></div>
+        <div class="msg warn" id="liveWarn" hidden>Пока редактор подключён, порт занят: Arduino IDE не сможет прошить плату или открыть монитор порта. Сначала нажми «Отключить».</div>
+      </section>
+
       <section class="sec">
         <h2>Код
           <span class="r">
@@ -108,8 +119,32 @@
           </div>
         </details>
       </section>
+
+      <section class="sec">
+        <details>
+          <summary>Шрифты с кириллицей</summary>
+          <div style="display:flex;flex-direction:column;gap:8px;margin-top:10px">
+            <div class="msg">Загрузи TTF / OTF: редактор растрирует его в GFXfont (CP1251, 0x20–0xFF). Шрифт появится в списке шрифтов текста, а файл <code>.h</code> для скетча можно скачать ниже.</div>
+            <input type="file" id="fontFile" accept=".ttf,.otf,.woff,.woff2,font/ttf,font/otf,font/woff,font/woff2" aria-label="Файл шрифта">
+            <div class="row">
+              <label class="set">имя <input type="text" id="fontName" style="width:130px" spellcheck="false"></label>
+              <label class="set">размер, pt <input type="number" id="fontPt" value="12" min="4" max="48" style="width:56px"></label>
+              <button class="btn primary" id="fontMake">Создать</button>
+            </div>
+            <div class="msg" id="fontMsg" role="status"></div>
+            <div id="fontList"></div>
+          </div>
+        </details>
+      </section>
     </aside>
   </div>
+  <dialog id="rxDlg" aria-labelledby="rxTitle">
+    <div class="dlg-head"><h2 id="rxTitle">Скетч-приёмник</h2><span class="grow"></span>
+      <button class="btn" id="rxDl">Скачать .ino</button><button class="btn primary" id="rxCopy">Копировать</button><button class="btn" id="rxClose" aria-label="Закрыть">×</button></div>
+    <div class="msg">Залей его на плату один раз (Tools → USB CDC On Boot → Enabled), закрой монитор порта и нажми «Подключить плату».</div>
+    <pre class="code dlg-code" id="rxCode"></pre>
+    <div class="msg" id="rxMsg"></div>
+  </dialog>
   <script src="fonts.js"></script>
   <script src="script.js"></script>
 </body>
