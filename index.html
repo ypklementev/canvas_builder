@@ -1,0 +1,96 @@
+<!doctype html>
+<html>
+
+<head>
+  <meta charset=utf8>
+  <meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <link rel="stylesheet" href="style.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <title>LCD Canvas Builder</title>
+</head>
+
+<body>
+  <div class="app">
+    <header>
+      <h1>LCD Canvas Builder</h1>
+      <span class="spec" id="spec">GFXcanvas16 · RGB565</span>
+      <span class="grow"></span>
+      <label class="set">W <input type="number" id="inW" min="1" max="1024"></label>
+      <label class="set">H <input type="number" id="inH" min="1" max="1024"></label>
+      <label class="set">Масштаб
+        <select id="inZoom">
+          <option value="auto">авто</option>
+          <option>1</option>
+          <option>2</option>
+          <option>3</option>
+          <option>4</option>
+          <option>5</option>
+          <option>6</option>
+          <option>8</option>
+        </select>
+      </label>
+      <label class="set"><input type="checkbox" id="inGrid"> сетка</label>
+    </header>
+
+    <nav class="rail" id="rail" aria-label="Инструменты"></nav>
+
+    <main class="stage" id="stage">
+      <div class="bezel"><canvas id="view"></canvas></div>
+      <div class="status" id="status"></div>
+      <div class="hint" id="hint"></div>
+    </main>
+
+    <aside class="side">
+      <section class="sec">
+        <h2>Цвет <span class="r"><span class="spec" id="hex565"></span></span></h2>
+        <div class="row">
+          <input type="color" id="inColor" aria-label="Цвет">
+          <input type="text" id="inColor565" style="width:84px" aria-label="Цвет RGB565" placeholder="0xFFFF">
+          <div class="swatches" id="swatches"></div>
+        </div>
+        <div class="row">
+          <span class="set">Фон</span>
+          <input type="color" id="inBg" aria-label="Цвет фона">
+          <input type="text" id="inBg565" style="width:84px" aria-label="Фон RGB565">
+        </div>
+      </section>
+
+      <section class="sec" id="inspector">
+        <h2>Фигура <span class="r" id="insBtns"></span></h2>
+        <div id="insBody"></div>
+      </section>
+
+      <section class="sec">
+        <h2>Код
+          <span class="r">
+            <span class="seg" id="codeMode">
+              <button data-m="snippet">фигуры</button><button data-m="full">весь скетч</button>
+            </span>
+            <button class="btn primary" id="copyBtn">Копировать</button>
+          </span>
+        </h2>
+        <div class="code" id="code" tabindex="0"></div>
+        <div class="msg" id="copyMsg"></div>
+      </section>
+
+      <section class="sec">
+        <details>
+          <summary>Загрузить из кода</summary>
+          <div style="display:flex;flex-direction:column;gap:8px;margin-top:10px">
+            <textarea id="importText" placeholder="canvas.fillRect(100, 10, 60, 40, 0xF800);"></textarea>
+            <div class="row">
+              <button class="btn" id="importBtn">Заменить фигуры</button>
+              <button class="btn" id="appendBtn">Добавить</button>
+              <span class="grow"></span>
+              <button class="btn danger" id="clearBtn">Очистить холст</button>
+            </div>
+            <div class="msg" id="importMsg"></div>
+          </div>
+        </details>
+      </section>
+    </aside>
+  </div>
+  <script src="script.js"></script>
+</body>
+
+</html>
