@@ -15,6 +15,8 @@
       <h1>LCD Canvas Builder</h1>
       <span class="spec" id="spec">GFXcanvas16 · RGB565</span>
       <span class="grow"></span>
+      <label class="set">Экран <select id="inPreset"></select></label>
+      <button class="btn" id="rotBtn" title="Повернуть: поменять W и H местами">⟲ ориентация</button>
       <label class="set">W <input type="number" id="inW" min="1" max="1024"></label>
       <label class="set">H <input type="number" id="inH" min="1" max="1024"></label>
       <label class="set">Масштаб
@@ -51,16 +53,23 @@
           <input type="text" id="inColor565" style="width:84px" aria-label="Цвет RGB565" placeholder="0xFFFF">
           <div class="swatches" id="swatches"></div>
         </div>
+        <div id="palette"></div>
         <div class="row">
           <span class="set">Фон</span>
           <input type="color" id="inBg" aria-label="Цвет фона">
           <input type="text" id="inBg565" style="width:84px" aria-label="Фон RGB565">
+          <select id="inBgPc" aria-label="Фон из палитры" hidden></select>
         </div>
       </section>
 
       <section class="sec" id="inspector">
         <h2>Фигура <span class="r" id="insBtns"></span></h2>
         <div id="insBody"></div>
+      </section>
+
+      <section class="sec">
+        <h2>Слои</h2>
+        <div class="layers" id="layers"></div>
       </section>
 
       <section class="sec">

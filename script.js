@@ -1,16 +1,24 @@
 (() => {
     // ---------- state ----------
+    // shapes: flat list in draw order; shape.g = id of its group; groups: {id, name, parent, collapsed, hidden, locked}, members of a group are kept contiguous
+    // palette: [{n: 'C_BG', c}]; shape.pc / S.bgPc / S.colorPc = palette name the color comes from (shape.c is kept in sync)
     const START = [];
-    const S = { W: 172, H: 320, bg: 0x0000, shapes: START, sel: -1, tool: 'select', fill: false, color: 0xFFFF, radius: 8, zoom: 'auto', grid: true, codeMode: 'snippet', textFont: '', textSize: 2 };
-    const KEY = 'lcd-canvas-builder-v1';
-    try { const d = JSON.parse(localStorage.getItem(KEY) || 'null'); if (d && Array.isArray(d.shapes)) Object.assign(S, d, { sel: -1 }); } catch (e) { }
+    const S = { W: 172, H: 320, bg: 0x0000, bgPc: '', shapes: START, groups: [], palette: [], nextG: 1, sel: [], tool: 'select', fill: false, color: 0xFFFF, colorPc: '', radius: 8, zoom: 'auto', grid: true, codeMode: 'snippet', textFont: '', textSize: 2 };
+    const KEY = 'lcd-canvas-builder-v2', KEY_V1 = 'lcd-canvas-builder-v1';
+    try {
+        let d = JSON.parse(localStorage.getItem(KEY) || 'null');
+        if (!d) { d = JSON.parse(localStorage.getItem(KEY_V1) || 'null'); if (d) d = migrateV1(d); }
+        if (d && Array.isArray(d.shapes)) Object.assign(S, d, { sel: [] });
+    } catch (e) { }
+    // v1 → v2: v1 had no groups, palette or names (names are filled in by ensureNames() at start-up); v1 key is left untouched
+    function migrateV1(d) { delete d.sel; return Object.assign(d, { groups: [], palette: [], nextG: 1, bgPc: '', colorPc: '' }); }
     function save() { try { const { sel, ...rest } = S; localStorage.setItem(KEY, JSON.stringify(rest)); } catch (e) { } }
 
     // history
     let hist = [], future = [], lastPushKey = '', lastPushT = 0;
-    function snapshot() { return JSON.stringify({ shapes: S.shapes, bg: S.bg, W: S.W, H: S.H }); }
-    function push(key) { const now = Date.now(); if (key && key === lastPushKey && now - lastPushT < 800) { lastPushT = now; return; } lastPushKey = key || ''; lastPushT = now; hist.push(snapshot()); if (hist.length > 200) hist.shift(); future = []; }
-    function restore(js) { const d = JSON.parse(js); Object.assign(S, d); if (S.sel >= S.shapes.length) S.sel = -1; }
+    function snapshot() { return JSON.stringify({ shapes: S.shapes, groups: S.groups, palette: S.palette, nextG: S.nextG, bg: S.bg, bgPc: S.bgPc, W: S.W, H: S.H }); }
+    function push(key, snap) { const now = Date.now(); if (key && key === lastPushKey && now - lastPushT < 800) { lastPushT = now; return; } lastPushKey = key || ''; lastPushT = now; hist.push(snap || snapshot()); if (hist.length > 200) hist.shift(); future = []; }
+    function restore(js) { const d = JSON.parse(js); Object.assign(S, d); S.sel = S.sel.filter(i => i < S.shapes.length); }
     function undo() { if (!hist.length) return; future.push(snapshot()); restore(hist.pop()); lastPushKey = ''; syncSettings(); update(); }
     function redo() { if (!future.length) return; hist.push(snapshot()); restore(future.pop()); lastPushKey = ''; syncSettings(); update(); }
 
@@ -34,7 +42,7 @@
     // ---------- Adafruit GFX rasterizer (same algorithms as the library) ----------
     const off = document.createElement('canvas'), offx = off.getContext('2d');
     let img, u32, idb, curCol = 0, curId = -1;
-    function px(x, y) { if (x < 0 || y < 0 || x >= S.W || y >= S.H) return; const i = y * S.W + x; u32[i] = curCol; idb[i] = curId; }
+    function px(x, y) { if (x < 0 || y < 0 || x >= S.W || y >= S.H) return; const i = y * S.W + x; u32[i] = curCol; if (curId !== -3) idb[i] = curId; } // id -3: locked, keeps what is below clickable
     function hline(x, y, w) { if (w < 0) { w = -w; x -= w - 1; } for (let i = 0; i < w; i++)px(x + i, y); }
     function vline(x, y, h) { if (h < 0) { h = -h; y -= h - 1; } for (let i = 0; i < h; i++)px(x, y + i); }
     function line(x0, y0, x1, y1) {
@@ -177,15 +185,6 @@
         }
     }
     const cstr = t => t.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-    function textCode(s, st) {
-        const out = [];
-        if (!st.wrap) { out.push('canvas.setTextWrap(false);  // переносы уже посчитаны редактором'); st.wrap = true; }
-        if (st.font !== s.font) { out.push(s.font ? `canvas.setFont(&${s.font});` : 'canvas.setFont();  // встроенный 5×7'); st.font = s.font; }
-        if (st.size !== s.size) { out.push(`canvas.setTextSize(${s.size});`); st.size = s.size; }
-        if (st.color !== s.c) { out.push(`canvas.setTextColor(${fmt565(s.c)});`); st.color = s.c; }
-        for (const l of layoutText(s)) { out.push(`canvas.setCursor(${l.cx}, ${l.cy});`); out.push(`canvas.print("${cstr(l.t)}");`); }
-        return out;
-    }
     const FONT_GROUPS = [['Встроенный', ['']], ['Pixel', ['Picopixel', 'TomThumb', 'Org_01', 'Tiny3x3a2pt7b']],
     ['Sans', Object.keys(FONT_DATA).filter(k => k.startsWith('FreeSans'))], ['Mono', Object.keys(FONT_DATA).filter(k => k.startsWith('FreeMono'))],
     ['Serif', Object.keys(FONT_DATA).filter(k => k.startsWith('FreeSerif'))]];
@@ -216,8 +215,9 @@
         pixel: { name: 'Пиксель', f: [['x', 'x'], ['y', 'y']] },
         text: { name: 'Текст', f: [['x', 'x'], ['y', 'y'], ['w', 'w'], ['h', 'h']] },
     };
+    const colStr = s => s.pc && palEntry(s.pc) ? s.pc : fmt565(s.c);
     function codeLine(s) {
-        const c = fmt565(s.c), p = s.fill ? 'fill' : 'draw';
+        const c = colStr(s), p = s.fill ? 'fill' : 'draw';
         switch (s.t) {
             case 'rect': return `canvas.${p}Rect(${s.x}, ${s.y}, ${s.w}, ${s.h}, ${c});`;
             case 'rrect': return `canvas.${p}RoundRect(${s.x}, ${s.y}, ${s.w}, ${s.h}, ${s.r}, ${c});`;
@@ -230,7 +230,7 @@
     function boxHandles(s) {
         const L = Math.min(s.x, s.x + s.w - 1), T = Math.min(s.y, s.y + s.h - 1), R = Math.max(s.x, s.x + s.w - 1), B = Math.max(s.y, s.y + s.h - 1), mx = Math.floor((L + R) / 2), my = Math.floor((T + B) / 2);
         const mk = (x, y, cur, fx, fy) => ({
-            x, y, cur, set: (s, nx, ny) => {
+            x, y, cur, fx, fy, set: (s, nx, ny) => {
                 let l = Math.min(s.x, s.x + s.w - 1), t = Math.min(s.y, s.y + s.h - 1), r = Math.max(s.x, s.x + s.w - 1), b = Math.max(s.y, s.y + s.h - 1);
                 if (fx === 'l') l = Math.min(nx, r); if (fx === 'r') r = Math.max(nx, l); if (fy === 't') t = Math.min(ny, b); if (fy === 'b') b = Math.max(ny, t);
                 s.x = l; s.y = t; s.w = r - l + 1; s.h = b - t + 1;
@@ -246,8 +246,8 @@
         switch (s.t) {
             case 'rect': case 'rrect': case 'text': return boxHandles(s);
             case 'circle': return [{ x: s.x + s.r, y: s.y, cur: 'ew-resize', set: setR }, { x: s.x - s.r, y: s.y, cur: 'ew-resize', set: setR }, { x: s.x, y: s.y - s.r, cur: 'ns-resize', set: setR }, { x: s.x, y: s.y + s.r, cur: 'ns-resize', set: setR }];
-            case 'line': return [{ x: s.x0, y: s.y0, cur: 'move', set: (s, a, b) => { s.x0 = a; s.y0 = b; } }, { x: s.x1, y: s.y1, cur: 'move', set: (s, a, b) => { s.x1 = a; s.y1 = b; } }];
-            case 'tri': return [0, 1, 2].map(i => ({ x: s['x' + i], y: s['y' + i], cur: 'move', set: (s, a, b) => { s['x' + i] = a; s['y' + i] = b; } }));
+            case 'line': return [{ x: s.x0, y: s.y0, cur: 'move', pt: true, set: (s, a, b) => { s.x0 = a; s.y0 = b; } }, { x: s.x1, y: s.y1, cur: 'move', pt: true, set: (s, a, b) => { s.x1 = a; s.y1 = b; } }];
+            case 'tri': return [0, 1, 2].map(i => ({ x: s['x' + i], y: s['y' + i], cur: 'move', pt: true, set: (s, a, b) => { s['x' + i] = a; s['y' + i] = b; } }));
             default: return [];
         }
     }
@@ -263,6 +263,188 @@
         }
     }
     function moveShape(s, dx, dy) { for (const k of ['x', 'x0', 'x1', 'x2']) if (k in s) s[k] += dx; for (const k of ['y', 'y0', 'y1', 'y2']) if (k in s) s[k] += dy; }
+    // union bbox of several shapes → [x, y, w, h] or null
+    function boxOf(idx) {
+        let L = Infinity, T = Infinity, R = -Infinity, B = -Infinity;
+        for (const i of idx) { const [x, y, w, h] = bbox(S.shapes[i]); L = Math.min(L, x); T = Math.min(T, y); R = Math.max(R, x + w); B = Math.max(B, y + h); }
+        return L === Infinity ? null : [L, T, R - L, B - T];
+    }
+
+    // ---------- palette ----------
+    const palEntry = n => S.palette.find(p => p.n === n);
+    const RESERVED = new Set(['W', 'H', 'canvas', 'lcd', 'present', 'setup', 'loop', ...Object.keys(NAMED)]);
+    const validName = (n, self) => /^[A-Za-z_]\w*$/.test(n) && !RESERVED.has(n) && !S.palette.some(p => p.n === n && p !== self);
+    function newPalName(c) {
+        const base = Object.keys(NAMED).find(k => NAMED[k] === c);
+        let k = 1, n = base ? 'C_' + base : 'C_COLOR1';
+        while (!validName(n)) n = (base ? 'C_' + base : 'C_COLOR') + (++k);
+        return n;
+    }
+    // colors that point at the palette follow it; a deleted entry leaves the last value as a literal
+    function syncPalette() {
+        for (const s of S.shapes) if (s.pc) { const p = palEntry(s.pc); if (p) s.c = p.c; else delete s.pc; }
+        if (S.bgPc) { const p = palEntry(S.bgPc); if (p) S.bg = p.c; else S.bgPc = ''; }
+        if (S.colorPc) { const p = palEntry(S.colorPc); if (p) S.color = p.c; else S.colorPc = ''; }
+    }
+
+    // ---------- groups, names, selection ----------
+    const gById = id => S.groups.find(g => g.id === id);
+    function anc(gid) { const r = []; while (gid != null && r.length < 64) { const g = gById(gid); if (!g) break; r.push(gid); gid = g.parent; } return r; } // innermost → outermost
+    const hiddenAt = i => { const s = S.shapes[i]; return !!s.hidden || anc(s.g).some(id => gById(id).hidden); };
+    const lockedAt = i => { const s = S.shapes[i]; return !!s.locked || anc(s.g).some(id => gById(id).locked); };
+    const groupMembers = id => S.shapes.map((s, i) => anc(s.g).includes(id) ? i : -1).filter(i => i >= 0);
+    // tree view of the flat list: {kids} → {i} for a shape, {id, g, kids} for a group; kids in draw order
+    function buildTree() {
+        const root = { kids: [] }, nodes = new Map();
+        const node = id => {
+            if (id == null) return root; if (nodes.has(id)) return nodes.get(id);
+            const g = gById(id), p = node(g.parent), n = { id, g, kids: [] }; nodes.set(id, n); p.kids.push(n); return n;
+        };
+        S.shapes.forEach((s, i) => node(s.g).kids.push({ i }));
+        return root;
+    }
+    const nodeIdx = n => n.i != null ? [n.i] : n.kids.flatMap(nodeIdx);
+    const parentOf = n => (n.i != null ? S.shapes[n.i].g : n.g.parent) ?? null;
+    function findNode(pred, n = buildTree()) { for (const k of n.kids) { if (pred(k)) return k; if (k.kids) { const r = findNode(pred, k); if (r) return r; } } return null; }
+    // drop empty and dangling groups, keep members of every group contiguous
+    function normalize() {
+        const ids = new Set(S.groups.map(g => g.id));
+        for (const g of S.groups) if (g.parent != null && !ids.has(g.parent)) g.parent = null;
+        for (const s of S.shapes) if (s.g != null && !ids.has(s.g)) delete s.g;
+        const alive = new Set(S.shapes.flatMap(s => anc(s.g)));
+        S.groups = S.groups.filter(g => alive.has(g.id));
+        const objs = S.sel.map(i => S.shapes[i]), order = [];
+        (function walk(n) { for (const k of n.kids) k.i != null ? order.push(k.i) : walk(k); })(buildTree());
+        S.shapes = order.map(i => S.shapes[i]);
+        setSelObjs(objs);
+    }
+    function nextName(base, names) { let n = 0; const re = new RegExp('^' + base + ' (\\d+)$'); for (const s of names) { const m = s && s.match(re); if (m) n = Math.max(n, +m[1]); } return base + ' ' + (n + 1); }
+    const shapeName = t => nextName(META[t].name, S.shapes.map(s => s.name));
+    const groupName = () => nextName('Группа', S.groups.map(g => g.name));
+    function ensureNames() { for (const s of S.shapes) if (!s.name) s.name = shapeName(s.t); }
+
+    function setSel(idx) { S.sel = [...new Set(idx)].filter(i => S.shapes[i]).sort((a, b) => a - b); }
+    function setSelObjs(objs) { setSel(objs.map(o => S.shapes.indexOf(o))); }
+    const one = () => S.sel.length === 1 ? S.shapes[S.sel[0]] : null;
+    const selShapes = () => S.sel.map(i => S.shapes[i]);
+    // selection as tree nodes: a group whose members are all selected counts as one node
+    function selNodes() {
+        const sel = new Set(S.sel), out = [];
+        (function walk(n) {
+            for (const k of n.kids) {
+                if (k.i != null) { if (sel.has(k.i)) out.push(k); }
+                else if (nodeIdx(k).every(i => sel.has(i))) out.push(k); else walk(k);
+            }
+        })(buildTree());
+        return out;
+    }
+    const selGroup = () => { const n = selNodes(); return n.length === 1 && n[0].g ? n[0] : null; };
+    // what a click on shape i selects: its outermost group, or one level deeper when the selection is already inside that group
+    function target(i) {
+        const chain = anc(S.shapes[i].g).reverse(); let k = -1;
+        for (let j = chain.length - 1; j >= 0; j--) {
+            const m = groupMembers(chain[j]);
+            if (S.sel.length && S.sel.length < m.length && S.sel.every(x => m.includes(x))) { k = j; break; }
+        }
+        return chain[k + 1] != null ? groupMembers(chain[k + 1]) : [i];
+    }
+    const commonParent = nodes => { if (!nodes.length) return null; const cs = nodes.map(n => anc(parentOf(n))); return cs[0].find(id => cs.every(c => c.includes(id))) ?? null; };
+
+    // move a node's block above (drawn later) / below / into (on top inside) another node; false if it makes no sense
+    function moveBlock(node, ref, where) {
+        const bi = nodeIdx(node), ri = nodeIdx(ref);
+        if (bi.some(i => ri.includes(i))) return false;
+        const np = where === 'into' ? ref.id : parentOf(ref);
+        const block = bi.map(i => S.shapes[i]), refObjs = new Set(ri.map(i => S.shapes[i]));
+        if (node.i != null) { if (np == null) delete block[0].g; else block[0].g = np; } else node.g.parent = np;
+        const rest = S.shapes.filter(s => !block.includes(s)), pos = rest.map((s, k) => refObjs.has(s) ? k : -1).filter(k => k >= 0);
+        const at = where === 'below' ? pos[0] : pos[pos.length - 1] + 1;
+        S.shapes = [...rest.slice(0, at), ...block, ...rest.slice(at)];
+        setSelObjs(block); normalize();
+        return true;
+    }
+    function groupSel() {
+        const nodes = selNodes(); if (!nodes.length) return;
+        const id = S.nextG++; S.groups.push({ id, name: groupName(), parent: commonParent(nodes) });
+        for (const n of nodes) if (n.i != null) S.shapes[n.i].g = id; else n.g.parent = id;
+        // the new group goes where its topmost member was
+        const idx = new Set(S.sel), top = Math.max(...S.sel), block = selShapes();
+        const others = S.shapes.filter((_, i) => !idx.has(i)), at = S.shapes.slice(0, top).filter((_, i) => !idx.has(i)).length;
+        S.shapes = [...others.slice(0, at), ...block, ...others.slice(at)];
+        setSelObjs(block); normalize();
+    }
+    function ungroupSel() {
+        const gs = selNodes().filter(n => n.g); if (!gs.length) return false;
+        for (const n of gs) {
+            const pid = n.g.parent ?? null;
+            for (const s of S.shapes) if (s.g === n.id) { if (pid == null) delete s.g; else s.g = pid; }
+            for (const g of S.groups) if (g.parent === n.id) g.parent = pid;
+            S.groups = S.groups.filter(g => g !== n.g);
+        }
+        normalize(); return true;
+    }
+    function delSel() { const idx = new Set(S.sel); S.shapes = S.shapes.filter((_, i) => !idx.has(i)); S.sel = []; normalize(); }
+    // the selection as a self-contained piece {shapes, groups}: only groups that are selected as a whole come along
+    function clipSel() {
+        const idx = new Set(S.sel), full = new Set(S.groups.filter(g => groupMembers(g.id).every(i => idx.has(i))).map(g => g.id));
+        const shapes = selShapes().map(s => { const c = JSON.parse(JSON.stringify(s)); if (!full.has(c.g)) delete c.g; return c; });
+        const groups = S.groups.filter(g => full.has(g.id)).map(g => ({ ...g, parent: full.has(g.parent) ? g.parent : null }));
+        return { shapes, groups };
+    }
+    function insertPiece(piece, off, at, parent) {
+        const map = new Map(piece.groups.map(g => [g.id, S.nextG++]));
+        S.groups.push(...piece.groups.map(g => ({ ...g, id: map.get(g.id), parent: g.parent != null ? map.get(g.parent) : parent })));
+        const shapes = piece.shapes.map(s => { const c = JSON.parse(JSON.stringify(s)); if (c.g != null) c.g = map.get(c.g); else if (parent != null) c.g = parent; moveShape(c, off, off); return c; });
+        S.shapes.splice(at, 0, ...shapes); setSelObjs(shapes); normalize();
+    }
+    function dupSel() { if (!S.sel.length) return; push(); insertPiece(clipSel(), 5, Math.max(...S.sel) + 1, commonParent(selNodes())); update(); }
+    // ↑ / ↓: swap the selected node with its neighbour on the same level
+    function stepSel(dir) {
+        const ns = selNodes(); if (ns.length !== 1) return; const n = ns[0], p = parentOf(n);
+        const kids = (p == null ? buildTree() : findNode(k => k.id === p)).kids;
+        const k = kids.findIndex(c => n.i != null ? c.i === n.i : c.id === n.id), nb = kids[k + dir];
+        if (!nb) return; push(); moveBlock(n, nb, dir > 0 ? 'above' : 'below'); update();
+    }
+    function shiftSel(idx, dx, dy) { for (const i of idx) moveShape(S.shapes[i], dx, dy); }
+
+    // ---------- snapping ----------
+    // doubled coordinates keep centres of odd sizes integer: a box x..x+w gives lines 2x, 2x+w, 2x+2w (right edge is exclusive)
+    const SNAP = 5; // screen px
+    let guides = { x: [], y: [] };
+    function snapLines(excl) {
+        const xs = [0, S.W, 2 * S.W], ys = [0, S.H, 2 * S.H];
+        S.shapes.forEach((s, i) => { if (excl.has(i) || hiddenAt(i)) return; const [x, y, w, h] = bbox(s); xs.push(2 * x, 2 * x + w, 2 * x + 2 * w); ys.push(2 * y, 2 * y + h, 2 * y + 2 * h); });
+        return { xs, ys };
+    }
+    // nearest line to any anchor within the threshold → shift d in px (rounded like the centring buttons) and the lines that now match
+    function snap1(anchors, lines) {
+        const thr = 2 * SNAP / scale; let best = null;
+        for (const a of anchors) for (const l of lines) { const df = l - a; if (Math.abs(df) <= thr && (best == null || Math.abs(df) < Math.abs(best))) best = df; }
+        if (best == null) return { d: 0, at: [] };
+        const d = Math.round(best / 2);
+        return { d, at: [...new Set(lines.filter(l => anchors.some(a => Math.abs(a + 2 * d - l) <= 1)))] };
+    }
+    function snapHandle(hd, nx, ny, L) {
+        const g = { x: [], y: [] };
+        const ax = hd.pt ? [2 * nx, 2 * nx + 1, 2 * nx + 2] : hd.fx === 'l' ? [2 * nx] : hd.fx === 'r' ? [2 * nx + 2] : null;
+        const ay = hd.pt ? [2 * ny, 2 * ny + 1, 2 * ny + 2] : hd.fy === 't' ? [2 * ny] : hd.fy === 'b' ? [2 * ny + 2] : null;
+        if (ax) { const r = snap1(ax, L.xs); nx += r.d; g.x = r.at; }
+        if (ay) { const r = snap1(ay, L.ys); ny += r.d; g.y = r.at; }
+        return { x: nx, y: ny, g };
+    }
+    function snapCreate(a, b, L) {
+        const gx = [], gy = [], put = (r, g) => { g.push(...r.at); return r.d; }, pt = v => [2 * v, 2 * v + 1, 2 * v + 2];
+        let ax, ay, bx, by;
+        if (S.tool === 'circle') { ax = bx = put(snap1([2 * a.x + 1], L.xs), gx); ay = by = put(snap1([2 * a.y + 1], L.ys), gy); }
+        else if (S.tool === 'line') { ax = put(snap1(pt(a.x), L.xs), gx); ay = put(snap1(pt(a.y), L.ys), gy); bx = put(snap1(pt(b.x), L.xs), gx); by = put(snap1(pt(b.y), L.ys), gy); }
+        else { // box: which edge a corner makes depends on the drag direction
+            const rx = b.x >= a.x, ry = b.y >= a.y;
+            ax = put(snap1([rx ? 2 * a.x : 2 * a.x + 2], L.xs), gx); bx = put(snap1([rx ? 2 * b.x + 2 : 2 * b.x], L.xs), gx);
+            ay = put(snap1([ry ? 2 * a.y : 2 * a.y + 2], L.ys), gy); by = put(snap1([ry ? 2 * b.y + 2 : 2 * b.y], L.ys), gy);
+        }
+        guides = { x: gx, y: gy };
+        return [{ x: a.x + ax, y: a.y + ay }, { x: b.x + bx, y: b.y + by }];
+    }
 
     // ---------- view ----------
     const view = document.getElementById('view'), vx = view.getContext('2d'), stage = document.getElementById('stage'), emptyHint = document.getElementById('emptyHint');
@@ -273,11 +455,12 @@
         const aw = stage.clientWidth - 32 - 28, ah = (narrow ? window.innerHeight * 0.72 : stage.clientHeight - 40) - 44 - 80;
         return Math.max(1, Math.min(8, Math.floor(Math.min(aw / S.W, ah / S.H))));
     }
+    const rectAB = (a, b) => [Math.min(a.x, b.x), Math.min(a.y, b.y), Math.abs(b.x - a.x) + 1, Math.abs(b.y - a.y) + 1];
     function render() {
         const W = S.W, H = S.H;
         if (!img || img.width !== W || img.height !== H) { off.width = W; off.height = H; img = offx.createImageData(W, H); u32 = new Uint32Array(img.data.buffer); idb = new Int32Array(W * H); }
         u32.fill(toU32(S.bg)); idb.fill(-1);
-        S.shapes.forEach((s, i) => raster(s, i));
+        S.shapes.forEach((s, i) => { if (!hiddenAt(i)) raster(s, lockedAt(i) ? -3 : i); });
         if (preview) raster(preview, -2);
         emptyHint.hidden = S.shapes.length > 0 || !!preview || !!triPts;
         offx.putImageData(img, 0, 0);
@@ -292,29 +475,43 @@
             for (let j = 0; j <= H; j++) { vx.strokeStyle = j % 10 === 0 ? 'rgba(128,140,160,.45)' : 'rgba(128,140,160,.14)'; vx.beginPath(); vx.moveTo(0, j * scale + .5); vx.lineTo(cw, j * scale + .5); vx.stroke(); }
         }
         if (triPts && hover) { vx.strokeStyle = '#7ea2ff'; vx.setLineDash([4, 3]); vx.beginPath(); const pts = [...triPts, hover]; pts.forEach((p, i) => { const X = (p.x + .5) * scale, Y = (p.y + .5) * scale; i ? vx.lineTo(X, Y) : vx.moveTo(X, Y); }); vx.stroke(); vx.setLineDash([]); }
-        const s = S.shapes[S.sel];
-        if (s) {
-            const [x, y, w, h] = bbox(s);
+        const sel = S.sel.filter(i => S.shapes[i]);
+        if (sel.length > 1) { vx.lineWidth = 1; vx.strokeStyle = 'rgba(47,95,208,.9)'; for (const i of sel) { const [x, y, w, h] = bbox(S.shapes[i]); vx.strokeRect(x * scale + .5, y * scale + .5, w * scale - 1, h * scale - 1); } }
+        const sb = boxOf(sel);
+        if (sb) {
+            const [x, y, w, h] = sb;
             vx.setLineDash([5, 4]); vx.lineWidth = 1.5; vx.strokeStyle = '#ffffff'; vx.strokeRect(x * scale - 1.5, y * scale - 1.5, w * scale + 3, h * scale + 3);
             vx.lineDashOffset = 5; vx.strokeStyle = '#2f5fd0'; vx.strokeRect(x * scale - 1.5, y * scale - 1.5, w * scale + 3, h * scale + 3); vx.setLineDash([]); vx.lineDashOffset = 0;
-            for (const hd of handles(s)) { const X = (hd.x + .5) * scale, Y = (hd.y + .5) * scale; vx.fillStyle = '#fff'; vx.strokeStyle = '#2f5fd0'; vx.lineWidth = 1.5; vx.fillRect(X - 4, Y - 4, 8, 8); vx.strokeRect(X - 4, Y - 4, 8, 8); }
+            const s = one();
+            if (s && !lockedAt(sel[0])) for (const hd of handles(s)) { const X = (hd.x + .5) * scale, Y = (hd.y + .5) * scale; vx.fillStyle = '#fff'; vx.strokeStyle = '#2f5fd0'; vx.lineWidth = 1.5; vx.fillRect(X - 4, Y - 4, 8, 8); vx.strokeRect(X - 4, Y - 4, 8, 8); }
+        }
+        if (guides.x.length || guides.y.length) {
+            vx.strokeStyle = GC; vx.lineWidth = 1; vx.beginPath();
+            for (const g of guides.x) { const X = Math.round(g / 2 * scale) + .5; vx.moveTo(X, 0); vx.lineTo(X, ch); }
+            for (const g of guides.y) { const Y = Math.round(g / 2 * scale) + .5; vx.moveTo(0, Y); vx.lineTo(cw, Y); }
+            vx.stroke();
+        }
+        if (drag && drag.mode === 'marquee' && drag.b) {
+            const [x, y, w, h] = rectAB(drag.a, drag.b);
+            vx.fillStyle = 'rgba(47,95,208,.12)'; vx.fillRect(x * scale, y * scale, w * scale, h * scale);
+            vx.strokeStyle = '#2f5fd0'; vx.lineWidth = 1; vx.strokeRect(x * scale + .5, y * scale + .5, w * scale - 1, h * scale - 1);
         }
         if (alt) drawMeasure();
     }
 
     // ---------- Option/Alt distance overlay ----------
-    let alt = false, hoverShape = -1;
-    const MC = '#f24822';
+    let alt = false, hoverShape = -1, hoverT = null;
+    const MC = '#f24822', GC = '#ff2d8a';
     function drawMeasure() {
-        const ai = S.sel >= 0 ? S.sel : hoverShape; if (ai < 0 || !S.shapes[ai]) return;
-        const A = bbox(S.shapes[ai]);
-        const bi = hoverShape >= 0 && hoverShape !== ai ? hoverShape : -1;
-        const B = bi >= 0 ? bbox(S.shapes[bi]) : [0, 0, S.W, S.H];
+        const Ai = S.sel.length ? S.sel : hoverT; if (!Ai || !Ai.length) return;
+        const A = boxOf(Ai);
+        const hasB = !!(hoverT && hoverT.some(i => !Ai.includes(i)));
+        const B = hasB ? boxOf(hoverT) : [0, 0, S.W, S.H];
         const [ax, ay, aw, ah] = A, [bx, by, bw, bh] = B, ar = ax + aw, ab = ay + ah, br = bx + bw, bb = by + bh;
         const segs = []; // {o:'h'|'v', a, b, at} in pixel-edge units
         const cy = ay + ah / 2, cx = ax + aw / 2;
-        const inside = (ax >= bx && ay >= by && ar <= br && ab <= bb), contains = bi >= 0 && (bx >= ax && by >= ay && br <= ar && bb <= ab);
-        if (inside || bi < 0) {
+        const inside = (ax >= bx && ay >= by && ar <= br && ab <= bb), contains = hasB && (bx >= ax && by >= ay && br <= ar && bb <= ab);
+        if (inside || !hasB) {
             segs.push({ o: 'h', a: bx, b: ax, at: cy }, { o: 'h', a: ar, b: br, at: cy }, { o: 'v', a: by, b: ay, at: cx }, { o: 'v', a: ab, b: bb, at: cx });
         } else if (contains) {
             const qy = by + bh / 2, qx = bx + bw / 2;
@@ -332,7 +529,7 @@
             }
         }
         vx.save();
-        if (bi >= 0) { vx.strokeStyle = MC; vx.lineWidth = 1; vx.strokeRect(bx * scale + .5, by * scale + .5, bw * scale - 1, bh * scale - 1); }
+        if (hasB) { vx.strokeStyle = MC; vx.lineWidth = 1; vx.strokeRect(bx * scale + .5, by * scale + .5, bw * scale - 1, bh * scale - 1); }
         vx.strokeStyle = MC; vx.lineWidth = 1; vx.strokeRect(ax * scale + .5, ay * scale + .5, aw * scale - 1, ah * scale - 1);
         for (const g of segs) {
             const d = g.b - g.a; if (d === 0) continue;
@@ -369,9 +566,10 @@
     // ---------- pointer ----------
     let drag = null;
     function ptr(e) { const r = view.getBoundingClientRect(); return { x: Math.floor((e.clientX - r.left) / scale), y: Math.floor((e.clientY - r.top) / scale), sx: e.clientX - r.left, sy: e.clientY - r.top }; }
+    // locked shapes don't write the ID buffer, so clicks go through them
     function pick(x, y) {
         let box = -1;
-        for (let i = S.shapes.length - 1; i >= 0; i--) { const s = S.shapes[i]; if (s.t !== 'text') continue; const [bx, by, bw, bh] = bbox(s); if (x >= bx && y >= by && x < bx + bw && y < by + bh) { box = i; break; } }
+        for (let i = S.shapes.length - 1; i >= 0; i--) { const s = S.shapes[i]; if (s.t !== 'text' || hiddenAt(i) || lockedAt(i)) continue; const [bx, by, bw, bh] = bbox(s); if (x >= bx && y >= by && x < bx + bw && y < by + bh) { box = i; break; } }
         for (let rad = 0; rad <= 3; rad++) {
             let best = -1;
             for (let dy = -rad; dy <= rad; dy++)for (let dx = -rad; dx <= rad; dx++) { const X = x + dx, Y = y + dy; if (X < 0 || Y < 0 || X >= S.W || Y >= S.H) continue; const v = idb[Y * S.W + X]; if (v > best) best = v; }
@@ -380,12 +578,16 @@
         return box;
     }
     function hitHandle(p) {
-        const s = S.shapes[S.sel]; if (!s || S.tool !== 'select') return null;
+        const s = one(); if (!s || S.tool !== 'select' || lockedAt(S.sel[0])) return null;
         for (const hd of handles(s)) { const X = (hd.x + .5) * scale, Y = (hd.y + .5) * scale; if (Math.abs(p.sx - X) <= 7 && Math.abs(p.sy - Y) <= 7) return hd; }
         return null;
     }
     function focusText(sel) { setTimeout(() => { const ta = document.getElementById('insText'); if (ta) { ta.focus(); if (sel) ta.select(); } }, 0); }
-    view.addEventListener('dblclick', e => { const s = S.shapes[S.sel]; if (s && s.t === 'text') focusText(true); });
+    // double click goes inside groups: selects exactly the shape under the cursor
+    view.addEventListener('dblclick', e => {
+        if (S.tool !== 'select') return; const p = ptr(e), i = pick(p.x, p.y); if (i < 0) return;
+        setSel([i]); update(); if (S.shapes[i].t === 'text') focusText(true);
+    });
     function newShape(t, a, b) {
         const c = S.color, f = S.fill;
         switch (t) {
@@ -395,37 +597,71 @@
             case 'line': { let x1 = b.x, y1 = b.y; if (drag && drag.shift) { if (Math.abs(x1 - a.x) > Math.abs(y1 - a.y)) y1 = a.y; else x1 = a.x; } return { t, x0: a.x, y0: a.y, x1, y1, c }; }
         }
     }
+    function addShape(s) { s.name = shapeName(s.t); if (S.colorPc) s.pc = S.colorPc; S.shapes.push(s); setSel([S.shapes.length - 1]); }
     view.addEventListener('pointerdown', e => {
-        const p = ptr(e); view.setPointerCapture(e.pointerId);
+        const p = ptr(e); view.setPointerCapture(e.pointerId); guides = { x: [], y: [] };
         if (S.tool === 'select') {
-            const hd = hitHandle(p);
-            if (hd) { push(); drag = { mode: 'handle', hd }; return; }
-            const i = pick(p.x, p.y); S.sel = i;
-            if (i >= 0) { push(); drag = { mode: 'move', last: p }; }
+            const hd = !e.shiftKey && hitHandle(p);
+            if (hd) { drag = { mode: 'handle', hd, snap: snapshot(), lines: snapLines(new Set(S.sel)) }; return; }
+            const i = pick(p.x, p.y);
+            if (i < 0) { if (!e.shiftKey) S.sel = []; drag = { mode: 'marquee', a: p, b: null, base: S.sel.slice() }; update(); return; }
+            const t = target(i), all = t.every(j => S.sel.includes(j));
+            if (e.shiftKey) { setSel(all ? S.sel.filter(j => !t.includes(j)) : S.sel.concat(t)); update(); return; }
+            if (!all) setSel(t);
+            drag = { mode: 'move', a: p, orig: S.sel.map(j => JSON.stringify(S.shapes[j])), box: boxOf(S.sel), snap: snapshot(), lines: snapLines(new Set(S.sel)), moved: false };
             update(); return;
         }
         if (S.tool === 'tri') {
             triPts = triPts || []; triPts.push({ x: p.x, y: p.y });
-            if (triPts.length === 3) { push(); const [a, b, c] = triPts; S.shapes.push({ t: 'tri', fill: S.fill, x0: a.x, y0: a.y, x1: b.x, y1: b.y, x2: c.x, y2: c.y, c: S.color }); S.sel = S.shapes.length - 1; triPts = null; update(); }
+            if (triPts.length === 3) { push(); const [a, b, c] = triPts; triPts = null; addShape({ t: 'tri', fill: S.fill, x0: a.x, y0: a.y, x1: b.x, y1: b.y, x2: c.x, y2: c.y, c: S.color }); update(); }
             else render();
             return;
         }
-        if (S.tool === 'pixel') { push(); S.shapes.push({ t: 'pixel', x: p.x, y: p.y, c: S.color }); S.sel = S.shapes.length - 1; update(); return; }
-        drag = { mode: 'create', a: { x: p.x, y: p.y }, shift: e.shiftKey, moved: false };
+        if (S.tool === 'pixel') { push(); addShape({ t: 'pixel', x: p.x, y: p.y, c: S.color }); update(); return; }
+        drag = { mode: 'create', a: { x: p.x, y: p.y }, shift: e.shiftKey, moved: false, lines: snapLines(new Set()) };
         preview = newShape(S.tool, drag.a, drag.a); render();
     });
     view.addEventListener('pointermove', e => {
         const p = ptr(e); hover = { x: p.x, y: p.y }; status();
         const prevHS = hoverShape, prevAlt = alt; alt = e.altKey;
-        if (!drag || drag.mode !== 'move') { hoverShape = pick(p.x, p.y); }
+        if (!drag || drag.mode !== 'move') { hoverShape = pick(p.x, p.y); hoverT = hoverShape >= 0 ? target(hoverShape) : null; }
         if (!drag && S.tool === 'select') { const hd = hitHandle(p); view.style.cursor = hd ? hd.cur : hoverShape >= 0 ? 'move' : ''; }
         else if (S.tool !== 'select') view.style.cursor = S.tool === 'text' ? 'text' : '';
         if (!drag) { if (triPts || alt && (hoverShape !== prevHS || !prevAlt) || prevAlt !== alt) render(); return; }
-        if (drag.mode === 'create') { drag.shift = e.shiftKey; if (p.x !== drag.a.x || p.y !== drag.a.y) drag.moved = true; preview = newShape(S.tool, drag.a, p); render(); }
-        else if (drag.mode === 'move') { const dx = p.x - drag.last.x, dy = p.y - drag.last.y; if (dx || dy) { moveShape(S.shapes[S.sel], dx, dy); drag.last = p; update(true); } }
-        else if (drag.mode === 'handle') { drag.hd.set(S.shapes[S.sel], p.x, p.y); update(true); }
+        const free = e.ctrlKey || e.metaKey; // Ctrl/⌘ held: no snapping
+        guides = { x: [], y: [] };
+        if (drag.mode === 'create') {
+            drag.shift = e.shiftKey; if (p.x !== drag.a.x || p.y !== drag.a.y) drag.moved = true;
+            const [a, b] = free ? [drag.a, p] : snapCreate(drag.a, p, drag.lines);
+            preview = newShape(S.tool, a, b); render();
+        }
+        else if (drag.mode === 'move') {
+            let dx = p.x - drag.a.x, dy = p.y - drag.a.y;
+            if (!drag.moved && !dx && !dy) return; drag.moved = true;
+            if (!free) {
+                const [x, y, w, h] = drag.box, X = x + dx, Y = y + dy;
+                const sx = snap1([2 * X, 2 * X + w, 2 * X + 2 * w], drag.lines.xs), sy = snap1([2 * Y, 2 * Y + h, 2 * Y + 2 * h], drag.lines.ys);
+                dx += sx.d; dy += sy.d; guides = { x: sx.at, y: sy.at };
+            }
+            if (!drag.pushed) { push('', drag.snap); drag.pushed = true; }
+            S.sel.forEach((j, k) => { Object.assign(S.shapes[j], JSON.parse(drag.orig[k])); moveShape(S.shapes[j], dx, dy); });
+            update(true);
+        }
+        else if (drag.mode === 'handle') {
+            let nx = p.x, ny = p.y;
+            if (!free) { const r = snapHandle(drag.hd, nx, ny, drag.lines); nx = r.x; ny = r.y; guides = r.g; }
+            if (!drag.pushed) { push('', drag.snap); drag.pushed = true; }
+            drag.hd.set(one(), nx, ny); update(true);
+        }
+        else if (drag.mode === 'marquee') {
+            drag.b = p; const [x, y, w, h] = rectAB(drag.a, p), hit = [];
+            S.shapes.forEach((s, i) => { if (hiddenAt(i) || lockedAt(i)) return; const [bx, by, bw, bh] = bbox(s); if (bx < x + w && bx + bw > x && by < y + h && by + bh > y) hit.push(i); });
+            const tops = hit.flatMap(i => { const ch = anc(S.shapes[i].g); return ch.length ? groupMembers(ch[ch.length - 1]) : [i]; });
+            setSel(drag.base.concat(tops)); update(true);
+        }
     });
     function endDrag() {
+        guides = { x: [], y: [] };
         if (drag && drag.mode === 'create') {
             let s = preview;
             if (!drag.moved) {
@@ -435,14 +671,14 @@
                 else if (S.tool === 'circle') s.r = 10;
                 else if (S.tool === 'line') { s.x1 = a.x + 30; }
             }
-            push(); S.shapes.push(s); S.sel = S.shapes.length - 1; preview = null;
+            push(); addShape(s); preview = null;
             if (s.t === 'text') { S.tool = 'select'; drag = null; update(); focusText(true); return; }
         }
         drag = null; update();
     }
     view.addEventListener('pointerup', endDrag);
-    view.addEventListener('pointercancel', () => { drag = null; preview = null; render(); });
-    view.addEventListener('pointerleave', () => { hover = null; hoverShape = -1; status(); render(); });
+    view.addEventListener('pointercancel', () => { drag = null; preview = null; guides = { x: [], y: [] }; render(); });
+    view.addEventListener('pointerleave', () => { hover = null; hoverShape = -1; hoverT = null; status(); render(); });
     document.addEventListener('keydown', e => { if (e.key === 'Alt') { e.preventDefault(); if (!alt) { alt = true; render(); } } });
     document.addEventListener('keyup', e => { if (e.key === 'Alt') { e.preventDefault(); alt = false; render(); } });
     window.addEventListener('blur', () => { if (alt) { alt = false; render(); } });
@@ -457,6 +693,7 @@
         tri: '<path d="M12 4l8.5 15h-17z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>',
         pixel: '<rect x="9" y="9" width="6" height="6" fill="currentColor"/>',
         text: '<path d="M5 6V4h14v2M12 4v16M9 20h6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>',
+        group: '<path d="M3 6h6l2 2h10v11H3z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>',
     };
     const AL = 'fill="currentColor"';
     const ALIGN = [
@@ -468,10 +705,17 @@
         ['b', 'К нижнему краю', `<rect x="2" y="16.4" width="16" height="1.6" ${AL}/><rect x="5" y="5" width="4" height="10" ${AL}/><rect x="11" y="9" width="4" height="6" ${AL}/>`],
         ['c', 'Точно по центру экрана', `<rect x="9.2" y="2" width="1.6" height="16" ${AL}/><rect x="2" y="9.2" width="16" height="1.6" ${AL}/><rect x="6" y="6" width="8" height="8" fill="none" stroke="currentColor" stroke-width="1.5"/>`],
     ];
+    // alignment inside the selection: same icons, plus equal spacing
+    const SALIGN = [
+        ['l', 'Выровнять левые края', ALIGN[0][2]], ['cx', 'Выровнять центры по горизонтали', ALIGN[1][2]], ['r', 'Выровнять правые края', ALIGN[2][2]],
+        ['t', 'Выровнять верхние края', ALIGN[3][2]], ['cy', 'Выровнять центры по вертикали', ALIGN[4][2]], ['b', 'Выровнять нижние края', ALIGN[5][2]],
+        ['dh', 'Равные промежутки по горизонтали (от 3 фигур)', `<rect x="2" y="5" width="3" height="10" ${AL}/><rect x="8.5" y="3" width="3" height="14" ${AL}/><rect x="15" y="6" width="3" height="8" ${AL}/>`],
+        ['dv', 'Равные промежутки по вертикали (от 3 фигур)', `<rect x="5" y="2" width="10" height="3" ${AL}/><rect x="3" y="8.5" width="14" height="3" ${AL}/><rect x="6" y="15" width="8" height="3" ${AL}/>`],
+    ];
     const TOOLS = [['select', 'Выбор и перемещение', 'V'], ['rect', 'Прямоугольник', 'R'], ['rrect', 'Скруглённый прямоугольник', 'O'], ['circle', 'Круг', 'C'], ['line', 'Линия', 'L'], ['tri', 'Треугольник', 'Y'], ['pixel', 'Пиксель', 'P'], ['text', 'Текст', 'T']];
     const HINTS = {
-        select: 'Клик — выбрать фигуру, тяни — двигать. Квадратные маркеры меняют размер. Стрелки сдвигают на 1 px, с Shift на 10. Зажми Option (Alt) — увидишь расстояния до краёв, а при наведении на другую фигуру — до неё.',
-        rect: 'Тяни от угла до угла. Shift — квадрат. Просто клик ставит 40×30.',
+        select: 'Клик — выбрать (фигуру в группе — вместе с группой, двойной клик — саму фигуру). Shift+клик — добавить к выделению, рамка по пустому месту — выделить несколько. Тяни — двигать, края и центры прилипают, с Ctrl/⌘ без привязки. Стрелки — 1 px, с Shift 10. Option (Alt) — расстояния.',
+        rect: 'Тяни от угла до угла. Shift — квадрат. Просто клик ставит 40×30. Ctrl/⌘ — без привязки.',
         rrect: 'Тяни от угла до угла. Радиус настраивается в панели фигуры.',
         circle: 'Нажми в центре и тяни наружу — это радиус. Привязка у круга по центру.',
         line: 'Тяни от начала до конца. Shift — строго по горизонтали или вертикали.',
@@ -487,7 +731,7 @@
     document.getElementById('fillBtn').onclick = toggleFill;
     document.getElementById('undoBtn').onclick = undo;
     function setTool(t) { S.tool = t; triPts = null; preview = null; update(); }
-    function toggleFill() { const s = S.shapes[S.sel]; if (s && META[s.t].canFill) { push(); s.fill = !s.fill; S.fill = s.fill; } else S.fill = !S.fill; update(); }
+    function toggleFill() { const ss = selShapes().filter(s => META[s.t].canFill); if (ss.length) { push(); const v = !ss[0].fill; ss.forEach(s => s.fill = v); S.fill = v; } else S.fill = !S.fill; update(); }
 
     const sw = document.getElementById('swatches');
     sw.innerHTML = SWATCHES.map(c => `<button class="sw" data-c="${c}" style="background:${toHex(c)}" title="${fmt565(c)}" aria-label="${fmt565(c)}"></button>`).join('');
@@ -495,42 +739,110 @@
     const inColor = document.getElementById('inColor'), inColor565 = document.getElementById('inColor565');
     inColor.addEventListener('input', () => setColor(to565(inColor.value), 'color'));
     inColor565.addEventListener('change', () => { const c = parse565(inColor565.value); if (c != null) setColor(c); });
-    function setColor(c, key) { S.color = c; const s = S.shapes[S.sel]; if (s) { push(key ? 'col' + S.sel : ''); s.c = c; } update(); }
-    const inBg = document.getElementById('inBg'), inBg565 = document.getElementById('inBg565');
-    inBg.addEventListener('input', () => { push('bg'); S.bg = to565(inBg.value); update(); });
-    inBg565.addEventListener('change', () => { const c = parse565(inBg565.value); if (c != null) { push(); S.bg = c; } update(); });
+    // pc: palette name, otherwise the color becomes a literal
+    function setColor(c, key, pc) {
+        S.color = c; S.colorPc = pc || ''; const ss = selShapes();
+        if (ss.length) { push(key ? 'col' + S.sel.join() : ''); for (const s of ss) { s.c = c; if (pc) s.pc = pc; else delete s.pc; } }
+        update();
+    }
+    const inBg = document.getElementById('inBg'), inBg565 = document.getElementById('inBg565'), inBgPc = document.getElementById('inBgPc');
+    inBg.addEventListener('input', () => { push('bg'); S.bg = to565(inBg.value); S.bgPc = ''; update(); });
+    inBg565.addEventListener('change', () => { const c = parse565(inBg565.value); if (c != null) { push(); S.bg = c; S.bgPc = ''; } update(); });
+    inBgPc.addEventListener('change', () => { push(); S.bgPc = inBgPc.value; update(); });
+    function renderBgPc() {
+        inBgPc.hidden = !S.palette.length; if (document.activeElement === inBgPc) return;
+        inBgPc.innerHTML = '<option value="">— из палитры —</option>' + S.palette.map(p => `<option${p.n === S.bgPc ? ' selected' : ''}>${p.n}</option>`).join('');
+    }
 
-    const inW = document.getElementById('inW'), inH = document.getElementById('inH'), inZoom = document.getElementById('inZoom'), inGrid = document.getElementById('inGrid');
-    function syncSettings() { inW.value = S.W; inH.value = S.H; inZoom.value = S.zoom; inGrid.checked = S.grid; }
-    inW.addEventListener('change', () => { const v = Math.max(1, Math.min(1024, +inW.value | 0)); push(); S.W = v; update(); });
-    inH.addEventListener('change', () => { const v = Math.max(1, Math.min(1024, +inH.value | 0)); push(); S.H = v; update(); });
+    // palette
+    const palEl = document.getElementById('palette'); let palHtml = '';
+    function curPc() { const ss = selShapes(); if (!ss.length) return S.colorPc; const p = ss[0].pc || ''; return ss.every(s => (s.pc || '') === p) ? p : ''; }
+    function renderPalette() {
+        const a = document.activeElement; if (palEl.contains(a) && a.tagName === 'INPUT') return; // don't rebuild under the user's typing or an open color picker
+        const cur = curPc(), e = palEntry(cur);
+        const html = `<div class="row"><span class="set">Палитра</span>${S.palette.map(p => `<button class="pchip" data-pn="${p.n}" aria-pressed="${p.n === cur}" title="${fmt565(p.c)}"><span class="chip" style="background:${toHex(p.c)}"></span>${p.n}</button>`).join('')}<button class="btn" id="palAdd" title="Добавить текущий цвет в палитру и привязать к нему выбранное">+ в палитру</button></div>`
+            + (e ? `<div class="row pal-edit"><span class="set">Цвет палитры</span><input type="text" id="palName" value="${e.n}" style="width:110px" aria-label="Имя цвета"><input type="color" id="palColor" value="${toHex(e.c)}" aria-label="Цвет ${e.n}"><input type="text" id="palHex" value="${fmt565(e.c)}" style="width:72px" aria-label="${e.n} в RGB565"><button class="btn danger" id="palDel" title="Убрать из палитры (у фигур останется этот же цвет числом)">Удалить</button></div><div class="msg warn" id="palWarn"></div>` : '');
+        if (html !== palHtml) palEl.innerHTML = palHtml = html;
+    }
+    palEl.addEventListener('click', e => {
+        const chip = e.target.closest('[data-pn]');
+        if (chip) { const p = palEntry(chip.dataset.pn); setColor(p.c, '', p.n); return; }
+        if (e.target.closest('#palAdd')) {
+            push(); const ss = selShapes(), c = ss.length ? ss[0].c : S.color, n = newPalName(c);
+            S.palette.push({ n, c });
+            if (ss.length) ss.forEach(s => { if (s.c === c) s.pc = n; }); else S.colorPc = n;
+            update(); return;
+        }
+        if (e.target.closest('#palDel')) {
+            const n = curPc(); push(); S.palette = S.palette.filter(p => p.n !== n); update();
+        }
+    });
+    palEl.addEventListener('input', e => { if (e.target.id !== 'palColor') return; const p = palEntry(curPc()); if (!p) return; push('pal' + p.n); p.c = to565(e.target.value); update(); });
+    palEl.addEventListener('change', e => {
+        const p = palEntry(curPc()); if (!p) return;
+        if (e.target.id === 'palHex') { const c = parse565(e.target.value); if (c != null) { push(); p.c = c; } update(); }
+        if (e.target.id === 'palName') {
+            const v = e.target.value.trim(), warn = document.getElementById('palWarn');
+            if (v === p.n) return;
+            if (!validName(v, p)) { warn.textContent = 'Имя — идентификатор C++ (латиница, цифры, _), не W/H/имя цвета и без повторов.'; e.target.value = p.n; return; }
+            push(); for (const s of S.shapes) if (s.pc === p.n) s.pc = v; if (S.bgPc === p.n) S.bgPc = v; if (S.colorPc === p.n) S.colorPc = v; p.n = v; warn.textContent = ''; update();
+        }
+    });
+    palEl.addEventListener('focusout', () => setTimeout(() => { renderPalette(); renderBgPc(); }, 0));
+
+    // screen size presets and orientation
+    const PRESETS = [[172, 320, 'Waveshare 1.47″'], [135, 240, '1.14″'], [240, 240, '1.3″ / 1.54″'], [240, 280, '1.69″'], [240, 320, '2.0–2.8″'], [320, 480, '3.5″'], [128, 160, '1.8″'], [128, 128, '']];
+    const inW = document.getElementById('inW'), inH = document.getElementById('inH'), inZoom = document.getElementById('inZoom'), inGrid = document.getElementById('inGrid'), inPreset = document.getElementById('inPreset');
+    inPreset.innerHTML = '<option value="">свой</option>' + PRESETS.map(([w, h, n], k) => `<option value="${k}">${w}×${h}${n ? ' · ' + n : ''}</option>`).join('');
+    function syncSettings() {
+        inW.value = S.W; inH.value = S.H; inZoom.value = S.zoom; inGrid.checked = S.grid;
+        const k = PRESETS.findIndex(([w, h]) => Math.min(S.W, S.H) === Math.min(w, h) && Math.max(S.W, S.H) === Math.max(w, h)); inPreset.value = k < 0 ? '' : k;
+    }
+    inW.addEventListener('change', () => { const v = Math.max(1, Math.min(1024, +inW.value | 0)); push(); S.W = v; syncSettings(); update(); });
+    inH.addEventListener('change', () => { const v = Math.max(1, Math.min(1024, +inH.value | 0)); push(); S.H = v; syncSettings(); update(); });
+    inPreset.addEventListener('change', () => { if (inPreset.value === '') return; const [w, h] = PRESETS[+inPreset.value], land = S.W > S.H; push(); S.W = land ? h : w; S.H = land ? w : h; syncSettings(); update(); });
+    document.getElementById('rotBtn').addEventListener('click', () => { push(); [S.W, S.H] = [S.H, S.W]; syncSettings(); update(); });
     inZoom.addEventListener('change', () => { S.zoom = inZoom.value; update(); });
     inGrid.addEventListener('change', () => { S.grid = inGrid.checked; update(); });
 
     // inspector
     const insBody = document.getElementById('insBody'), insBtns = document.getElementById('insBtns');
+    const alignHtml = (attr, list, label, aria, dis) => `<div class="align" role="group" aria-label="${aria}"><span class="set">${label}</span>${list.map(([k, n, ic]) => `<button class="ab${k === 'c' ? ' wide' : ''}" ${attr}="${k}" title="${n}" aria-label="${n}"${dis && dis(k) ? ' disabled' : ''}><svg viewBox="0 0 20 20">${ic}</svg>${k === 'c' ? 'центр' : ''}</button>`).join('')}</div>`;
+    const stepBtns = '<button class="btn" data-a="up" title="Выше (рисуется позже)">↑</button><button class="btn" data-a="down" title="Ниже (рисуется раньше)">↓</button>';
     function renderInspector() {
-        const s = S.shapes[S.sel];
-        if (!s) {
+        const s = one();
+        if (!S.sel.length) {
             insBtns.innerHTML = '';
-            insBody.innerHTML = `<div class="empty">Ничего не выбрано. Новые фигуры: <b>${S.fill ? 'заливка' : 'контур'}</b>, цвет ${fmt565(S.color)}${S.tool === 'rrect' ? '' : ''}.</div>
+            insBody.innerHTML = `<div class="empty">Ничего не выбрано. Новые фигуры: <b>${S.fill ? 'заливка' : 'контур'}</b>, цвет ${S.colorPc || fmt565(S.color)}.</div>
       <div class="row" style="margin-top:8px"><span class="set">Радиус для новых скруглённых</span><input type="number" id="inRad" value="${S.radius}" style="width:60px"></div>`;
             document.getElementById('inRad').onchange = e => { S.radius = Math.max(0, +e.target.value | 0); save(); };
             return;
         }
-        const m = META[s.t];
-        insBtns.innerHTML = `<button class="btn" data-a="up" title="Выше (рисуется позже)">↑</button><button class="btn" data-a="down" title="Ниже (рисуется раньше)">↓</button><button class="btn" data-a="dup" title="Дублировать (Ctrl+D)">Копия</button><button class="btn danger" data-a="del" title="Удалить (Del)">Удалить</button>`;
-        insBody.innerHTML = `<div class="row" style="justify-content:space-between"><span><span class="chip" style="background:${toHex(s.c)}"></span>${m.name} <span class="spec">#${S.sel + 1}</span></span>
+        if (!s) return renderMulti();
+        const m = META[s.t], i = S.sel[0];
+        insBtns.innerHTML = `${stepBtns}<button class="btn" data-a="dup" title="Дублировать (Ctrl+D)">Копия</button><button class="btn danger" data-a="del" title="Удалить (Del)">Удалить</button>`;
+        insBody.innerHTML = `<div class="row" style="justify-content:space-between"><span><span class="chip" style="background:${toHex(s.c)}"></span><b>${esc(s.name || m.name)}</b> <span class="spec">${[(s.name || '').startsWith(m.name) ? '' : m.name, s.pc].filter(Boolean).join(' · ')}</span></span>
     ${m.canFill ? `<span class="seg" id="insFill"><button data-f="0" aria-pressed="${!s.fill}">draw</button><button data-f="1" aria-pressed="${!!s.fill}">fill</button></span>` : ''}</div>
     <div class="fields" style="margin-top:10px">${m.f.map(([k, l]) => `<label>${l}<input type="number" data-k="${k}" id="f-${k}" value="${s[k]}"></label>`).join('')}</div>
     ${s.t === 'text' ? textInspector(s) : ''}
-    <div class="align" role="group" aria-label="Выравнивание по экрану"><span class="set">По экрану</span>${ALIGN.map(([k, n, ic]) => `<button class="ab${k === 'c' ? ' wide' : ''}" data-al="${k}" title="${n}" aria-label="${n}">${k === 'c' ? '<svg viewBox="0 0 20 20">' + ic + '</svg>центр' : '<svg viewBox="0 0 20 20">' + ic + '</svg>'}</button>`).join('')}</div>`;
+    ${alignHtml('data-al', ALIGN, 'По экрану', 'Выравнивание по экрану')}`;
         insBody.querySelectorAll('input[data-k]').forEach(inp => inp.addEventListener('input', () => {
-            if (inp.value === '' || isNaN(+inp.value)) return; push('f' + S.sel + inp.dataset.k); S.shapes[S.sel][inp.dataset.k] = Math.trunc(+inp.value); update(true);
+            if (inp.value === '' || isNaN(+inp.value)) return; push('f' + i + inp.dataset.k); S.shapes[i][inp.dataset.k] = Math.trunc(+inp.value); update(true);
         }));
-        if (s.t === 'text') bindTextInspector(s);
+        if (s.t === 'text') bindTextInspector(s, i);
         const f = document.getElementById('insFill');
         if (f) f.onclick = e => { const b = e.target.closest('button'); if (!b) return; push(); s.fill = b.dataset.f === '1'; S.fill = s.fill; update(); };
+    }
+    function renderMulti() {
+        const ns = selNodes(), grp = selGroup();
+        insBtns.innerHTML = (ns.length === 1 ? stepBtns : '')
+            + (grp ? '<button class="btn" data-a="ungroup" title="Разгруппировать (Ctrl/⌘+Shift+G)">Разгруппировать</button>' : '<button class="btn" data-a="group" title="Сгруппировать (Ctrl/⌘+G)">Группа</button>')
+            + '<button class="btn" data-a="dup" title="Дублировать (Ctrl+D)">Копия</button><button class="btn danger" data-a="del" title="Удалить (Del)">Удалить</button>';
+        insBody.innerHTML = `<div class="row">${grp ? `<label class="set">Группа <input type="text" id="grpName" value="${escA(grp.g.name)}" style="width:160px"></label>` : ''}<span class="spec">выбрано фигур: ${S.sel.length}${ns.length > 1 ? `, объектов: ${ns.length}` : ''}</span></div>
+    ${ns.length >= 2 ? alignHtml('data-sal', SALIGN, 'Между собой', 'Выравнивание внутри выделения', k => (k === 'dh' || k === 'dv') && ns.length < 3) : ''}
+    ${alignHtml('data-al', ALIGN, 'По экрану', 'Выравнивание по экрану')}`;
+        const gn = document.getElementById('grpName');
+        if (gn) gn.addEventListener('change', () => { const v = gn.value.trim(); if (v && v !== grp.g.name) { push(); grp.g.name = v; } update(); });
     }
     function textInspector(s) {
         const opts = FONT_GROUPS.map(([g, ks]) => `<optgroup label="${g}">${ks.map(k => `<option value="${k}"${k === s.font ? ' selected' : ''}>${fontLabel(k)}</option>`).join('')}</optgroup>`).join('');
@@ -551,86 +863,184 @@
     function textWarn(s) {
         const bad = [...new Set([...(s.text || '')].filter(ch => ch !== '\n' && !supported(s.font, ch)))];
         const el = document.getElementById('txtWarn'); if (!el) return;
-        const L = layoutText(s), m = fontMetrics(s.font, s.size), over = m.block(wrapText(s).length) > s.h;
+        const m = fontMetrics(s.font, s.size), over = m.block(wrapText(s).length) > s.h;
         el.textContent = (bad.length ? `Нет в шрифте и будут пропущены: ${bad.slice(0, 12).join(' ')}. ` : '') + (over ? 'Текст выше рамки — увеличь h или нажми «Высота по тексту».' : '');
     }
-    function bindTextInspector(s) {
+    function bindTextInspector(s, i) {
         const ta = document.getElementById('insText');
-        ta.addEventListener('input', () => { push('txt' + S.sel); s.text = ta.value; textWarn(s); update(true); });
+        ta.addEventListener('input', () => { push('txt' + i); s.text = ta.value; textWarn(s); update(true); });
         document.getElementById('insFont').onchange = e => {
             push(); const wasBuiltin = !s.font; s.font = e.target.value; S.textFont = s.font;
             if (s.font && wasBuiltin && s.size > 1) { s.size = 1; S.textSize = 1; } else if (!s.font && !wasBuiltin && s.size === 1) { s.size = 2; S.textSize = 2; }
             update();
         };
-        document.getElementById('insSize').addEventListener('input', e => { const v = Math.max(1, Math.min(10, +e.target.value | 0)); if (!e.target.value) return; push('sz' + S.sel); s.size = v; S.textSize = v; textWarn(s); update(true); });
+        document.getElementById('insSize').addEventListener('input', e => { const v = Math.max(1, Math.min(10, +e.target.value | 0)); if (!e.target.value) return; push('sz' + i); s.size = v; S.textSize = v; textWarn(s); update(true); });
         document.getElementById('insAlign').onclick = e => { const b = e.target.closest('button'); if (!b) return; push(); s.align = b.dataset.v; update(); };
         document.getElementById('insVAlign').onclick = e => { const b = e.target.closest('button'); if (!b) return; push(); s.valign = b.dataset.v; update(); };
         document.getElementById('fitH').onclick = () => { push(); s.h = Math.max(1, fontMetrics(s.font, s.size).block(Math.max(1, wrapText(s).length))); update(); };
         textWarn(s);
     }
-    insBody.addEventListener('click', e => { const b = e.target.closest('[data-al]'); if (b) align(b.dataset.al); });
-    function align(k) {
-        const s = S.shapes[S.sel]; if (!s) return;
-        const [x, y, w, h] = bbox(s); let dx = 0, dy = 0;
+    insBody.addEventListener('click', e => { const b = e.target.closest('[data-al],[data-sal]'); if (!b) return; b.dataset.al ? alignScreen(b.dataset.al) : alignSel(b.dataset.sal); });
+    // the whole selection moves as one block
+    function alignScreen(k) {
+        const b = boxOf(S.sel); if (!b) return;
+        const [x, y, w, h] = b; let dx = 0, dy = 0;
         if (k === 'l') dx = -x; if (k === 'r') dx = S.W - w - x; if (k === 'cx' || k === 'c') dx = Math.round((S.W - w) / 2) - x;
         if (k === 't') dy = -y; if (k === 'b') dy = S.H - h - y; if (k === 'cy' || k === 'c') dy = Math.round((S.H - h) / 2) - y;
-        if (!dx && !dy) return; push(); moveShape(s, dx, dy); update();
+        if (!dx && !dy) return; push(); shiftSel(S.sel, dx, dy); update();
     }
-    insBtns.addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return; act(b.dataset.a); });
+    // align / distribute the selected objects (a whole group is one object) within the selection box
+    function alignSel(k) {
+        const ns = selNodes().map(n => { const idx = nodeIdx(n); return { idx, b: boxOf(idx) }; }); if (ns.length < 2) return;
+        const [X, Y, W, H] = boxOf(S.sel), moves = [];
+        if (k === 'dh' || k === 'dv') {
+            if (ns.length < 3) return;
+            const hz = k === 'dh', a = hz ? 0 : 1, sz = hz ? 2 : 3, start = hz ? X : Y, span = hz ? W : H;
+            ns.sort((p, q) => p.b[a] - q.b[a] || p.b[sz] - q.b[sz]);
+            const gap = (span - ns.reduce((t, n) => t + n.b[sz], 0)) / (ns.length - 1); let acc = 0;
+            ns.forEach((n, j) => { const t = Math.round(start + acc + j * gap); acc += n.b[sz]; moves.push([n.idx, hz ? t - n.b[0] : 0, hz ? 0 : t - n.b[1]]); });
+        } else ns.forEach(n => {
+            const [x, y, w, h] = n.b; let dx = 0, dy = 0;
+            if (k === 'l') dx = X - x; if (k === 'r') dx = X + W - w - x; if (k === 'cx') dx = X + Math.round((W - w) / 2) - x;
+            if (k === 't') dy = Y - y; if (k === 'b') dy = Y + H - h - y; if (k === 'cy') dy = Y + Math.round((H - h) / 2) - y;
+            moves.push([n.idx, dx, dy]);
+        });
+        if (!moves.some(m => m[1] || m[2])) return; push(); for (const [idx, dx, dy] of moves) shiftSel(idx, dx, dy); update();
+    }
+    insBtns.addEventListener('click', e => { const b = e.target.closest('button'); if (b) act(b.dataset.a); });
     function act(a) {
-        const i = S.sel, s = S.shapes[i]; if (!s) return; push();
-        if (a === 'del') { S.shapes.splice(i, 1); S.sel = Math.min(i, S.shapes.length - 1); if (S.sel < 0) S.sel = -1; }
-        if (a === 'dup') { const c = JSON.parse(JSON.stringify(s)); moveShape(c, 5, 5); S.shapes.splice(i + 1, 0, c); S.sel = i + 1; }
-        if (a === 'up' && i < S.shapes.length - 1) { [S.shapes[i], S.shapes[i + 1]] = [S.shapes[i + 1], S.shapes[i]]; S.sel = i + 1; }
-        if (a === 'down' && i > 0) { [S.shapes[i], S.shapes[i - 1]] = [S.shapes[i - 1], S.shapes[i]]; S.sel = i - 1; }
+        if (!S.sel.length) return;
+        if (a === 'del') { push(); delSel(); }
+        if (a === 'dup') return dupSel();
+        if (a === 'up') return stepSel(1);
+        if (a === 'down') return stepSel(-1);
+        if (a === 'group') { push(); groupSel(); }
+        if (a === 'ungroup') { const snap = snapshot(); if (ungroupSel()) push('', snap); }
         update();
     }
     // internal clipboard (Ctrl/⌘+C, X, V): each paste of a copy goes +5/+5 further; after a cut the first paste lands in place
     let clip = null, clipN = 0;
     function copySel(cut) {
-        const s = S.shapes[S.sel]; if (!s) return false;
-        clip = JSON.stringify(s); clipN = cut ? -1 : 0;
-        if (cut) act('del');
+        if (!S.sel.length) return false;
+        clip = JSON.stringify(clipSel()); clipN = cut ? -1 : 0;
+        if (cut) { push(); delSel(); update(); }
         return true;
     }
     function paste() {
         if (!clip) return false;
-        push(); clipN++; const c = JSON.parse(clip); moveShape(c, 5 * clipN, 5 * clipN);
-        S.shapes.push(c); S.sel = S.shapes.length - 1; S.tool = 'select'; triPts = null; preview = null; update();
+        push(); clipN++; const at = S.sel.length ? Math.max(...S.sel) + 1 : S.shapes.length, parent = S.sel.length ? commonParent(selNodes()) : null;
+        insertPiece(JSON.parse(clip), 5 * clipN, at, parent); S.tool = 'select'; triPts = null; preview = null; update();
         return true;
     }
+
+    // layers: topmost first, groups fold; click selects, Shift+click adds, double click renames, drag reorders
+    const layersEl = document.getElementById('layers');
+    const EYE = '<svg viewBox="0 0 20 20"><path d="M2 10s3-5.5 8-5.5S18 10 18 10s-3 5.5-8 5.5S2 10 2 10z" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="10" cy="10" r="2.3" fill="currentColor"/></svg>';
+    const EYE_OFF = '<svg viewBox="0 0 20 20"><path d="M2 10s3-5.5 8-5.5S18 10 18 10s-3 5.5-8 5.5S2 10 2 10z" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3.5 16.5l13-13" stroke="currentColor" stroke-width="1.5"/></svg>';
+    const LOCK = '<svg viewBox="0 0 20 20"><rect x="4.5" y="9" width="11" height="8" rx="1.5" fill="currentColor"/><path d="M7 9V6.5a3 3 0 016 0V9" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>';
+    const UNLOCK = '<svg viewBox="0 0 20 20"><rect x="4.5" y="9" width="11" height="8" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M7 9V6.5a3 3 0 015.8-1" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>';
+    let layersSig = '';
+    function renderLayers() {
+        if (layersEl.querySelector('input')) return; // rename in progress
+        const sel = new Set(S.sel), rows = [];
+        const row = (key, d, on, off, fold, ic, name, hid, lck) => ({
+            on, html: `<div class="ly${off ? ' off' : ''}" ${key} draggable="true" style="padding-left:${4 + d * 14}px"><span class="ly-caret">${fold}</span><svg class="ly-ic" viewBox="0 0 24 24">${ic}</svg><span class="ly-name">${esc(name || '')}</span>`
+                + `<button class="ly-b${hid ? ' act' : ''}" data-act="eye" title="${hid ? 'Показать' : 'Скрыть'}" aria-label="${hid ? 'Показать' : 'Скрыть'}">${hid ? EYE_OFF : EYE}</button>`
+                + `<button class="ly-b${lck ? ' act' : ''}" data-act="lock" title="${lck ? 'Разблокировать' : 'Заблокировать'}" aria-label="${lck ? 'Разблокировать' : 'Заблокировать'}">${lck ? LOCK : UNLOCK}</button></div>`
+        });
+        (function walk(n, d) {
+            for (let k = n.kids.length - 1; k >= 0; k--) {
+                const c = n.kids[k];
+                if (c.i != null) { const s = S.shapes[c.i]; rows.push(row(`data-i="${c.i}"`, d, sel.has(c.i), hiddenAt(c.i), '', ICONS[s.t], s.name, s.hidden, s.locked)); continue; }
+                const g = c.g, m = nodeIdx(c);
+                rows.push(row(`data-g="${c.id}"`, d, m.every(i => sel.has(i)), hiddenAt(m[0]), `<button class="ly-tw" data-act="fold" aria-label="${g.collapsed ? 'Развернуть' : 'Свернуть'}">${g.collapsed ? '▸' : '▾'}</button>`, ICONS.group, g.name, g.hidden, g.locked));
+                if (!g.collapsed) walk(c, d + 1);
+            }
+        })(buildTree(), 0);
+        // same rows → only flip the highlight, so clicks and double clicks land on stable elements
+        const sig = rows.map(r => r.html).join('');
+        if (sig !== layersSig || layersEl.children.length !== rows.length) { layersSig = sig; layersEl.innerHTML = sig || '<div class="empty">Слоёв пока нет.</div>'; if (!rows.length) layersSig = ''; }
+        rows.forEach((r, k) => layersEl.children[k] && layersEl.children[k].classList.toggle('on', r.on));
+    }
+    const rowObj = r => r.dataset.i != null ? S.shapes[+r.dataset.i] : gById(+r.dataset.g);
+    const rowNode = (r, tree) => r.dataset.i != null ? { i: +r.dataset.i } : findNode(k => k.id === +r.dataset.g, tree);
+    layersEl.addEventListener('click', e => {
+        const r = e.target.closest('.ly'); if (!r) return; const b = e.target.closest('[data-act]'), obj = rowObj(r);
+        if (b) {
+            const a = b.dataset.act;
+            if (a === 'fold') { obj.collapsed = !obj.collapsed; if (!obj.collapsed) delete obj.collapsed; update(); return; }
+            push(); const k = a === 'eye' ? 'hidden' : 'locked'; if (obj[k]) delete obj[k]; else obj[k] = true; update(); return;
+        }
+        const idx = r.dataset.i != null ? [+r.dataset.i] : groupMembers(+r.dataset.g);
+        if (e.shiftKey) { const all = idx.every(i => S.sel.includes(i)); setSel(all ? S.sel.filter(i => !idx.includes(i)) : S.sel.concat(idx)); }
+        else setSel(idx);
+        S.tool = 'select'; update();
+    });
+    layersEl.addEventListener('dblclick', e => {
+        const nm = e.target.closest('.ly-name'); if (!nm) return; const obj = rowObj(nm.closest('.ly'));
+        const inp = document.createElement('input'); inp.type = 'text'; inp.className = 'ly-in'; inp.value = obj.name || ''; inp.setAttribute('aria-label', 'Имя');
+        nm.replaceWith(inp); inp.focus(); inp.select();
+        let done = false;
+        const fin = ok => { if (done) return; done = true; const v = inp.value.trim(); if (ok && v && v !== obj.name) { push(); obj.name = v; } inp.remove(); layersSig = ''; update(); };
+        inp.addEventListener('keydown', ev => { ev.stopPropagation(); if (ev.key === 'Enter') fin(true); if (ev.key === 'Escape') fin(false); });
+        inp.addEventListener('blur', () => fin(true));
+    });
+    let dragRow = null;
+    const dropWhere = (r, e) => { const b = r.getBoundingClientRect(), f = (e.clientY - b.top) / b.height; return r.dataset.g != null && f > .25 && f < .75 ? 'into' : f < .5 ? 'above' : 'below'; };
+    const clearDrop = () => layersEl.querySelectorAll('.drop-above,.drop-below,.drop-into').forEach(x => x.classList.remove('drop-above', 'drop-below', 'drop-into'));
+    layersEl.addEventListener('dragstart', e => { const r = e.target.closest('.ly'); if (!r) return; dragRow = r; e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', ''); });
+    layersEl.addEventListener('dragover', e => { const r = e.target.closest('.ly'); if (!dragRow || !r) return; e.preventDefault(); clearDrop(); r.classList.add('drop-' + dropWhere(r, e)); });
+    layersEl.addEventListener('dragleave', e => { if (!layersEl.contains(e.relatedTarget)) clearDrop(); });
+    layersEl.addEventListener('dragend', () => { dragRow = null; clearDrop(); });
+    layersEl.addEventListener('drop', e => {
+        const r = e.target.closest('.ly'); clearDrop(); if (!dragRow || !r) return; e.preventDefault();
+        const tree = buildTree(), node = rowNode(dragRow, tree), ref = rowNode(r, tree), snap = snapshot(); dragRow = null;
+        if (node && ref && moveBlock(node, ref, dropWhere(r, e))) { push('', snap); update(); }
+    });
 
     // code
     const codeEl = document.getElementById('code');
     function esc(t) { return t.replace(/&/g, '&amp;').replace(/</g, '&lt;'); }
+    const escA = t => esc(t).replace(/"/g, '&quot;');
     function hl(t) {
         if (/^\s*\/\//.test(t)) return `<span class="t-c">${esc(t)}</span>`;
         return esc(t).replace(/("(?:\\.|[^"\\])*")|(\/\/.*)$|\b(0x[0-9A-Fa-f]+|\d+)\b|(\b(?:canvas|lcd)\b(?:\.|-&gt;)\w+)/g, (m, q, c, n, f) => q ? `<span class="t-s">${q}</span>` : c ? `<span class="t-c">${c}</span>` : n ? `<span class="t-n">${n}</span>` : `<span class="t-fn">${f}</span>`);
     }
+    function textCode(s, st) {
+        const out = [], col = colStr(s);
+        if (!st.wrap) { out.push('canvas.setTextWrap(false);  // переносы уже посчитаны редактором'); st.wrap = true; }
+        if (st.font !== s.font) { out.push(s.font ? `canvas.setFont(&${s.font});` : 'canvas.setFont();  // встроенный 5×7'); st.font = s.font; }
+        if (st.size !== s.size) { out.push(`canvas.setTextSize(${s.size});`); st.size = s.size; }
+        if (st.color !== col) { out.push(`canvas.setTextColor(${col});`); st.color = col; }
+        for (const l of layoutText(s)) { out.push(`canvas.setCursor(${l.cx}, ${l.cy});`); out.push(`canvas.print("${cstr(l.t)}");`); }
+        return out;
+    }
+    // hidden shapes don't go into the code; palette colors become constexpr constants
     function buildLines() {
         const st = { font: '', size: 1, color: null, wrap: false };
-        const shapeLines = S.shapes.flatMap((s, i) => s.t === 'text' ? textCode(s, st).map(t => ({ t, i })) : [{ t: codeLine(s), i }]);
-        const fonts = [...new Set(S.shapes.filter(s => s.t === 'text' && s.font).map(s => s.font))];
-        if (S.codeMode === 'snippet') return shapeLines;
-        const L = t => ({ t, i: -1 });
+        const shapeLines = S.shapes.flatMap((s, i) => hiddenAt(i) ? [] : s.t === 'text' ? textCode(s, st).map(t => ({ t, i })) : [{ t: codeLine(s), i }]);
+        const fonts = [...new Set(S.shapes.filter((s, i) => s.t === 'text' && s.font && !hiddenAt(i)).map(s => s.font))];
+        const L = t => ({ t, i: -1 }), pal = S.palette.map(p => L(`constexpr uint16_t ${p.n} = ${fmt565(p.c)};`));
+        if (S.codeMode === 'snippet') return pal.length ? [...pal, L(''), ...shapeLines] : shapeLines;
         return [
             L('#include <Waveshare_LCD147.h>'), L('#include <Adafruit_GFX.h>'), ...fonts.map(f => L(`#include <Fonts/${f}.h>`)), L(''),
             L(`constexpr int W = ${S.W};   // ширина экрана`), L(`constexpr int H = ${S.H};   // высота экрана`), L(''),
+            ...(pal.length ? [...pal, L('')] : []),
             L('St7789* lcd;                 // драйвер (твоя библиотека)'), L('GFXcanvas16 canvas(W, H);    // холст в памяти, на нём рисуем'), L(''),
             L('// Показать холст на экране'), L('void present() {'), L('  lcd->drawImage(0, 0, W, H, canvas.getBuffer());'), L('}'), L(''),
             L('void setup() {'), L('  Serial.begin(115200);'), L('  lcd = &Waveshare147::begin();'), L(''),
-            L(`  canvas.fillScreen(${fmt565(S.bg)});  // фон`),
+            L(`  canvas.fillScreen(${S.bgPc && palEntry(S.bgPc) ? S.bgPc : fmt565(S.bg)});  // фон`),
             ...shapeLines.map(l => ({ t: '  ' + l.t, i: l.i })),
             L('  present();'), L('}'), L(''), L('void loop() {'), L('}'),
         ];
     }
     function renderCode() {
-        const lines = buildLines();
-        codeEl.innerHTML = lines.length ? lines.map(l => `<div class="${l.i >= 0 ? 'shape' : ''}${l.i === S.sel && l.i >= 0 ? ' on' : ''}" ${l.i >= 0 ? `data-i="${l.i}"` : ''}>${hl(l.t) || ' '}</div>`).join('') : '<div class="t-c">// холст пуст — нарисуй что-нибудь</div>';
+        const lines = buildLines(), sel = new Set(S.sel);
+        codeEl.innerHTML = lines.length ? lines.map(l => `<div class="${l.i >= 0 ? 'shape' : ''}${l.i >= 0 && sel.has(l.i) ? ' on' : ''}" ${l.i >= 0 ? `data-i="${l.i}"` : ''}>${hl(l.t) || ' '}</div>`).join('') : '<div class="t-c">// холст пуст — нарисуй что-нибудь</div>';
         const on = codeEl.querySelector('.on'); if (on) { const r = on.offsetTop - codeEl.scrollTop; if (r < 0 || r > codeEl.clientHeight - 20) codeEl.scrollTop = on.offsetTop - codeEl.clientHeight / 2; }
         document.querySelectorAll('#codeMode button').forEach(b => b.setAttribute('aria-pressed', b.dataset.m === S.codeMode));
     }
-    codeEl.addEventListener('click', e => { const d = e.target.closest('[data-i]'); if (d) { S.sel = +d.dataset.i; S.tool = 'select'; update(); } });
+    codeEl.addEventListener('click', e => { const d = e.target.closest('[data-i]'); if (d) { setSel([+d.dataset.i]); S.tool = 'select'; update(); } });
     document.getElementById('codeMode').addEventListener('click', e => { const b = e.target.closest('button'); if (b) { S.codeMode = b.dataset.m; update(); } });
     const copyMsg = document.getElementById('copyMsg');
     document.getElementById('copyBtn').addEventListener('click', () => {
@@ -640,8 +1050,9 @@
     });
 
     // import
-    function evalNum(expr) {
-        expr = expr.trim(); const c = parse565(expr);
+    function evalNum(expr, pal) {
+        expr = expr.trim(); if (pal && pal[expr] != null) return pal[expr];
+        const c = parse565(expr);
         if (/^(0x|#)|^[A-Z_]*(BLACK|WHITE|RED|GREEN|BLUE|YELLOW|MAGENTA|CYAN|ORANGE)$/i.test(expr) && c != null) return c;
         const e = expr.replace(/\bW\b/g, S.W).replace(/\bH\b/g, S.H);
         if (!/^[\d\s+\-*/().]+$/.test(e)) return null;
@@ -649,15 +1060,19 @@
     }
     const cunesc = t => t.replace(/\\(x[0-9a-fA-F]{1,2}|[0-7]{1,3}|.)/g, (_, e) => e[0] === 'x' ? String.fromCharCode(parseInt(e.slice(1), 16)) : /^[0-7]/.test(e) ? String.fromCharCode(parseInt(e, 8)) : { n: '\n', r: '\r', t: '\t' }[e] || e);
     function parseCode(src) {
-        const out = []; let bg = null, skipped = 0;
+        const out = [], pal = {}; let bg = null, bgPc = '', skipped = 0;
         src = src.replace(/("(?:\\.|[^"\\])*")|\/\/.*$/gm, (m, q) => q || '');
+        // palette: constexpr / const uint16_t NAME = value;
+        for (const m of src.matchAll(/\b(?:constexpr|const)\s+uint16_t\s+([A-Za-z_]\w*)\s*=\s*([^;]+);/g)) { const v = evalNum(m[2], pal); if (v != null) pal[m[1]] = v & 0xFFFF; }
+        const pcOf = a => a != null && pal[a.trim()] != null ? a.trim() : '';
         const T = { Rect: ['rect', ['x', 'y', 'w', 'h']], RoundRect: ['rrect', ['x', 'y', 'w', 'h', 'r']], Circle: ['circle', ['x', 'y', 'r']], Triangle: ['tri', ['x0', 'y0', 'x1', 'y1', 'x2', 'y2']], Line: ['line', ['x0', 'y0', 'x1', 'y1']], Pixel: ['pixel', ['x', 'y']] };
-        const ts = { font: '', size: 1, c: 0xFFFF, cx: 0, cy: 0 }; let group = null;
+        const ts = { font: '', size: 1, c: 0xFFFF, pc: '', cx: 0, cy: 0 }; let group = null;
         const flush = () => {
             if (!group) return; const g = group; group = null;
             const x = Math.min(...g.lines.map(l => l.left)), r = Math.max(...g.lines.map(l => l.right));
             const align = g.lines.every(l => l.left === g.lines[0].left) ? 'left' : g.lines.every(l => l.right === g.lines[0].right) ? 'right' : 'center';
-            out.push({ t: 'text', x, y: g.top, w: Math.max(1, r - x), h: fontMetrics(g.font, g.size).block(g.lines.length), text: g.lines.map(l => l.t).join('\n'), font: g.font, size: g.size, align, valign: 'top', c: g.c });
+            const sh = { t: 'text', x, y: g.top, w: Math.max(1, r - x), h: fontMetrics(g.font, g.size).block(g.lines.length), text: g.lines.map(l => l.t).join('\n'), font: g.font, size: g.size, align, valign: 'top', c: g.c };
+            if (g.pc) sh.pc = g.pc; out.push(sh);
         };
         const re = /canvas\s*\.\s*(\w+)\s*\(((?:"(?:\\.|[^"\\])*"|[^;"])*)\)\s*;/g; let m;
         while ((m = re.exec(src))) {
@@ -669,10 +1084,10 @@
                 (cunesc(q ? q[1] : '') + (fn === 'println' ? '\n' : '')).split('\n').forEach((t, k) => {
                     if (k) { ts.cx = 0; ts.cy += fm.pitch; }
                     t = t.replace(/\r/g, ''); if (!t) return;
-                    const same = group && group.font === ts.font && group.size === ts.size && group.c === ts.c;
+                    const same = group && group.font === ts.font && group.size === ts.size && group.c === ts.c && group.pc === ts.pc;
                     if (same && ts.cy === group.lastCy && ts.cx === group.endCx) group.lines[group.lines.length - 1].t += t; // continues the previous print on the same line
                     else if (same && ts.cy === group.lastCy + fm.pitch) group.lines.push({ t, cx: ts.cx });
-                    else { flush(); group = { font: ts.font, size: ts.size, c: ts.c, top: ts.cy - fm.top, lines: [{ t, cx: ts.cx }] }; }
+                    else { flush(); group = { font: ts.font, size: ts.size, c: ts.c, pc: ts.pc, top: ts.cy - fm.top, lines: [{ t, cx: ts.cx }] }; }
                     const l = group.lines[group.lines.length - 1], mm = measureStr(ts.font, ts.size, l.t);
                     l.left = l.cx + mm.l; l.right = l.left + mm.w;
                     ts.cx += advanceStr(ts.font, ts.size, t); group.lastCy = ts.cy; group.endCx = ts.cx;
@@ -681,33 +1096,38 @@
             }
             if (fn === 'setFont') { const f = raw.replace(/^&/, '').trim(); ts.font = FONT_DATA[f] ? f : ''; if (f && !FONT_DATA[f]) skipped++; continue; }
             if (fn === 'setTextWrap') continue;
-            const args = raw ? raw.split(',').map(evalNum) : [];
+            const parts = raw ? raw.split(',') : [], args = parts.map(a => evalNum(a, pal));
             if (args.some(a => a == null)) { skipped++; continue; }
             if (fn === 'setTextSize') { ts.size = Math.max(1, args[0] || 1); continue; }
-            if (fn === 'setTextColor') { ts.c = args[0]; continue; }
+            if (fn === 'setTextColor') { ts.c = args[0]; ts.pc = pcOf(parts[0]); continue; }
             if (fn === 'setCursor') { ts.cx = args[0]; ts.cy = args[1]; continue; }
-            if (fn === 'fillScreen') { bg = args[0]; continue; }
+            if (fn === 'fillScreen') { bg = args[0]; bgPc = pcOf(parts[0]); continue; }
             const k = fn.match(/^(draw|fill)(Rect|RoundRect|Circle|Triangle|Line|Pixel)$/);
             if (!k) { skipped++; continue; }
             const D = T[k[2]]; if (args.length !== D[1].length + 1) { skipped++; continue; }
             flush();
-            const sh = { t: D[0] }; if (META[D[0]].canFill) sh.fill = k[1] === 'fill'; D[1].forEach((key, i) => sh[key] = args[i]); sh.c = args[args.length - 1]; out.push(sh);
+            const sh = { t: D[0] }; if (META[D[0]].canFill) sh.fill = k[1] === 'fill'; D[1].forEach((key, i) => sh[key] = args[i]); sh.c = args[args.length - 1];
+            const pc = pcOf(parts[parts.length - 1]); if (pc) sh.pc = pc; out.push(sh);
         }
         flush();
-        return { out, bg, skipped };
+        return { out, bg, bgPc, skipped, pal };
     }
     const importMsg = document.getElementById('importMsg');
     function doImport(replace) {
-        const { out, bg, skipped } = parseCode(document.getElementById('importText').value);
-        if (!out.length && bg == null) { importMsg.textContent = 'Не нашёл вызовов canvas.* — проверь, что строки заканчиваются на «;».'; return; }
-        push(); if (replace) S.shapes = out; else S.shapes.push(...out); if (bg != null) S.bg = bg; S.sel = -1;
-        importMsg.textContent = `Загружено фигур: ${out.length}${skipped ? `, пропущено: ${skipped} (не разобрал аргументы)` : ''}.`; update();
+        const { out, bg, bgPc, skipped, pal } = parseCode(document.getElementById('importText').value), np = Object.keys(pal).length;
+        if (!out.length && bg == null && !np) { importMsg.textContent = 'Не нашёл вызовов canvas.* — проверь, что строки заканчиваются на «;».'; return; }
+        push();
+        for (const [n, c] of Object.entries(pal)) { const p = palEntry(n); if (p) p.c = c; else S.palette.push({ n, c }); }
+        if (replace) { S.shapes = out; S.groups = []; } else S.shapes.push(...out);
+        if (bg != null) { S.bg = bg; S.bgPc = bgPc; }
+        S.sel = []; ensureNames(); normalize();
+        importMsg.textContent = `Загружено фигур: ${out.length}${np ? `, цветов палитры: ${np}` : ''}${skipped ? `, пропущено: ${skipped} (не разобрал аргументы)` : ''}.`; update();
     }
     document.getElementById('importBtn').onclick = () => doImport(true);
     document.getElementById('appendBtn').onclick = () => doImport(false);
     const clearBtn = document.getElementById('clearBtn'); let clearArm = 0;
     clearBtn.onclick = () => {
-        if (Date.now() - clearArm < 3000) { push(); S.shapes = []; S.sel = -1; clearBtn.textContent = 'Очистить холст'; clearArm = 0; update(); return; }
+        if (Date.now() - clearArm < 3000) { push(); S.shapes = []; S.groups = []; S.sel = []; clearBtn.textContent = 'Очистить холст'; clearArm = 0; update(); return; }
         clearArm = Date.now(); clearBtn.textContent = 'Точно очистить?'; setTimeout(() => { if (clearArm && Date.now() - clearArm >= 2900) { clearBtn.textContent = 'Очистить холст'; clearArm = 0; } }, 3000);
     };
 
@@ -715,15 +1135,18 @@
     const statusEl = document.getElementById('status'), hintEl = document.getElementById('hint');
     function status() {
         const p = hover;
-        statusEl.innerHTML = `<span>x <b>${p ? p.x : '–'}</b></span><span>y <b>${p ? p.y : '–'}</b></span><span>${S.W} × ${S.H}</span><span>×${scale}</span><span>фигур: <b>${S.shapes.length}</b></span>`;
+        statusEl.innerHTML = `<span>x <b>${p ? p.x : '–'}</b></span><span>y <b>${p ? p.y : '–'}</b></span><span>${S.W} × ${S.H}</span><span>×${scale}</span><span>фигур: <b>${S.shapes.length}</b></span>${S.sel.length > 1 ? `<span>выбрано: <b>${S.sel.length}</b></span>` : ''}`;
     }
     document.addEventListener('keydown', e => {
         if (e.target.matches('input,textarea,select')) return;
         const k = e.key, mod = e.ctrlKey || e.metaKey;
-        if (mod && k.toLowerCase() === 'z') { e.preventDefault(); e.shiftKey ? redo() : undo(); return; }
-        if (mod && k.toLowerCase() === 'y') { e.preventDefault(); redo(); return; }
-        if (mod && k.toLowerCase() === 'd') { e.preventDefault(); act('dup'); return; }
-        // e.code, so it works with any keyboard layout; leave native copy alone while text is selected on the page
+        // e.code, so shortcuts work with any keyboard layout
+        if (mod && e.code === 'KeyZ') { e.preventDefault(); e.shiftKey ? redo() : undo(); return; }
+        if (mod && e.code === 'KeyY') { e.preventDefault(); redo(); return; }
+        if (mod && e.code === 'KeyD') { e.preventDefault(); dupSel(); return; }
+        if (mod && e.code === 'KeyG') { e.preventDefault(); act(e.shiftKey ? 'ungroup' : 'group'); return; }
+        if (mod && e.code === 'KeyA' && !e.target.closest('#code')) { e.preventDefault(); setSel(S.shapes.map((_, i) => i).filter(i => !hiddenAt(i) && !lockedAt(i))); S.tool = 'select'; update(); return; }
+        // leave native copy alone while text is selected on the page
         const textSel = !getSelection().isCollapsed;
         if (mod && !e.altKey && !textSel && (e.code === 'KeyC' || e.code === 'KeyX') && copySel(e.code === 'KeyX')) { e.preventDefault(); return; }
         if (mod && !e.altKey && e.code === 'KeyV' && paste()) { e.preventDefault(); return; }
@@ -731,23 +1154,24 @@
         const map = { v: 'select', r: 'rect', o: 'rrect', c: 'circle', l: 'line', y: 'tri', p: 'pixel', t: 'text' };
         if (map[k.toLowerCase()]) { setTool(map[k.toLowerCase()]); return; }
         if (k.toLowerCase() === 'f') { toggleFill(); return; }
-        if (k === 'Escape') { triPts = null; preview = null; S.sel = -1; update(); return; }
-        if ((k === 'Delete' || k === 'Backspace') && S.sel >= 0) { e.preventDefault(); act('del'); return; }
+        if (k === 'Escape') { triPts = null; preview = null; S.sel = []; update(); return; }
+        if ((k === 'Delete' || k === 'Backspace') && S.sel.length) { e.preventDefault(); act('del'); return; }
         const arrows = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
-        if (arrows[k] && S.sel >= 0) { e.preventDefault(); const n = e.shiftKey ? 10 : 1; push('nudge' + S.sel); moveShape(S.shapes[S.sel], arrows[k][0] * n, arrows[k][1] * n); update(); }
+        if (arrows[k] && S.sel.length) { e.preventDefault(); const n = e.shiftKey ? 10 : 1; push('nudge' + S.sel.join()); shiftSel(S.sel, arrows[k][0] * n, arrows[k][1] * n); update(); }
     });
 
     // ---------- update ----------
     function update(fast) {
-        render(); status(); renderCode();
+        syncPalette();
+        render(); status(); renderCode(); renderLayers(); renderPalette(); renderBgPc();
         if (!fast || !insBody.contains(document.activeElement)) renderInspector();
-        else { const s = S.shapes[S.sel]; if (s) insBody.querySelectorAll('input[data-k]').forEach(inp => { if (inp !== document.activeElement) inp.value = s[inp.dataset.k]; }); }
+        else { const s = one(); if (s) insBody.querySelectorAll('input[data-k]').forEach(inp => { if (inp !== document.activeElement) inp.value = s[inp.dataset.k]; }); }
         rail.querySelectorAll('[data-tool]').forEach(b => b.setAttribute('aria-pressed', b.dataset.tool === S.tool));
-        const fb = document.getElementById('fillBtn'); const sel = S.shapes[S.sel]; const fillOn = sel && META[sel.t].canFill ? sel.fill : S.fill;
+        const ss = selShapes(), fb = document.getElementById('fillBtn'), f0 = ss.find(s => META[s.t].canFill), fillOn = f0 ? f0.fill : S.fill;
         fb.setAttribute('aria-pressed', !!fillOn); fb.textContent = fillOn ? 'fill' : 'draw';
         view.classList.toggle('sel', S.tool === 'select');
-        const col = sel ? sel.c : S.color; inColor.value = toHex(col); if (document.activeElement !== inColor565) inColor565.value = fmt565(col);
-        document.getElementById('hex565').textContent = sel ? 'цвет фигуры' : 'цвет новых фигур';
+        const col = ss.length ? ss[0].c : S.color; inColor.value = toHex(col); if (document.activeElement !== inColor565) inColor565.value = fmt565(col);
+        document.getElementById('hex565').textContent = ss.length > 1 ? `цвет ${ss.length} фигур` : ss.length ? 'цвет фигуры' : 'цвет новых фигур';
         sw.querySelectorAll('.sw').forEach(b => b.setAttribute('aria-pressed', +b.dataset.c === col));
         inBg.value = toHex(S.bg); if (document.activeElement !== inBg565) inBg565.value = fmt565(S.bg);
         document.getElementById('spec').textContent = `GFXcanvas16 · ${S.W}×${S.H} · RGB565`;
@@ -755,5 +1179,5 @@
         save();
     }
     window.addEventListener('resize', () => render());
-    syncSettings(); update();
+    ensureNames(); normalize(); syncSettings(); update();
 })();
