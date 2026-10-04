@@ -1665,10 +1665,13 @@
     function download(name, text) { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' })); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); }
 
     // ---------- live preview on the board (Web Serial) ----------
-    // frame, little-endian: "LCDF" | W u16 | H u16 | flags u8 (bit 0 = RLE) | seq u8 | len u32 | payload[len] | Fletcher-16(payload) u16
+    // frame, little-endian: "LCD2" | W u16 | H u16 | flags u8 (bit 0 = RLE) | seq u8 | len u32 | payload[len] | Fletcher-16(payload) u16
     // payload: RGB565 words in canvas.getBuffer() order; RLE: byte n, bit 7 set → the next word (n & 127) + 1 times, else n + 1 words as they are
-    // the board answers every frame with "OK <seq>" or "ERR <seq> <reason>"; while it hasn't answered only the newest frame waits
-    const LIVE = { port: null, writer: null, reader: null, busy: false, dirty: false, seq: 0, last: 0, done: [], timer: 0, waitT: 0, errs: 0, err: '', note: '', noReply: false };
+    // the payload goes in CHUNK-byte pieces: after each full piece the board says "N <seq>" and only then gets the next one,
+    // because USB CDC on the ESP32-S3 drops bytes when its receive buffer overflows; the frame ends with "OK <seq>" or "ERR <seq> <reason>"
+    // while a frame is on its way only the newest state waits; no answer for REPLY_MS → the board has reset its parser (after 500 ms of silence), start over
+    const LIVE = { port: null, writer: null, reader: null, busy: false, dirty: false, seq: 0, last: 0, done: [], timer: 0, wait: null, errs: 0, err: '', note: '', noReply: false };
+    const CHUNK = 4096, REPLY_MS = 1000;
     const FPS = 18;
     function frame565() {
         const n = S.W * S.H, out = new Uint16Array(n);
@@ -1690,22 +1693,44 @@
     function buildFrame(seq) {
         const px = frame565(), raw = new Uint8Array(px.buffer), packed = rle(px), useRle = packed.length < raw.length, data = useRle ? packed : raw;
         const f = new Uint8Array(14 + data.length + 2), dv = new DataView(f.buffer);
-        f.set([76, 67, 68, 70]); dv.setUint16(4, S.W, true); dv.setUint16(6, S.H, true); f[8] = useRle ? 1 : 0; f[9] = seq; dv.setUint32(10, data.length, true);
+        f.set([76, 67, 68, 50]); dv.setUint16(4, S.W, true); dv.setUint16(6, S.H, true); f[8] = useRle ? 1 : 0; f[9] = seq; dv.setUint32(10, data.length, true);
         f.set(data, 14); dv.setUint16(14 + data.length, fletcher16(data), true);
         return f;
     }
-    function pump() {
+    // the board's next line for this frame: 'N', 'OK', 'ERR' or 'timeout'
+    function reply(seq) {
+        return new Promise(res => {
+            const t = setTimeout(() => { LIVE.wait = null; res('timeout'); }, REPLY_MS);
+            LIVE.wait = { seq, res: v => { clearTimeout(t); LIVE.wait = null; res(v); } };
+        });
+    }
+    function onLine(l) {
+        const m = l.match(/^(OK|ERR|N)\s+(\d+)\s*(.*)$/); if (!m || !LIVE.wait || +m[2] !== LIVE.wait.seq) return;
+        if (m[1] === 'ERR') LIVE.err = m[3];
+        LIVE.wait.res(m[1]);
+    }
+    async function sendFrame(seq) {
+        const f = buildFrame(seq), len = f.length - 16, cuts = [0];
+        for (let k = CHUNK; k < len; k += CHUNK) cuts.push(14 + k);
+        cuts.push(f.length);
+        for (let k = 0; k < cuts.length - 1; k++) {
+            const r = reply(seq); // armed before writing, so a fast answer isn't missed
+            await LIVE.writer.write(f.subarray(cuts[k], cuts[k + 1]));
+            const v = await r; if (v !== (k < cuts.length - 2 ? 'N' : 'OK')) return v === 'N' ? 'ERR' : v;
+        }
+        return 'OK';
+    }
+    async function pump() {
         if (!LIVE.writer || LIVE.busy || !LIVE.dirty) return;
         const wait = LIVE.last + 1000 / FPS - performance.now();
         if (wait > 0) { clearTimeout(LIVE.timer); LIVE.timer = setTimeout(pump, wait); return; }
-        LIVE.dirty = false; LIVE.busy = true; LIVE.last = performance.now(); LIVE.seq = (LIVE.seq + 1) & 255;
-        LIVE.writer.write(buildFrame(LIVE.seq)).catch(() => lost());
-        LIVE.waitT = setTimeout(() => { LIVE.busy = false; LIVE.noReply = true; LIVE.dirty = true; renderLive(); pump(); }, 2000);
-    }
-    function onLine(l) {
-        const m = l.match(/^(OK|ERR)\s+(\d+)\s*(.*)$/); if (!m || !LIVE.busy || +m[2] !== LIVE.seq) return;
-        clearTimeout(LIVE.waitT); LIVE.busy = false; LIVE.noReply = false;
-        if (m[1] === 'OK') LIVE.done.push(performance.now()); else { LIVE.errs++; LIVE.err = m[3]; LIVE.dirty = true; } // a broken frame is sent again
+        const port = LIVE.port; LIVE.dirty = false; LIVE.busy = true; LIVE.last = performance.now(); LIVE.seq = (LIVE.seq + 1) & 255;
+        let r; try { r = await sendFrame(LIVE.seq); } catch (e) { r = 'closed'; }
+        if (LIVE.port !== port) return; if (r === 'closed') return lost();
+        LIVE.busy = false;
+        if (r === 'OK') { LIVE.done.push(performance.now()); LIVE.noReply = false; }
+        else if (r === 'timeout') { LIVE.noReply = true; LIVE.dirty = true; }
+        else { LIVE.errs++; LIVE.noReply = false; LIVE.dirty = true; } // a broken frame is sent again
         renderLive(); pump();
     }
     async function readLoop(port) {
@@ -1731,7 +1756,7 @@
     }
     async function disconnect(note) {
         const { port, writer, reader } = LIVE; if (!port) return;
-        clearTimeout(LIVE.timer); clearTimeout(LIVE.waitT);
+        clearTimeout(LIVE.timer); if (LIVE.wait) LIVE.wait.res('closed');
         Object.assign(LIVE, { port: null, writer: null, reader: null, busy: false, dirty: false, note: note || '' });
         renderLive();
         try { await reader?.cancel(); } catch (e) { } try { reader?.releaseLock(); } catch (e) { }
@@ -1747,7 +1772,7 @@
         liveBtn.textContent = on ? 'Отключить' : 'Подключить плату'; liveBtn.classList.toggle('primary', !on);
         liveDot.dataset.s = !on ? 'off' : LIVE.noReply ? 'warn' : 'on'; liveWarn.hidden = !on;
         liveStatus.textContent = !on ? (LIVE.note || 'не подключена')
-            : LIVE.noReply ? 'плата не отвечает — залит ли скетч-приёмник?'
+            : LIVE.noReply ? 'плата не отвечает — залит ли свежий скетч-приёмник (протокол LCD2)?'
                 : `подключена · ${LIVE.done.length} кадр/с · ${S.W}×${S.H}${LIVE.errs ? ` · ошибок: ${LIVE.errs} (${LIVE.err})` : ''}`;
     }
     setInterval(() => { if (LIVE.port) renderLive(); }, 500);
@@ -1757,16 +1782,19 @@
 // Плата: Waveshare ESP32-S3-LCD-1.47B. В Arduino IDE: Tools → USB CDC On Boot → Enabled.
 //
 // Кадр (всё little-endian):
-//   "LCDF" | W u16 | H u16 | flags u8 (бит 0 — RLE) | seq u8 | len u32 | payload[len] | Fletcher-16(payload) u16
+//   "LCD2" | W u16 | H u16 | flags u8 (бит 0 — RLE) | seq u8 | len u32 | payload[len] | Fletcher-16(payload) u16
 // payload — слова RGB565 в порядке canvas.getBuffer(). RLE: байт n; если бит 7 = 1 —
 // следующее слово повторить (n & 127) + 1 раз, иначе дальше идут n + 1 слов как есть.
-// На каждый кадр плата отвечает "OK <seq>" или "ERR <seq> <причина>" (строкой).
+// Payload идёт кусками по CHUNK байт: после каждого полного куска плата пишет "N <seq>",
+// и только тогда редактор шлёт следующий (USB CDC теряет байты, если буфер приёма переполнен).
+// В конце кадра плата отвечает "OK <seq>" или "ERR <seq> <причина>" (строкой).
 
 #include <Waveshare_LCD147.h>
 #include <Adafruit_GFX.h>
 
 constexpr int W = ${S.W};   // размер по умолчанию; кадр другого размера пересоздаёт холст
 constexpr int H = ${S.H};
+constexpr uint32_t CHUNK = ${CHUNK};   // должен совпадать с редактором
 
 St7789* lcd;
 GFXcanvas16* canvas = nullptr;
@@ -1831,7 +1859,7 @@ void endFrame() {
 }
 
 void feed(uint8_t b) {
-  static const uint8_t magic[4] = { 'L', 'C', 'D', 'F' };
+  static const uint8_t magic[4] = { 'L', 'C', 'D', '2' };
   switch (state) {
     case WAIT_MAGIC:
       if (b == magic[got]) { if (++got == 4) { state = HEADER; got = 0; } }
@@ -1844,6 +1872,7 @@ void feed(uint8_t b) {
     case PAYLOAD:
       payloadByte(b);
       if (++done == len) state = CHECKSUM;
+      else if (done % CHUNK == 0) Serial.printf("N %u\\n", seq);   // кусок принят — можно слать следующий
       break;
     case CHECKSUM:
       sum[got++] = b;
