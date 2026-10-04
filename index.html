@@ -6,6 +6,7 @@
   <meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover">
   <link rel="stylesheet" href="style.css">
   <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="shortcut icon" href="assets/favicon.png" type="image/x-icon">
   <title>LCD Canvas Builder</title>
 </head>
 
@@ -37,12 +38,15 @@
     <nav class="rail" id="rail" aria-label="Инструменты"></nav>
 
     <main class="stage" id="stage">
+      <div class="tabs" id="tabs" role="group" aria-label="Экраны"></div>
       <div class="bezel">
         <canvas id="view"></canvas>
         <div class="empty-hint" id="emptyHint" hidden><span>Выбери инструмент слева или вставь код через „Загрузить из кода“</span></div>
       </div>
       <div class="status" id="status"></div>
+      <div class="msg warn" id="stageMsg" role="status"></div>
       <div class="hint" id="hint"></div>
+      <input type="file" id="imgFile" accept="image/png,image/jpeg,image/svg+xml,image/gif,image/webp" hidden>
     </main>
 
     <aside class="side">
@@ -76,11 +80,15 @@
         <h2>Код
           <span class="r">
             <span class="seg" id="codeMode">
-              <button data-m="snippet">фигуры</button><button data-m="full">весь скетч</button>
+              <button data-m="snippet">фигуры</button><button data-m="full">весь скетч</button><button data-m="images" id="modeImg" hidden>images.h</button>
             </span>
             <button class="btn primary" id="copyBtn">Копировать</button>
           </span>
         </h2>
+        <div class="row code-opts">
+          <label class="set" title="Для переименованных элементов: constexpr int ИМЯ_X = …; и вызовы используют эти константы"><input type="checkbox" id="optConsts"> константы координат</label>
+          <label class="set" title="Массивы картинок идут в отдельный файл images.h, скетч его подключает"><input type="checkbox" id="optImgH"> картинки в images.h</label>
+        </div>
         <div class="code" id="code" tabindex="0"></div>
         <div class="msg" id="copyMsg"></div>
       </section>

@@ -1,26 +1,45 @@
 (() => {
     // ---------- state ----------
+    // screens: [{name, shapes, groups, bg, bgPc}]; S.shapes / S.groups / S.bg / S.bgPc always mean the current screen S.screens[S.cur]
     // shapes: flat list in draw order; shape.g = id of its group; groups: {id, name, parent, collapsed, hidden, locked}, members of a group are kept contiguous
-    // palette: [{n: 'C_BG', c}]; shape.pc / S.bgPc / S.colorPc = palette name the color comes from (shape.c is kept in sync)
+    // palette (shared by all screens): [{n: 'C_BG', c}]; shape.pc / shape.epc / screen.bgPc / S.colorPc = palette name the color comes from (the number is kept in sync)
+    // assets: {id: dataURL} of uploaded pictures, shape.src points here; not part of undo snapshots, so history stays small
     const START = [];
-    const S = { W: 172, H: 320, bg: 0x0000, bgPc: '', shapes: START, groups: [], palette: [], nextG: 1, sel: [], tool: 'select', fill: false, color: 0xFFFF, colorPc: '', radius: 8, zoom: 'auto', grid: true, codeMode: 'snippet', textFont: '', textSize: 2 };
-    const KEY = 'lcd-canvas-builder-v2', KEY_V1 = 'lcd-canvas-builder-v1';
+    const blankScreen = name => ({ name, shapes: [], groups: [], bg: 0x0000, bgPc: '' });
+    const S = { W: 172, H: 320, screens: [Object.assign(blankScreen('Main'), { shapes: START })], cur: 0, palette: [], assets: {}, nextG: 1, sel: [], tool: 'select', fill: false, color: 0xFFFF, colorPc: '', radius: 8, zoom: 'auto', grid: true, codeMode: 'snippet', textFont: '', textSize: 2, coordConsts: false, imgHeader: false };
+    for (const k of ['shapes', 'groups', 'bg', 'bgPc']) Object.defineProperty(S, k, { get: () => S.screens[S.cur][k], set: v => { S.screens[S.cur][k] = v; }, enumerable: false });
+    const KEY = 'lcd-canvas-builder-v3', OLD_KEYS = ['lcd-canvas-builder-v2', 'lcd-canvas-builder-v1'];
     try {
         let d = JSON.parse(localStorage.getItem(KEY) || 'null');
-        if (!d) { d = JSON.parse(localStorage.getItem(KEY_V1) || 'null'); if (d) d = migrateV1(d); }
-        if (d && Array.isArray(d.shapes)) Object.assign(S, d, { sel: [] });
+        if (!d) for (const k of OLD_KEYS) { const o = JSON.parse(localStorage.getItem(k) || 'null'); if (o && Array.isArray(o.shapes)) { d = migrate(o); break; } }
+        if (d && Array.isArray(d.screens) && d.screens.length) { delete d.sel; Object.assign(S, d); S.cur = Math.min(Math.max(0, S.cur | 0), S.screens.length - 1); }
     } catch (e) { }
-    // v1 → v2: v1 had no groups, palette or names (names are filled in by ensureNames() at start-up); v1 key is left untouched
-    function migrateV1(d) { delete d.sel; return Object.assign(d, { groups: [], palette: [], nextG: 1, bgPc: '', colorPc: '' }); }
-    function save() { try { const { sel, ...rest } = S; localStorage.setItem(KEY, JSON.stringify(rest)); } catch (e) { } }
+    // v1 (no groups, palette, names) and v2 (one screen) → v3: everything becomes the screen «Main»; names are filled in by ensureNames() at start-up; old keys are left untouched
+    function migrate(d) {
+        const scr = { name: 'Main', shapes: d.shapes, groups: d.groups || [], bg: d.bg || 0, bgPc: d.bgPc || '' };
+        for (const k of ['shapes', 'groups', 'bg', 'bgPc', 'sel']) delete d[k];
+        return Object.assign(d, { screens: [scr], cur: 0, palette: d.palette || [], nextG: d.nextG || 1, assets: {}, colorPc: d.colorPc || '' });
+    }
+    // assets are serialised only when they change; unused ones are dropped from storage (but stay in memory for undo)
+    let assetsVer = 0, assetsKey = '', assetsJson = '{}';
+    function save() {
+        try {
+            const { sel, assets, ...rest } = S, used = new Set(S.screens.flatMap(sc => sc.shapes.filter(s => s.t === 'img').map(s => s.src)));
+            const key = assetsVer + ':' + [...used].sort().join();
+            if (key !== assetsKey) { assetsJson = JSON.stringify(Object.fromEntries(Object.entries(assets).filter(([k]) => used.has(k)))); assetsKey = key; }
+            localStorage.setItem(KEY, '{"assets":' + assetsJson + ',' + JSON.stringify(rest).slice(1));
+            saveFailed(false);
+        } catch (e) { saveFailed(true); }
+    }
 
     // history
     let hist = [], future = [], lastPushKey = '', lastPushT = 0;
-    function snapshot() { return JSON.stringify({ shapes: S.shapes, groups: S.groups, palette: S.palette, nextG: S.nextG, bg: S.bg, bgPc: S.bgPc, W: S.W, H: S.H }); }
+    function snapshot() { return JSON.stringify({ screens: S.screens, cur: S.cur, palette: S.palette, nextG: S.nextG, W: S.W, H: S.H }); }
     function push(key, snap) { const now = Date.now(); if (key && key === lastPushKey && now - lastPushT < 800) { lastPushT = now; return; } lastPushKey = key || ''; lastPushT = now; hist.push(snap || snapshot()); if (hist.length > 200) hist.shift(); future = []; }
-    function restore(js) { const d = JSON.parse(js); Object.assign(S, d); S.sel = S.sel.filter(i => i < S.shapes.length); }
+    function restore(js) { const d = JSON.parse(js), cur = S.cur; Object.assign(S, d); if (S.cur !== cur) S.sel = []; S.sel = S.sel.filter(i => i < S.shapes.length); }
     function undo() { if (!hist.length) return; future.push(snapshot()); restore(hist.pop()); lastPushKey = ''; syncSettings(); update(); }
     function redo() { if (!future.length) return; hist.push(snapshot()); restore(future.pop()); lastPushKey = ''; syncSettings(); update(); }
+    function withScreen(k, fn) { const c = S.cur; S.cur = k; try { return fn(); } finally { S.cur = c; } }
 
     // ---------- color ----------
     const to565 = hex => { const n = parseInt(hex.slice(1), 16), r = n >> 16 & 255, g = n >> 8 & 255, b = n & 255; return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3); };
@@ -195,13 +214,111 @@
     function raster(s, id) {
         curCol = toU32(s.c); curId = id;
         switch (s.t) {
-            case 'text': for (const l of layoutText(s)) drawStr(s.font, s.size, l.t, l.cx, l.cy); break;
+            case 'text': if (s.var) drawVarText(s); else for (const l of layoutText(s)) drawStr(s.font, s.size, l.t, l.cx, l.cy); break;
+            case 'img': drawImg(s); break;
             case 'rect': s.fill ? fillRect(s.x, s.y, s.w, s.h) : drawRect(s.x, s.y, s.w, s.h); break;
             case 'rrect': s.fill ? fillRoundRect(s.x, s.y, s.w, s.h, s.r) : drawRoundRect(s.x, s.y, s.w, s.h, s.r); break;
             case 'circle': s.fill ? fillCircle(s.x, s.y, s.r) : drawCircle(s.x, s.y, s.r); break;
             case 'line': line(s.x0, s.y0, s.x1, s.y1); break;
             case 'tri': if (s.fill) fillTriangle(s.x0, s.y0, s.x1, s.y1, s.x2, s.y2); else { line(s.x0, s.y0, s.x1, s.y1); line(s.x1, s.y1, s.x2, s.y2); line(s.x2, s.y2, s.x0, s.y0); } break;
             case 'pixel': px(s.x, s.y); break;
+        }
+    }
+
+    // ---------- changing text: what the generated drawXxx(value) does on the board ----------
+    // Adafruit_GFX::getTextBounds(str, 0, 0, …) with wrap off (charBounds for the classic font and for GFXfont)
+    function textBounds(font, size, str) {
+        let x = 0, minx = 0x7FFF, miny = 0x7FFF, maxx = -1, maxy = -1; const F = font && FONT_DATA[font];
+        for (const c of utf8.encode(str)) {
+            if (c === 10 || c === 13) continue;
+            if (!F) { minx = Math.min(minx, x); miny = Math.min(miny, 0); maxx = Math.max(maxx, x + 6 * size - 1); maxy = Math.max(maxy, 8 * size - 1); x += 6 * size; }
+            else if (c >= F.first && c <= F.last) {
+                const [, gw, gh, xa, xo, yo] = F.g[c - F.first], x1 = x + xo * size, y1 = yo * size; // empty glyphs (space) count too, as in the library
+                minx = Math.min(minx, x1); miny = Math.min(miny, y1); maxx = Math.max(maxx, x1 + gw * size - 1); maxy = Math.max(maxy, y1 + gh * size - 1); x += xa * size;
+            }
+        }
+        return { x: maxx >= minx ? minx : 0, w: maxx >= minx ? maxx - minx + 1 : 0, y: maxy >= miny ? miny : 0, h: maxy >= miny ? maxy - miny + 1 : 0 };
+    }
+    const varText = s => cleanText(s.font, (s.text || '').replace(/\n/g, ' '));
+    // cursor exactly as the generated C++: x + (w - bw) / 2 - bx with integer division
+    function varLayout(s) {
+        const t = varText(s), b = textBounds(s.font, s.size, t);
+        const cx = s.align === 'center' ? s.x + Math.trunc((s.w - b.w) / 2) - b.x : s.align === 'right' ? s.x + s.w - b.w - b.x : s.x - b.x;
+        const cy = s.valign === 'middle' ? s.y + Math.trunc((s.h - b.h) / 2) - b.y : s.valign === 'bottom' ? s.y + s.h - b.h - b.y : s.y - b.y;
+        return { t, cx, cy };
+    }
+    function drawVarText(s) {
+        const col = curCol; curCol = toU32(s.erase === 'color' ? s.ec : S.bg); fillRect(s.x, s.y, s.w, s.h); curCol = col;
+        const l = varLayout(s); drawStr(s.font, s.size, l.t, l.cx, l.cy);
+    }
+
+    // ---------- pictures ----------
+    // the source is decoded once; the w×h result (RGB565 + mask, or 1-bit) is cached; preview draws from those arrays like the library does
+    const decoded = new Map(), processed = new Map();
+    function srcImage(id) {
+        let e = decoded.get(id); if (e) return e.ready ? e : null;
+        const url = S.assets[id]; if (!url) return null;
+        e = { ready: false, img: new Image(), svg: url.startsWith('data:image/svg'), cache: null }; decoded.set(id, e);
+        e.img.onload = () => { e.ready = true; update(); };
+        e.img.src = url; return null;
+    }
+    // source pixels; SVG is rasterised at 4× the target size, then resampled like any picture
+    function sourcePixels(e, w, h) {
+        const sw = e.svg ? w * 4 : e.img.naturalWidth, sh = e.svg ? h * 4 : e.img.naturalHeight, key = sw + 'x' + sh;
+        if (e.cache && e.cache.key === key) return e.cache.data;
+        const c = document.createElement('canvas'); c.width = sw; c.height = sh; const x = c.getContext('2d'); x.drawImage(e.img, 0, 0, sw, sh);
+        e.cache = { key, data: x.getImageData(0, 0, sw, sh) }; return e.cache.data;
+    }
+    // nearest: the source pixel under the centre; avg: alpha-weighted mean over the covered source area
+    function resample(src, w, h, avg) {
+        const { width: sw, height: sh, data: d } = src, out = new Uint8ClampedArray(w * h * 4);
+        for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+            let x0, x1, y0, y1;
+            if (avg) { x0 = Math.min(sw - 1, Math.floor(x * sw / w)); x1 = Math.max(x0 + 1, Math.floor((x + 1) * sw / w)); y0 = Math.min(sh - 1, Math.floor(y * sh / h)); y1 = Math.max(y0 + 1, Math.floor((y + 1) * sh / h)); }
+            else { x0 = Math.min(sw - 1, Math.floor((x + .5) * sw / w)); x1 = x0 + 1; y0 = Math.min(sh - 1, Math.floor((y + .5) * sh / h)); y1 = y0 + 1; }
+            let r = 0, g = 0, b = 0, a = 0, n = 0;
+            for (let yy = y0; yy < y1; yy++) for (let xx = x0; xx < x1; xx++) { const k = (yy * sw + xx) * 4, al = d[k + 3]; r += d[k] * al; g += d[k + 1] * al; b += d[k + 2] * al; a += al; n++; }
+            const o = (y * w + x) * 4; if (a) { out[o] = Math.round(r / a); out[o + 1] = Math.round(g / a); out[o + 2] = Math.round(b / a); } out[o + 3] = Math.round(a / n);
+        }
+        return out;
+    }
+    // masks and icons use the drawBitmap layout: rows of (w + 7) / 8 bytes, most significant bit = leftmost pixel
+    function toRGB(p, w, h) {
+        const px = new Uint16Array(w * h), bw = (w + 7) >> 3, mask = new Uint8Array(bw * h); let holes = false;
+        for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) {
+            const o = (j * w + i) * 4; px[j * w + i] = ((p[o] >> 3) << 11) | ((p[o + 1] >> 2) << 5) | (p[o + 2] >> 3);
+            if (p[o + 3] >= 128) mask[j * bw + (i >> 3)] |= 0x80 >> (i & 7); else holes = true;
+        }
+        return { px, mask: holes ? mask : null };
+    }
+    // icon: a pixel is on when it is darker than the threshold (transparent counts as white); inversion flips it
+    function toBits(p, w, h, thr, inv) {
+        const bw = (w + 7) >> 3, bits = new Uint8Array(bw * h);
+        for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) {
+            const o = (j * w + i) * 4, lum = p[o + 3] >= 128 ? 299 * p[o] + 587 * p[o + 1] + 114 * p[o + 2] : 255000; // ×1000, integer so that grey 128 is exactly 128
+            if ((lum < thr * 1000) !== !!inv) bits[j * bw + (i >> 3)] |= 0x80 >> (i & 7);
+        }
+        return { bits };
+    }
+    function imgData(s) {
+        if (!(s.w >= 1 && s.h >= 1)) return null;
+        const e = srcImage(s.src); if (!e) return null;
+        const key = [s.src, s.w, s.h, s.mode, s.scale, s.thr, s.inv].join('|'); let r = processed.get(key); if (r) return r;
+        const rgba = resample(sourcePixels(e, s.w, s.h), s.w, s.h, s.scale === 'avg');
+        r = s.mode === 'icon' ? toBits(rgba, s.w, s.h, s.thr, s.inv) : toRGB(rgba, s.w, s.h);
+        if (processed.size > 64) processed.clear(); processed.set(key, r); return r;
+    }
+    // Adafruit drawBitmap(x, y, bitmap, w, h, color) / drawRGBBitmap(x, y, bitmap[, mask], w, h)
+    function drawImg(s) {
+        const d = imgData(s); if (!d) return;
+        const bw = (s.w + 7) >> 3;
+        for (let j = 0; j < s.h; j++) {
+            let b = 0;
+            for (let i = 0; i < s.w; i++) {
+                if (s.mode === 'icon') { if (i & 7) b <<= 1; else b = d.bits[j * bw + (i >> 3)]; if (b & 0x80) px(s.x + i, s.y + j); continue; }
+                if (d.mask) { if (i & 7) b <<= 1; else b = d.mask[j * bw + (i >> 3)]; if (!(b & 0x80)) continue; }
+                curCol = toU32(d.px[j * s.w + i]); px(s.x + i, s.y + j);
+            }
         }
     }
 
@@ -214,19 +331,9 @@
         tri: { name: 'Треугольник', f: [['x0', 'x0'], ['y0', 'y0'], ['x1', 'x1'], ['y1', 'y1'], ['x2', 'x2'], ['y2', 'y2']], canFill: true },
         pixel: { name: 'Пиксель', f: [['x', 'x'], ['y', 'y']] },
         text: { name: 'Текст', f: [['x', 'x'], ['y', 'y'], ['w', 'w'], ['h', 'h']] },
+        img: { name: 'Картинка', f: [['x', 'x'], ['y', 'y'], ['w', 'w'], ['h', 'h']] },
     };
     const colStr = s => s.pc && palEntry(s.pc) ? s.pc : fmt565(s.c);
-    function codeLine(s) {
-        const c = colStr(s), p = s.fill ? 'fill' : 'draw';
-        switch (s.t) {
-            case 'rect': return `canvas.${p}Rect(${s.x}, ${s.y}, ${s.w}, ${s.h}, ${c});`;
-            case 'rrect': return `canvas.${p}RoundRect(${s.x}, ${s.y}, ${s.w}, ${s.h}, ${s.r}, ${c});`;
-            case 'circle': return `canvas.${p}Circle(${s.x}, ${s.y}, ${s.r}, ${c});`;
-            case 'line': return `canvas.drawLine(${s.x0}, ${s.y0}, ${s.x1}, ${s.y1}, ${c});`;
-            case 'tri': return `canvas.${p}Triangle(${s.x0}, ${s.y0}, ${s.x1}, ${s.y1}, ${s.x2}, ${s.y2}, ${c});`;
-            case 'pixel': return `canvas.drawPixel(${s.x}, ${s.y}, ${c});`;
-        }
-    }
     function boxHandles(s) {
         const L = Math.min(s.x, s.x + s.w - 1), T = Math.min(s.y, s.y + s.h - 1), R = Math.max(s.x, s.x + s.w - 1), B = Math.max(s.y, s.y + s.h - 1), mx = Math.floor((L + R) / 2), my = Math.floor((T + B) / 2);
         const mk = (x, y, cur, fx, fy) => ({
@@ -244,7 +351,7 @@
     function handles(s) {
         const setR = (s, nx, ny) => { s.r = Math.round(Math.hypot(nx - s.x, ny - s.y)); };
         switch (s.t) {
-            case 'rect': case 'rrect': case 'text': return boxHandles(s);
+            case 'rect': case 'rrect': case 'text': case 'img': return boxHandles(s);
             case 'circle': return [{ x: s.x + s.r, y: s.y, cur: 'ew-resize', set: setR }, { x: s.x - s.r, y: s.y, cur: 'ew-resize', set: setR }, { x: s.x, y: s.y - s.r, cur: 'ns-resize', set: setR }, { x: s.x, y: s.y + s.r, cur: 'ns-resize', set: setR }];
             case 'line': return [{ x: s.x0, y: s.y0, cur: 'move', pt: true, set: (s, a, b) => { s.x0 = a; s.y0 = b; } }, { x: s.x1, y: s.y1, cur: 'move', pt: true, set: (s, a, b) => { s.x1 = a; s.y1 = b; } }];
             case 'tri': return [0, 1, 2].map(i => ({ x: s['x' + i], y: s['y' + i], cur: 'move', pt: true, set: (s, a, b) => { s['x' + i] = a; s['y' + i] = b; } }));
@@ -253,7 +360,7 @@
     }
     function bbox(s) {
         switch (s.t) {
-            case 'rect': case 'rrect': case 'text': return [Math.min(s.x, s.x + s.w), Math.min(s.y, s.y + s.h), Math.abs(s.w), Math.abs(s.h)];
+            case 'rect': case 'rrect': case 'text': case 'img': return [Math.min(s.x, s.x + s.w), Math.min(s.y, s.y + s.h), Math.abs(s.w), Math.abs(s.h)];
             case 'circle': return [s.x - s.r, s.y - s.r, 2 * s.r + 1, 2 * s.r + 1];
             case 'pixel': return [s.x, s.y, 1, 1];
             default: {
@@ -282,8 +389,8 @@
     }
     // colors that point at the palette follow it; a deleted entry leaves the last value as a literal
     function syncPalette() {
-        for (const s of S.shapes) if (s.pc) { const p = palEntry(s.pc); if (p) s.c = p.c; else delete s.pc; }
-        if (S.bgPc) { const p = palEntry(S.bgPc); if (p) S.bg = p.c; else S.bgPc = ''; }
+        const fix = (o, k, pk) => { if (!o[pk]) return; const p = palEntry(o[pk]); if (p) o[k] = p.c; else delete o[pk]; };
+        for (const sc of S.screens) { for (const s of sc.shapes) { fix(s, 'c', 'pc'); fix(s, 'ec', 'epc'); } if (sc.bgPc) { const p = palEntry(sc.bgPc); if (p) sc.bg = p.c; else sc.bgPc = ''; } }
         if (S.colorPc) { const p = palEntry(S.colorPc); if (p) S.color = p.c; else S.colorPc = ''; }
     }
 
@@ -569,7 +676,7 @@
     // locked shapes don't write the ID buffer, so clicks go through them
     function pick(x, y) {
         let box = -1;
-        for (let i = S.shapes.length - 1; i >= 0; i--) { const s = S.shapes[i]; if (s.t !== 'text' || hiddenAt(i) || lockedAt(i)) continue; const [bx, by, bw, bh] = bbox(s); if (x >= bx && y >= by && x < bx + bw && y < by + bh) { box = i; break; } }
+        for (let i = S.shapes.length - 1; i >= 0; i--) { const s = S.shapes[i]; if ((s.t !== 'text' && s.t !== 'img') || hiddenAt(i) || lockedAt(i)) continue; const [bx, by, bw, bh] = bbox(s); if (x >= bx && y >= by && x < bx + bw && y < by + bh) { box = i; break; } }
         for (let rad = 0; rad <= 3; rad++) {
             let best = -1;
             for (let dy = -rad; dy <= rad; dy++)for (let dx = -rad; dx <= rad; dx++) { const X = x + dx, Y = y + dy; if (X < 0 || Y < 0 || X >= S.W || Y >= S.H) continue; const v = idb[Y * S.W + X]; if (v > best) best = v; }
@@ -693,6 +800,7 @@
         tri: '<path d="M12 4l8.5 15h-17z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>',
         pixel: '<rect x="9" y="9" width="6" height="6" fill="currentColor"/>',
         text: '<path d="M5 6V4h14v2M12 4v16M9 20h6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>',
+        img: '<rect x="3.5" y="5" width="17" height="14" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="9" cy="10" r="1.8" fill="currentColor"/><path d="M4.5 18l5-5 3 3 3-4 4.5 5.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>',
         group: '<path d="M3 6h6l2 2h10v11H3z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>',
     };
     const AL = 'fill="currentColor"';
@@ -725,6 +833,7 @@
     };
     const rail = document.getElementById('rail');
     rail.innerHTML = TOOLS.map(([t, n, k]) => `<button class="tool" data-tool="${t}" title="${n} (${k})" aria-label="${n}"><svg viewBox="0 0 24 24">${ICONS[t]}</svg><kbd>${k}</kbd></button>`).join('')
+        + `<button class="tool" id="imgBtn" title="Картинка (I): PNG, JPG или SVG. Можно перетащить файл на холст или вставить из буфера" aria-label="Картинка"><svg viewBox="0 0 24 24">${ICONS.img}</svg><kbd>I</kbd></button>`
         + '<hr><button class="tool fillbtn" id="fillBtn" title="Заливка для новых фигур (F)">fill</button>'
         + '<button class="tool" id="undoBtn" title="Отменить (Ctrl+Z)" aria-label="Отменить"><svg viewBox="0 0 24 24"><path d="M9 7L4 12l5 5M4 12h11a5 5 0 010 10h-2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" transform="translate(0,-3)"/></svg></button>';
     rail.addEventListener('click', e => { const b = e.target.closest('[data-tool]'); if (b) setTool(b.dataset.tool); });
@@ -785,7 +894,7 @@
             const v = e.target.value.trim(), warn = document.getElementById('palWarn');
             if (v === p.n) return;
             if (!validName(v, p)) { warn.textContent = 'Имя — идентификатор C++ (латиница, цифры, _), не W/H/имя цвета и без повторов.'; e.target.value = p.n; return; }
-            push(); for (const s of S.shapes) if (s.pc === p.n) s.pc = v; if (S.bgPc === p.n) S.bgPc = v; if (S.colorPc === p.n) S.colorPc = v; p.n = v; warn.textContent = ''; update();
+            push(); for (const sc of S.screens) { for (const s of sc.shapes) { if (s.pc === p.n) s.pc = v; if (s.epc === p.n) s.epc = v; } if (sc.bgPc === p.n) sc.bgPc = v; } if (S.colorPc === p.n) S.colorPc = v; p.n = v; warn.textContent = ''; update();
         }
     });
     palEl.addEventListener('focusout', () => setTimeout(() => { renderPalette(); renderBgPc(); }, 0));
@@ -824,12 +933,13 @@
         insBody.innerHTML = `<div class="row" style="justify-content:space-between"><span><span class="chip" style="background:${toHex(s.c)}"></span><b>${esc(s.name || m.name)}</b> <span class="spec">${[(s.name || '').startsWith(m.name) ? '' : m.name, s.pc].filter(Boolean).join(' · ')}</span></span>
     ${m.canFill ? `<span class="seg" id="insFill"><button data-f="0" aria-pressed="${!s.fill}">draw</button><button data-f="1" aria-pressed="${!!s.fill}">fill</button></span>` : ''}</div>
     <div class="fields" style="margin-top:10px">${m.f.map(([k, l]) => `<label>${l}<input type="number" data-k="${k}" id="f-${k}" value="${s[k]}"></label>`).join('')}</div>
-    ${s.t === 'text' ? textInspector(s) : ''}
+    ${s.t === 'text' ? textInspector(s) : ''}${s.t === 'img' ? imgInspector(s) : ''}
     ${alignHtml('data-al', ALIGN, 'По экрану', 'Выравнивание по экрану')}`;
         insBody.querySelectorAll('input[data-k]').forEach(inp => inp.addEventListener('input', () => {
             if (inp.value === '' || isNaN(+inp.value)) return; push('f' + i + inp.dataset.k); S.shapes[i][inp.dataset.k] = Math.trunc(+inp.value); update(true);
         }));
         if (s.t === 'text') bindTextInspector(s, i);
+        if (s.t === 'img') bindImgInspector(s, i);
         const f = document.getElementById('insFill');
         if (f) f.onclick = e => { const b = e.target.closest('button'); if (!b) return; push(); s.fill = b.dataset.f === '1'; S.fill = s.fill; update(); };
     }
@@ -847,8 +957,13 @@
     function textInspector(s) {
         const opts = FONT_GROUPS.map(([g, ks]) => `<optgroup label="${g}">${ks.map(k => `<option value="${k}"${k === s.font ? ' selected' : ''}>${fontLabel(k)}</option>`).join('')}</optgroup>`).join('');
         const seg = (id, key, items) => `<span class="seg" id="${id}">${items.map(([v, l, t]) => `<button data-v="${v}" title="${t}" aria-pressed="${s[key] === v}">${l}</button>`).join('')}</span>`;
-        return `<div class="txt">
-    <textarea id="insText" spellcheck="false" placeholder="Введи текст. Enter — новая строка.">${esc(s.text || '')}</textarea>
+        const fn = s.var ? (plan().shapes.get(s) || {}).fn || varFn(s.var) : '';
+        const varRow = `<div class="row"><label class="set"><input type="checkbox" id="insVar"${s.var ? ' checked' : ''}> меняющийся текст</label>${s.var ? `<label class="set">id <input type="text" id="insVarId" value="${escA(s.var)}" style="width:96px" spellcheck="false"></label><span class="spec">${fn}(value)</span>` : ''}</div>`
+            + (s.var ? `<div class="row"><span class="set">Стирать</span><span class="seg" id="insErase"><button data-v="bg" aria-pressed="${s.erase !== 'color'}" title="Перед выводом залить блок фоном экрана">фоном экрана</button><button data-v="color" aria-pressed="${s.erase === 'color'}" title="Перед выводом залить блок своим цветом">своим цветом</button></span>`
+                + (s.erase === 'color' ? `<input type="color" id="insEc" value="${toHex(s.ec)}" aria-label="Цвет стирания">${S.palette.length ? `<select id="insEpc" aria-label="Цвет стирания из палитры"><option value="">—</option>${S.palette.map(p => `<option${p.n === s.epc ? ' selected' : ''}>${p.n}</option>`).join('')}</select>` : ''}` : '')
+                + '</div><div class="msg">Текст в редакторе — пример значения, одна строка. Позиция считается на плате через getTextBounds по выравниванию блока.</div>' : '');
+        return `<div class="txt">${varRow}
+    <textarea id="insText" spellcheck="false" placeholder="${s.var ? 'Пример значения' : 'Введи текст. Enter — новая строка.'}">${esc(s.text || '')}</textarea>
     <div class="msg warn" id="txtWarn"></div>
     <div class="row">
       <select id="insFont" aria-label="Шрифт">${opts}</select>
@@ -866,6 +981,24 @@
         const m = fontMetrics(s.font, s.size), over = m.block(wrapText(s).length) > s.h;
         el.textContent = (bad.length ? `Нет в шрифте и будут пропущены: ${bad.slice(0, 12).join(' ')}. ` : '') + (over ? 'Текст выше рамки — увеличь h или нажми «Высота по тексту».' : '');
     }
+    function imgInspector(s) {
+        const seg = (id, key, items) => `<span class="seg" id="${id}">${items.map(([v, l, t]) => `<button data-v="${v}" title="${t}" aria-pressed="${s[key] === v}">${l}</button>`).join('')}</span>`;
+        const d = imgData(s), bw = (s.w + 7) >> 3, icon = s.mode === 'icon', bytes = icon ? bw * s.h : s.w * s.h * 2 + (d && d.mask ? bw * s.h : 0);
+        return `<div class="txt">
+    <div class="row">${seg('imgMode', 'mode', [['color', 'цвет', 'RGB565-массив и drawRGBBitmap'], ['icon', 'иконка', '1-битная маска и drawBitmap цветом фигуры']])}
+      ${seg('imgScale', 'scale', [['nearest', 'без сглаживания', 'Каждый пиксель берётся из ближайшего пикселя исходника'], ['avg', 'усреднение', 'Каждый пиксель — среднее по своей области исходника']])}</div>
+    ${icon ? `<div class="row"><label class="set">порог <input type="range" id="imgThr" min="1" max="255" value="${s.thr}"></label><span class="spec" id="imgThrV">${s.thr}</span><label class="set"><input type="checkbox" id="imgInv"${s.inv ? ' checked' : ''}> инверсия</label></div>
+    <div class="msg">Пиксель горит, если он темнее порога (прозрачное считается белым). Цвет иконки — в разделе «Цвет», можно из палитры.</div>` : ''}
+    <div class="row"><button class="btn" id="imgRatio" title="Подогнать высоту под пропорции исходной картинки">Исходные пропорции</button><span class="spec">${d ? (!icon && d.mask ? 'с прозрачностью · ' : '') : 'загружается… · '}${bytes.toLocaleString('ru')} байт</span></div></div>`;
+    }
+    function bindImgInspector(s, i) {
+        for (const [id, key] of [['imgMode', 'mode'], ['imgScale', 'scale']]) document.getElementById(id).onclick = e => { const b = e.target.closest('button'); if (!b || s[key] === b.dataset.v) return; push(); s[key] = b.dataset.v; update(); };
+        const thr = document.getElementById('imgThr');
+        if (thr) thr.addEventListener('input', () => { push('thr' + i); s.thr = +thr.value; document.getElementById('imgThrV').textContent = thr.value; update(true); });
+        const inv = document.getElementById('imgInv');
+        if (inv) inv.onchange = () => { push(); s.inv = inv.checked; update(); };
+        document.getElementById('imgRatio').onclick = () => { if (!s.nw || !s.nh) return; push(); s.h = Math.max(1, Math.round(s.w * s.nh / s.nw)); update(); };
+    }
     function bindTextInspector(s, i) {
         const ta = document.getElementById('insText');
         ta.addEventListener('input', () => { push('txt' + i); s.text = ta.value; textWarn(s); update(true); });
@@ -877,7 +1010,21 @@
         document.getElementById('insSize').addEventListener('input', e => { const v = Math.max(1, Math.min(10, +e.target.value | 0)); if (!e.target.value) return; push('sz' + i); s.size = v; S.textSize = v; textWarn(s); update(true); });
         document.getElementById('insAlign').onclick = e => { const b = e.target.closest('button'); if (!b) return; push(); s.align = b.dataset.v; update(); };
         document.getElementById('insVAlign').onclick = e => { const b = e.target.closest('button'); if (!b) return; push(); s.valign = b.dataset.v; update(); };
-        document.getElementById('fitH').onclick = () => { push(); s.h = Math.max(1, fontMetrics(s.font, s.size).block(Math.max(1, wrapText(s).length))); update(); };
+        document.getElementById('fitH').onclick = () => { push(); s.h = Math.max(1, s.var ? textBounds(s.font, s.size, varText(s)).h : fontMetrics(s.font, s.size).block(Math.max(1, wrapText(s).length))); update(); };
+        document.getElementById('insVar').onchange = e => {
+            push();
+            if (e.target.checked) { s.var = uniqueVar('text', new Set(S.screens.flatMap(x => x.shapes.map(t => t.var)).filter(Boolean))); s.erase = 'bg'; s.ec = S.bg; s.text = (s.text || '').replace(/\n/g, ' '); }
+            else for (const k of ['var', 'erase', 'ec', 'epc']) delete s[k];
+            update();
+        };
+        const vid = document.getElementById('insVarId');
+        if (vid) vid.onchange = () => { const v = lead(vid.value.trim().replace(/[^A-Za-z0-9_]/g, '_')); if (v && v !== s.var) { push(); s.var = v; } update(); };
+        const er = document.getElementById('insErase');
+        if (er) er.onclick = e => { const b = e.target.closest('button'); if (!b) return; push(); s.erase = b.dataset.v; if (s.ec == null) s.ec = S.bg; update(); };
+        const ec = document.getElementById('insEc');
+        if (ec) ec.addEventListener('input', () => { push('ec' + i); s.ec = to565(ec.value); delete s.epc; update(true); });
+        const epc = document.getElementById('insEpc');
+        if (epc) epc.onchange = () => { push(); if (epc.value) s.epc = epc.value; else delete s.epc; update(); };
         textWarn(s);
     }
     insBody.addEventListener('click', e => { const b = e.target.closest('[data-al],[data-sal]'); if (!b) return; b.dataset.al ? alignScreen(b.dataset.al) : alignSel(b.dataset.sal); });
@@ -922,7 +1069,7 @@
     let clip = null, clipN = 0;
     function copySel(cut) {
         if (!S.sel.length) return false;
-        clip = JSON.stringify(clipSel()); clipN = cut ? -1 : 0;
+        clip = JSON.stringify(clipSel()); clipN = cut ? -1 : 0; clipText = selectionCode();
         if (cut) { push(); delSel(); update(); }
         return true;
     }
@@ -1006,65 +1153,226 @@
         if (/^\s*\/\//.test(t)) return `<span class="t-c">${esc(t)}</span>`;
         return esc(t).replace(/("(?:\\.|[^"\\])*")|(\/\/.*)$|\b(0x[0-9A-Fa-f]+|\d+)\b|(\b(?:canvas|lcd)\b(?:\.|-&gt;)\w+)/g, (m, q, c, n, f) => q ? `<span class="t-s">${q}</span>` : c ? `<span class="t-c">${c}</span>` : n ? `<span class="t-n">${n}</span>` : `<span class="t-fn">${f}</span>`);
     }
-    function textCode(s, st) {
+    // C++ names from element names: Russian is transliterated; constants UPPER_SNAKE, arrays lower_snake, functions drawPascal
+    const TR = { а: 'a', б: 'b', в: 'v', г: 'g', д: 'd', е: 'e', ё: 'e', ж: 'zh', з: 'z', и: 'i', й: 'y', к: 'k', л: 'l', м: 'm', н: 'n', о: 'o', п: 'p', р: 'r', с: 's', т: 't', у: 'u', ф: 'f', х: 'h', ц: 'ts', ч: 'ch', ш: 'sh', щ: 'sch', ъ: '', ы: 'y', ь: '', э: 'e', ю: 'yu', я: 'ya' };
+    const words = n => [...String(n).toLowerCase()].map(ch => TR[ch] ?? ch).join('').split(/[^a-z0-9]+/).filter(Boolean);
+    const lead = id => /^\d/.test(id) ? '_' + id : id;
+    const upperId = n => lead(words(n).join('_').toUpperCase() || 'ITEM');
+    const snakeId = n => lead(words(n).join('_') || 'image');
+    const pascalId = n => lead(words(n).map(w => w[0].toUpperCase() + w.slice(1)).join('') || 'Screen');
+    const varFn = id => 'draw' + id[0].toUpperCase() + id.slice(1);
+    // only names the user gave count as names: «Прямоугольник 3» / «Группа 2» stay out of the code
+    const customName = s => !!s.name && !new RegExp('^' + META[s.t].name + ' \\d+$').test(s.name);
+    const customGroup = g => !!g.name && !/^Группа \d+$/.test(g.name);
+    const FIELDS = { rect: ['x', 'y', 'w', 'h'], rrect: ['x', 'y', 'w', 'h', 'r'], text: ['x', 'y', 'w', 'h'], img: ['x', 'y', 'w', 'h'], circle: ['x', 'y', 'r'], line: ['x0', 'y0', 'x1', 'y1'], tri: ['x0', 'y0', 'x1', 'y1', 'x2', 'y2'], pixel: ['x', 'y'] };
+    const bgExpr = sc => sc.bgPc && palEntry(sc.bgPc) ? sc.bgPc : fmt565(sc.bg);
+
+    // every C++ name of the sketch, allocated in one pass so they stay unique: screen functions, constant prefixes, arrays, changing-text functions
+    function plan() {
+        const used = new Set(['W', 'H', 'canvas', 'lcd', 'present', 'setup', 'loop', ...S.palette.map(p => p.n)]);
+        const take = (base, sep = '_') => { let n = base, k = 2; while (used.has(n)) n = base + sep + k++; used.add(n); return n; };
+        const P = { fns: S.screens.map(sc => take('draw' + pascalId(sc.name), '')), shapes: new Map(), vis: [] };
+        S.screens.forEach((sc, k) => {
+            const vis = withScreen(k, () => S.shapes.filter((_, i) => !hiddenAt(i))); P.vis.push(vis);
+            for (const s of vis) {
+                const e = {};
+                if (S.coordConsts && customName(s)) e.pre = take(upperId(s.name));
+                if (s.t === 'img') { e.arr = take(snakeId(s.name)); const d = imgData(s); if (d && d.mask && s.mode !== 'icon') e.mask = take(e.arr + '_mask'); }
+                if (s.t === 'text' && s.var) e.fn = take(varFn(s.var), '');
+                P.shapes.set(s, e);
+            }
+        });
+        return P;
+    }
+    // a coordinate: the number, or NAME_X when the element has constants
+    const V = (s, e, k) => e && e.pre ? `${e.pre}_${k.toUpperCase()}` : String(s[k]);
+    const plus = (base, d) => d ? `${base} ${d < 0 ? '-' : '+'} ${Math.abs(d)}` : base;
+    function codeLine(s, e) {
+        const c = colStr(s), p = s.fill ? 'fill' : 'draw', v = k => V(s, e, k);
+        switch (s.t) {
+            case 'rect': return `canvas.${p}Rect(${v('x')}, ${v('y')}, ${v('w')}, ${v('h')}, ${c});`;
+            case 'rrect': return `canvas.${p}RoundRect(${v('x')}, ${v('y')}, ${v('w')}, ${v('h')}, ${v('r')}, ${c});`;
+            case 'circle': return `canvas.${p}Circle(${v('x')}, ${v('y')}, ${v('r')}, ${c});`;
+            case 'line': return `canvas.drawLine(${v('x0')}, ${v('y0')}, ${v('x1')}, ${v('y1')}, ${c});`;
+            case 'tri': return `canvas.${p}Triangle(${v('x0')}, ${v('y0')}, ${v('x1')}, ${v('y1')}, ${v('x2')}, ${v('y2')}, ${c});`;
+            case 'pixel': return `canvas.drawPixel(${v('x')}, ${v('y')}, ${c});`;
+            case 'img': return s.mode === 'icon' ? `canvas.drawBitmap(${v('x')}, ${v('y')}, ${e.arr}, ${v('w')}, ${v('h')}, ${c});`
+                : `canvas.drawRGBBitmap(${v('x')}, ${v('y')}, ${e.arr}, ${e.mask ? e.mask + ', ' : ''}${v('w')}, ${v('h')});`;
+        }
+    }
+    function textCode(s, st, e) {
         const out = [], col = colStr(s);
         if (!st.wrap) { out.push('canvas.setTextWrap(false);  // переносы уже посчитаны редактором'); st.wrap = true; }
         if (st.font !== s.font) { out.push(s.font ? `canvas.setFont(&${s.font});` : 'canvas.setFont();  // встроенный 5×7'); st.font = s.font; }
         if (st.size !== s.size) { out.push(`canvas.setTextSize(${s.size});`); st.size = s.size; }
         if (st.color !== col) { out.push(`canvas.setTextColor(${col});`); st.color = col; }
-        for (const l of layoutText(s)) { out.push(`canvas.setCursor(${l.cx}, ${l.cy});`); out.push(`canvas.print("${cstr(l.t)}");`); }
+        for (const l of layoutText(s)) {
+            const cx = e && e.pre ? plus(V(s, e, 'x'), l.cx - s.x) : l.cx, cy = e && e.pre ? plus(V(s, e, 'y'), l.cy - s.y) : l.cy;
+            out.push(`canvas.setCursor(${cx}, ${cy});`); out.push(`canvas.print("${cstr(l.t)}");`);
+        }
         return out;
     }
-    // hidden shapes don't go into the code; palette colors become constexpr constants
-    function buildLines() {
-        const st = { font: '', size: 1, color: null, wrap: false };
-        const shapeLines = S.shapes.flatMap((s, i) => hiddenAt(i) ? [] : s.t === 'text' ? textCode(s, st).map(t => ({ t, i })) : [{ t: codeLine(s), i }]);
-        const fonts = [...new Set(S.shapes.filter((s, i) => s.t === 'text' && s.font && !hiddenAt(i)).map(s => s.font))];
-        const L = t => ({ t, i: -1 }), pal = S.palette.map(p => L(`constexpr uint16_t ${p.n} = ${fmt565(p.c)};`));
-        if (S.codeMode === 'snippet') return pal.length ? [...pal, L(''), ...shapeLines] : shapeLines;
-        return [
-            L('#include <Waveshare_LCD147.h>'), L('#include <Adafruit_GFX.h>'), ...fonts.map(f => L(`#include <Fonts/${f}.h>`)), L(''),
+    function shapeCode(s, e, st) {
+        // the function sets font, size and colour itself, so the next static text must set them again
+        if (s.t === 'text' && s.var) { st.font = st.size = undefined; st.color = null; return [`${e.fn}("${cstr(varText(s))}");`]; }
+        return s.t === 'text' ? textCode(s, st, e) : [codeLine(s, e)];
+    }
+    // drawing lines of screen k in draw order; named elements and groups get a «// name» comment; i/k point back at the shape
+    function screenLines(k, P, unknown) {
+        return withScreen(k, () => {
+            const st = unknown ? { font: undefined, size: undefined, color: null, wrap: false } : { font: '', size: 1, color: null, wrap: false }, out = [];
+            (function walk(n) {
+                for (const c of n.kids) {
+                    if (c.i == null) { if (nodeIdx(c).every(hiddenAt)) continue; if (customGroup(c.g)) out.push({ t: '// ' + c.g.name, i: -1, k }); walk(c); continue; }
+                    const s = S.shapes[c.i]; if (hiddenAt(c.i)) continue;
+                    if (customName(s)) out.push({ t: '// ' + s.name, i: c.i, k });
+                    for (const t of shapeCode(s, P.shapes.get(s), st)) out.push({ t, i: c.i, k });
+                }
+            })(buildTree());
+            return out;
+        });
+    }
+    const constLines = (vis, P) => vis.flatMap(s => { const e = P.shapes.get(s); return e.pre ? FIELDS[s.t].map(f => `constexpr int ${e.pre}_${f.toUpperCase()} = ${s[f]};`) : []; });
+    // PROGMEM arrays of a picture; data rows are marked so the panel can fold them
+    const arrCache = new Map();
+    function imgArrayLines(s, e) {
+        const d = imgData(s); if (!d) return [{ t: `// ${s.name}: картинка ещё загружается` }];
+        const key = [s.src, s.w, s.h, s.mode, s.scale, s.thr, s.inv, e.arr, e.mask, s.name].join('|'); let r = arrCache.get(key); if (r) return r;
+        const rows = (vals, per, n) => { const o = []; for (let k = 0; k < vals.length; k += per) o.push({ t: '  ' + Array.from(vals.slice(k, k + per), v => '0x' + v.toString(16).toUpperCase().padStart(n, '0')).join(', ') + ',', data: true }); return o; };
+        const icon = s.mode === 'icon';
+        r = [{ t: `// ${s.name}: ${s.w}×${s.h}, ${icon ? '1 бит на пиксель, для drawBitmap' : 'RGB565, для drawRGBBitmap' + (e.mask ? ' + маска прозрачности' : '')}` }];
+        if (icon) r.push({ t: `const uint8_t ${e.arr}[] PROGMEM = {` }, ...rows(d.bits, 16, 2), { t: '};' });
+        else {
+            r.push({ t: `const uint16_t ${e.arr}[] PROGMEM = {` }, ...rows(d.px, 12, 4), { t: '};' });
+            if (e.mask) r.push({ t: `const uint8_t ${e.mask}[] PROGMEM = {` }, ...rows(d.mask, 16, 2), { t: '};' });
+        }
+        if (arrCache.size > 32) arrCache.clear(); arrCache.set(key, r); return r;
+    }
+    // void drawTemp(const char* value): erase the block, set the style, place the value by getTextBounds and the block alignment
+    function varFnLines(s, e, bg) {
+        const v = k => V(s, e, k), x = v('x'), y = v('y'), w = v('w'), h = v('h');
+        const er = s.erase === 'color' ? (s.epc && palEntry(s.epc) ? s.epc : fmt565(s.ec)) : bg;
+        const cx = s.align === 'center' ? `${x} + (${w} - bw) / 2 - bx` : s.align === 'right' ? `${x} + ${w} - bw - bx` : `${x} - bx`;
+        const cy = s.valign === 'middle' ? `${y} + (${h} - bh) / 2 - by` : s.valign === 'bottom' ? `${y} + ${h} - bh - by` : `${y} - by`;
+        return [`// меняющийся текст «${s.var}»${customName(s) ? ' — ' + s.name : ''}`, `void ${e.fn}(const char* value) {`,
+            `  canvas.fillRect(${x}, ${y}, ${w}, ${h}, ${er});  // стереть область блока`,
+            s.font ? `  canvas.setFont(&${s.font});` : '  canvas.setFont();  // встроенный 5×7', `  canvas.setTextSize(${s.size});`, `  canvas.setTextColor(${colStr(s)});`, '  canvas.setTextWrap(false);',
+            '  // выравнивание считается на плате через getTextBounds', '  int16_t bx, by; uint16_t bw, bh;', '  canvas.getTextBounds(value, 0, 0, &bx, &by, &bw, &bh);',
+            `  canvas.setCursor(${cx}, ${cy});`, '  canvas.print(value);', '}'];
+    }
+    function buildLines(P = plan()) {
+        const L = t => ({ t, i: -1 }), ind = l => ({ ...l, t: l.t ? '  ' + l.t : l.t });
+        const pal = S.palette.map(p => L(`constexpr uint16_t ${p.n} = ${fmt565(p.c)};`));
+        const all = P.vis.flatMap((v, k) => v.map(s => ({ s, k, e: P.shapes.get(s) })));
+        const imgs = all.filter(o => o.s.t === 'img'), vars = all.filter(o => o.s.t === 'text' && o.s.var), header = S.imgHeader && imgs.length > 0;
+        const arrays = () => imgs.flatMap(o => [...imgArrayLines(o.s, o.e).map(l => ({ i: -1, ...l })), L('')]);
+        if (S.codeMode === 'images' && header) return [L('// images.h — картинки для скетча'), L('#pragma once'), L('#include <Arduino.h>'), L(''), ...arrays()];
+        if (S.codeMode === 'snippet') {
+            const cur = P.vis[S.cur], notes = [];
+            if (cur.some(s => s.t === 'img')) notes.push(L(`// массивы картинок — в режиме «весь скетч»${header ? ' (images.h)' : ''}`));
+            if (cur.some(s => s.t === 'text' && s.var)) notes.push(L('// функции меняющегося текста — в режиме «весь скетч»'));
+            const pre = [...pal, ...constLines(cur, P).map(L), ...notes], body = screenLines(S.cur, P, false);
+            return pre.length ? [...pre, L(''), ...body] : body;
+        }
+        const fonts = [...new Set(all.filter(o => o.s.t === 'text' && o.s.font).map(o => o.s.font))], consts = all.flatMap(o => constLines([o.s], P)).map(L);
+        const out = [
+            L('#include <Waveshare_LCD147.h>'), L('#include <Adafruit_GFX.h>'), ...fonts.map(f => L(`#include <Fonts/${f}.h>`)), ...(header ? [L('#include "images.h"')] : []), L(''),
             L(`constexpr int W = ${S.W};   // ширина экрана`), L(`constexpr int H = ${S.H};   // высота экрана`), L(''),
             ...(pal.length ? [...pal, L('')] : []),
+            ...(consts.length ? [L('// координаты именованных элементов'), ...consts, L('')] : []),
             L('St7789* lcd;                 // драйвер (твоя библиотека)'), L('GFXcanvas16 canvas(W, H);    // холст в памяти, на нём рисуем'), L(''),
+            ...(header ? [] : arrays()),
             L('// Показать холст на экране'), L('void present() {'), L('  lcd->drawImage(0, 0, W, H, canvas.getBuffer());'), L('}'), L(''),
-            L('void setup() {'), L('  Serial.begin(115200);'), L('  lcd = &Waveshare147::begin();'), L(''),
-            L(`  canvas.fillScreen(${S.bgPc && palEntry(S.bgPc) ? S.bgPc : fmt565(S.bg)});  // фон`),
-            ...shapeLines.map(l => ({ t: '  ' + l.t, i: l.i })),
-            L('  present();'), L('}'), L(''), L('void loop() {'), L('}'),
+            ...vars.flatMap(o => [...varFnLines(o.s, o.e, bgExpr(S.screens[o.k])).map(L), L('')]),
         ];
+        // with several screens a screen can't rely on text settings left by another one
+        const unknown = S.screens.length > 1;
+        S.screens.forEach((sc, k) => out.push(L(`// Экран «${sc.name}»`), L(`void ${P.fns[k]}() {`), L(`  canvas.fillScreen(${bgExpr(sc)});  // фон`), ...screenLines(k, P, unknown).map(ind), L('}'), L('')));
+        out.push(L('void setup() {'), L('  Serial.begin(115200);'), L('  lcd = &Waveshare147::begin();'), L(''), L(`  ${P.fns[0]}();`), L('  present();'), L('}'), L(''), L('void loop() {'));
+        if (vars.length) { const o = vars[0]; out.push(L('  // пример обновления меняющегося текста:'), L(`  // ${o.e.fn}("${cstr(varText(o.s))}");`), L('  // present();')); }
+        out.push(L('}'));
+        return out;
     }
+    const hasHeaderMode = () => S.imgHeader && S.screens.some(sc => sc.shapes.some(s => s.t === 'img'));
     function renderCode() {
-        const lines = buildLines(), sel = new Set(S.sel);
-        codeEl.innerHTML = lines.length ? lines.map(l => `<div class="${l.i >= 0 ? 'shape' : ''}${l.i >= 0 && sel.has(l.i) ? ' on' : ''}" ${l.i >= 0 ? `data-i="${l.i}"` : ''}>${hl(l.t) || ' '}</div>`).join('') : '<div class="t-c">// холст пуст — нарисуй что-нибудь</div>';
+        if (S.codeMode === 'images' && !hasHeaderMode()) S.codeMode = 'full';
+        const lines = buildLines(), sel = new Set(S.sel), html = [];
+        for (let n = 0; n < lines.length; n++) {
+            const l = lines[n];
+            if (l.data) { let m = n; while (m < lines.length && lines[m].data) m++; html.push(`<div class="t-c fold">  …  // ${m - n} строк данных — целиком при копировании</div>`); n = m - 1; continue; }
+            const k = l.k ?? S.cur, on = l.i >= 0 && k === S.cur && sel.has(l.i);
+            html.push(`<div class="${l.i >= 0 ? 'shape' : ''}${on ? ' on' : ''}"${l.i >= 0 ? ` data-i="${l.i}" data-k="${k}"` : ''}>${hl(l.t) || ' '}</div>`);
+        }
+        codeEl.innerHTML = html.length ? html.join('') : '<div class="t-c">// холст пуст — нарисуй что-нибудь</div>';
         const on = codeEl.querySelector('.on'); if (on) { const r = on.offsetTop - codeEl.scrollTop; if (r < 0 || r > codeEl.clientHeight - 20) codeEl.scrollTop = on.offsetTop - codeEl.clientHeight / 2; }
+        document.getElementById('modeImg').hidden = !hasHeaderMode();
         document.querySelectorAll('#codeMode button').forEach(b => b.setAttribute('aria-pressed', b.dataset.m === S.codeMode));
+        document.getElementById('optConsts').checked = S.coordConsts; document.getElementById('optImgH').checked = S.imgHeader;
     }
-    codeEl.addEventListener('click', e => { const d = e.target.closest('[data-i]'); if (d) { setSel([+d.dataset.i]); S.tool = 'select'; update(); } });
+    codeEl.addEventListener('click', e => { const d = e.target.closest('[data-i]'); if (!d) return; if (+d.dataset.k !== S.cur) { S.cur = +d.dataset.k; triPts = null; preview = null; } setSel([+d.dataset.i]); S.tool = 'select'; update(); });
     document.getElementById('codeMode').addEventListener('click', e => { const b = e.target.closest('button'); if (b) { S.codeMode = b.dataset.m; update(); } });
+    document.getElementById('optConsts').addEventListener('change', e => { S.coordConsts = e.target.checked; update(); });
+    document.getElementById('optImgH').addEventListener('change', e => { S.imgHeader = e.target.checked; if (!S.imgHeader && S.codeMode === 'images') S.codeMode = 'full'; update(); });
     const copyMsg = document.getElementById('copyMsg');
     document.getElementById('copyBtn').addEventListener('click', () => {
         const text = buildLines().map(l => l.t).join('\n');
-        const fallback = () => { const r = document.createRange(); r.selectNodeContents(codeEl); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); copyMsg.textContent = 'Код выделен — нажми Ctrl+C / ⌘C.'; };
-        try { navigator.clipboard.writeText(text).then(() => { copyMsg.textContent = 'Скопировано.'; setTimeout(() => copyMsg.textContent = '', 2000); }, fallback); } catch (e) { fallback(); }
+        const fallback = () => { const r = document.createRange(); r.selectNodeContents(codeEl); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); copyMsg.textContent = 'Код выделен — нажми Ctrl+C / ⌘C (большие массивы в панели свёрнуты).'; };
+        try { navigator.clipboard.writeText(text).then(() => { copyMsg.textContent = S.codeMode === 'images' ? 'Скопировано содержимое images.h.' : 'Скопировано.'; setTimeout(() => copyMsg.textContent = '', 2000); }, fallback); } catch (e) { fallback(); }
     });
+    // code of the selected shapes, for the system clipboard on Ctrl/⌘+C
+    function selectionCode() { const sel = new Set(S.sel); return screenLines(S.cur, plan(), false).filter(l => sel.has(l.i)).map(l => l.t).join('\n'); }
 
     // import
-    function evalNum(expr, pal) {
+    // numbers, colours, palette names, W/H and int constants inside simple expressions
+    function evalNum(expr, pal, vars) {
         expr = expr.trim(); if (pal && pal[expr] != null) return pal[expr];
         const c = parse565(expr);
         if (/^(0x|#)|^[A-Z_]*(BLACK|WHITE|RED|GREEN|BLUE|YELLOW|MAGENTA|CYAN|ORANGE)$/i.test(expr) && c != null) return c;
-        const e = expr.replace(/\bW\b/g, S.W).replace(/\bH\b/g, S.H);
+        const e = expr.replace(/\b[A-Za-z_]\w*\b/g, id => id === 'W' ? S.W : id === 'H' ? S.H : vars && vars[id] != null ? vars[id] : id);
         if (!/^[\d\s+\-*/().]+$/.test(e)) return null;
         try { const v = Function('return (' + e + ')')(); return Number.isFinite(v) ? Math.trunc(v) : null; } catch (_) { return null; }
     }
     const cunesc = t => t.replace(/\\(x[0-9a-fA-F]{1,2}|[0-7]{1,3}|.)/g, (_, e) => e[0] === 'x' ? String.fromCharCode(parseInt(e.slice(1), 16)) : /^[0-7]/.test(e) ? String.fromCharCode(parseInt(e, 8)) : { n: '\n', r: '\r', t: '\t' }[e] || e);
-    function parseCode(src) {
-        const out = [], pal = {}; let bg = null, bgPc = '', skipped = 0;
-        src = src.replace(/("(?:\\.|[^"\\])*")|\/\/.*$/gm, (m, q) => q || '');
-        // palette: constexpr / const uint16_t NAME = value;
-        for (const m of src.matchAll(/\b(?:constexpr|const)\s+uint16_t\s+([A-Za-z_]\w*)\s*=\s*([^;]+);/g)) { const v = evalNum(m[2], pal); if (v != null) pal[m[1]] = v & 0xFFFF; }
-        const pcOf = a => a != null && pal[a.trim()] != null ? a.trim() : '';
+    // void name(params) { body } with braces matched outside string literals
+    function splitFunctions(src) {
+        const out = [], re = /\bvoid\s+(\w+)\s*\(([^)]*)\)\s*\{/g; let m;
+        while ((m = re.exec(src))) {
+            let d = 1, i = re.lastIndex, q = false;
+            for (; i < src.length && d; i++) { const ch = src[i]; if (q) { if (ch === '\\') i++; else if (ch === '"') q = false; } else if (ch === '"') q = true; else if (ch === '{') d++; else if (ch === '}') d--; }
+            out.push({ name: m[1], params: m[2].trim(), body: src.slice(re.lastIndex, i - 1), start: m.index, end: i }); re.lastIndex = i;
+        }
+        return out;
+    }
+    // a generated changing-text function → block geometry, style and alignment
+    function parseVarFn(f, ctx) {
+        const v = { font: '', size: 1, c: 0xFFFF, pc: '', align: 'left', valign: 'top' }; let rect = false;
+        for (const m of f.body.matchAll(/canvas\s*\.\s*(\w+)\s*\(([^;]*)\)\s*;/g)) {
+            const fn = m[1], parts = m[2].split(',').map(t => t.trim()), num = t => evalNum(t, ctx.pal, ctx.vars);
+            if (fn === 'fillRect' && !rect && parts.length === 5) { const a = parts.map(num); if (a.some(x => x == null)) return null; [v.x, v.y, v.w, v.h, v.ec] = a; v.epc = ctx.pcOf(parts[4]); v.eraseExpr = parts[4].replace(/\s/g, ''); rect = true; }
+            if (fn === 'setFont') { const n = parts[0].replace(/^&/, ''); v.font = FONT_DATA[n] ? n : ''; }
+            if (fn === 'setTextSize') v.size = Math.max(1, num(parts[0]) || 1);
+            if (fn === 'setTextColor') { v.c = num(parts[0]) ?? 0xFFFF; v.pc = ctx.pcOf(parts[0]); }
+            if (fn === 'setCursor') { v.align = !/\bbw\b/.test(parts[0]) ? 'left' : /\/\s*2/.test(parts[0]) ? 'center' : 'right'; v.valign = !/\bbh\b/.test(parts[1] || '') ? 'top' : /\/\s*2/.test(parts[1]) ? 'middle' : 'bottom'; }
+        }
+        return rect ? v : null;
+    }
+    function parseCode(raw) {
+        const names = {}; for (const m of raw.matchAll(/\/\/\s*Экран\s*«([^»\n]*)»\s*\n\s*void\s+(\w+)\s*\(/g)) names[m[2]] = m[1];
+        const src = raw.replace(/("(?:\\.|[^"\\])*")|\/\/.*$|\/\*[\s\S]*?\*\//gm, (m, q) => q || '');
+        const pal = {}, vars = {};
+        for (const m of src.matchAll(/\b(?:constexpr|const)\s+uint16_t\s+([A-Za-z_]\w*)\s*=\s*([^;]+);/g)) { const v = evalNum(m[2], pal, vars); if (v != null) pal[m[1]] = v & 0xFFFF; }
+        for (const m of src.matchAll(/\b(?:constexpr|const)\s+(?:int|int16_t|int32_t)\s+([A-Za-z_]\w*)\s*=\s*([^;]+);/g)) { if (m[1] === 'W' || m[1] === 'H') continue; const v = evalNum(m[2], pal, vars); if (v != null) vars[m[1]] = v; }
+        const ctx = { pal, vars, varFns: {}, skipped: 0, imgSkipped: 0, pcOf: a => a != null && pal[a.trim()] != null ? a.trim() : '' };
+        const fns = splitFunctions(src);
+        for (const f of fns) if (/^const\s+char\s*\*\s*\w+$/.test(f.params)) { const v = parseVarFn(f, ctx); if (v) ctx.varFns[f.name] = v; }
+        const scr = fns.filter(f => !f.params && !['setup', 'loop', 'present'].includes(f.name) && /canvas\s*\./.test(f.body));
+        if (scr.length) { const screens = scr.map(f => ({ name: names[f.name] || f.name.replace(/^draw(?=\w)/, ''), ...parseBody(f.body, ctx) })); return { ...ctx, multi: true, screens }; }
+        // no screen functions (a snippet or the old one-screen sketch): everything outside changing-text functions is one screen
+        let rest = src; for (const f of fns.filter(f => ctx.varFns[f.name]).reverse()) rest = rest.slice(0, f.start) + rest.slice(f.end);
+        const screens = [parseBody(rest, ctx)]; return { ...ctx, multi: false, screens }; // counters are read after parsing
+    }
+    function parseBody(src, ctx) {
+        const out = [], { pal, vars, pcOf } = ctx; let bg = null, bgPc = '', bgRaw = '';
         const T = { Rect: ['rect', ['x', 'y', 'w', 'h']], RoundRect: ['rrect', ['x', 'y', 'w', 'h', 'r']], Circle: ['circle', ['x', 'y', 'r']], Triangle: ['tri', ['x0', 'y0', 'x1', 'y1', 'x2', 'y2']], Line: ['line', ['x0', 'y0', 'x1', 'y1']], Pixel: ['pixel', ['x', 'y']] };
         const ts = { font: '', size: 1, c: 0xFFFF, pc: '', cx: 0, cy: 0 }; let group = null;
         const flush = () => {
@@ -1074,11 +1382,19 @@
             const sh = { t: 'text', x, y: g.top, w: Math.max(1, r - x), h: fontMetrics(g.font, g.size).block(g.lines.length), text: g.lines.map(l => l.t).join('\n'), font: g.font, size: g.size, align, valign: 'top', c: g.c };
             if (g.pc) sh.pc = g.pc; out.push(sh);
         };
-        const re = /canvas\s*\.\s*(\w+)\s*\(((?:"(?:\\.|[^"\\])*"|[^;"])*)\)\s*;/g; let m;
+        // canvas.fn(args); or a call of a changing-text function: drawTemp("example");
+        const re = /canvas\s*\.\s*(\w+)\s*\(((?:"(?:\\.|[^"\\])*"|[^;"])*)\)\s*;|\b([A-Za-z_]\w*)\s*\(\s*"((?:\\.|[^"\\])*)"\s*\)\s*;/g; let m;
         while ((m = re.exec(src))) {
+            if (m[3]) {
+                const v = ctx.varFns[m[3]]; if (!v) continue; flush();
+                const sh = { t: 'text', x: v.x, y: v.y, w: v.w, h: v.h, text: cunesc(m[4]), font: v.font, size: v.size, align: v.align, valign: v.valign, c: v.c, var: m[3].replace(/^draw(?=\w)/, '').replace(/^\w/, ch => ch.toLowerCase()) };
+                if (v.pc) sh.pc = v.pc;
+                if (v.eraseExpr === bgRaw) sh.erase = 'bg'; else { sh.erase = 'color'; sh.ec = v.ec; if (v.epc) sh.epc = v.epc; }
+                out.push(sh); ts.font = v.font; ts.size = v.size; ts.c = v.c; ts.pc = v.pc; continue;
+            }
             const fn = m[1], raw = m[2].trim();
             if (fn === 'print' || fn === 'println') {
-                const q = raw.match(/^"((?:\\.|[^"\\])*)"$/); if (!q && raw) { skipped++; continue; }
+                const q = raw.match(/^"((?:\\.|[^"\\])*)"$/); if (!q && raw) { ctx.skipped++; continue; }
                 const fm = fontMetrics(ts.font, ts.size);
                 // '\n' (and println) works like Adafruit write('\n'): x = 0, y += line height
                 (cunesc(q ? q[1] : '') + (fn === 'println' ? '\n' : '')).split('\n').forEach((t, k) => {
@@ -1094,35 +1410,47 @@
                 });
                 continue;
             }
-            if (fn === 'setFont') { const f = raw.replace(/^&/, '').trim(); ts.font = FONT_DATA[f] ? f : ''; if (f && !FONT_DATA[f]) skipped++; continue; }
+            if (/^draw(RGB|X|Grayscale)?Bitmap$/.test(fn)) { ctx.imgSkipped++; continue; }
+            if (fn === 'setFont') { const f = raw.replace(/^&/, '').trim(); ts.font = FONT_DATA[f] ? f : ''; if (f && !FONT_DATA[f]) ctx.skipped++; continue; }
             if (fn === 'setTextWrap') continue;
-            const parts = raw ? raw.split(',') : [], args = parts.map(a => evalNum(a, pal));
-            if (args.some(a => a == null)) { skipped++; continue; }
+            const parts = raw ? raw.split(',') : [], args = parts.map(a => evalNum(a, pal, vars));
+            if (args.some(a => a == null)) { ctx.skipped++; continue; }
             if (fn === 'setTextSize') { ts.size = Math.max(1, args[0] || 1); continue; }
             if (fn === 'setTextColor') { ts.c = args[0]; ts.pc = pcOf(parts[0]); continue; }
             if (fn === 'setCursor') { ts.cx = args[0]; ts.cy = args[1]; continue; }
-            if (fn === 'fillScreen') { bg = args[0]; bgPc = pcOf(parts[0]); continue; }
+            if (fn === 'fillScreen') { bg = args[0]; bgPc = pcOf(parts[0]); bgRaw = parts[0].replace(/\s/g, ''); continue; }
             const k = fn.match(/^(draw|fill)(Rect|RoundRect|Circle|Triangle|Line|Pixel)$/);
-            if (!k) { skipped++; continue; }
-            const D = T[k[2]]; if (args.length !== D[1].length + 1) { skipped++; continue; }
+            if (!k) { ctx.skipped++; continue; }
+            const D = T[k[2]]; if (args.length !== D[1].length + 1) { ctx.skipped++; continue; }
             flush();
             const sh = { t: D[0] }; if (META[D[0]].canFill) sh.fill = k[1] === 'fill'; D[1].forEach((key, i) => sh[key] = args[i]); sh.c = args[args.length - 1];
             const pc = pcOf(parts[parts.length - 1]); if (pc) sh.pc = pc; out.push(sh);
         }
         flush();
-        return { out, bg, bgPc, skipped, pal };
+        return { out, bg, bgPc };
     }
     const importMsg = document.getElementById('importMsg');
+    // a snippet goes into the current screen; a sketch with screen functions replaces (or adds) whole screens
     function doImport(replace) {
-        const { out, bg, bgPc, skipped, pal } = parseCode(document.getElementById('importText').value), np = Object.keys(pal).length;
-        if (!out.length && bg == null && !np) { importMsg.textContent = 'Не нашёл вызовов canvas.* — проверь, что строки заканчиваются на «;».'; return; }
+        const r = parseCode(document.getElementById('importText').value), np = Object.keys(r.pal).length, n = r.screens.reduce((t, sc) => t + sc.out.length, 0);
+        if (!n && r.screens.every(sc => sc.bg == null) && !np) { importMsg.textContent = 'Не нашёл вызовов canvas.* — проверь, что строки заканчиваются на «;».' + (r.imgSkipped ? ' Картинки (drawBitmap / drawRGBBitmap) не импортируются.' : ''); return; }
         push();
-        for (const [n, c] of Object.entries(pal)) { const p = palEntry(n); if (p) p.c = c; else S.palette.push({ n, c }); }
-        if (replace) { S.shapes = out; S.groups = []; } else S.shapes.push(...out);
-        if (bg != null) { S.bg = bg; S.bgPc = bgPc; }
-        S.sel = []; ensureNames(); normalize();
-        importMsg.textContent = `Загружено фигур: ${out.length}${np ? `, цветов палитры: ${np}` : ''}${skipped ? `, пропущено: ${skipped} (не разобрал аргументы)` : ''}.`; update();
+        for (const [k, c] of Object.entries(r.pal)) { const p = palEntry(k); if (p) p.c = c; else S.palette.push({ n: k, c }); }
+        S.sel = [];
+        if (r.multi) {
+            const taken = replace ? [] : S.screens.map(sc => sc.name);
+            const made = r.screens.map(sc => { const scr = blankScreen(uniqueName(sc.name || 'Экран', taken)); taken.push(scr.name); scr.shapes = sc.out; if (sc.bg != null) { scr.bg = sc.bg; scr.bgPc = sc.bgPc; } return scr; });
+            if (replace) { S.screens = made; S.cur = 0; } else { S.screens.push(...made); S.cur = S.screens.length - made.length; }
+        } else {
+            const sc = r.screens[0];
+            if (replace) { S.shapes = sc.out; S.groups = []; } else S.shapes.push(...sc.out);
+            if (sc.bg != null) { S.bg = sc.bg; S.bgPc = sc.bgPc; }
+        }
+        S.screens.forEach((_, k) => withScreen(k, () => { ensureNames(); normalize(); }));
+        importMsg.textContent = `Загружено фигур: ${n}${r.multi ? `, экранов: ${r.screens.length}` : ''}${np ? `, цветов палитры: ${np}` : ''}${r.skipped ? `, пропущено: ${r.skipped} (не разобрал аргументы)` : ''}${r.imgSkipped ? `. Картинки не импортируются — пропущено вызовов: ${r.imgSkipped}` : ''}.`;
+        syncSettings(); update();
     }
+    const uniqueName = (base, taken) => { let n = base, k = 2; while (taken.includes(n)) n = base + ' ' + k++; return n; };
     document.getElementById('importBtn').onclick = () => doImport(true);
     document.getElementById('appendBtn').onclick = () => doImport(false);
     const clearBtn = document.getElementById('clearBtn'); let clearArm = 0;
@@ -1130,6 +1458,96 @@
         if (Date.now() - clearArm < 3000) { push(); S.shapes = []; S.groups = []; S.sel = []; clearBtn.textContent = 'Очистить холст'; clearArm = 0; update(); return; }
         clearArm = Date.now(); clearBtn.textContent = 'Точно очистить?'; setTimeout(() => { if (clearArm && Date.now() - clearArm >= 2900) { clearBtn.textContent = 'Очистить холст'; clearArm = 0; } }, 3000);
     };
+
+    // ---------- screens ----------
+    const tabsEl = document.getElementById('tabs'); let tabsHtml = '';
+    function renderTabs() {
+        if (tabsEl.querySelector('input')) return; // rename in progress
+        const html = S.screens.map((s, k) => `<button class="tab" data-k="${k}" aria-pressed="${k === S.cur}" title="Двойной клик — переименовать">${esc(s.name)}</button>`).join('')
+            + '<button class="tab-b" data-a="add" title="Новый экран" aria-label="Новый экран">+</button><button class="tab-b" data-a="dup" title="Дублировать экран" aria-label="Дублировать экран">⧉</button>'
+            + `<button class="tab-b" data-a="del" title="Удалить экран" aria-label="Удалить экран"${S.screens.length < 2 ? ' disabled' : ''}>×</button>`;
+        if (html !== tabsHtml) tabsEl.innerHTML = tabsHtml = html;
+    }
+    function switchScreen(k) { S.cur = k; S.sel = []; triPts = null; preview = null; update(); }
+    tabsEl.addEventListener('click', e => {
+        const t = e.target.closest('[data-k]'), b = e.target.closest('[data-a]');
+        if (t) { if (+t.dataset.k !== S.cur) switchScreen(+t.dataset.k); return; }
+        if (!b || b.disabled) return; const a = b.dataset.a, names = S.screens.map(sc => sc.name);
+        push();
+        if (a === 'add') { const sc = blankScreen(uniqueName('Экран ' + (S.screens.length + 1), names)); sc.bg = S.bg; sc.bgPc = S.bgPc; S.screens.splice(S.cur + 1, 0, sc); S.cur++; }
+        if (a === 'dup') {
+            const sc = JSON.parse(JSON.stringify(S.screens[S.cur])); sc.name = uniqueName(sc.name + ' копия', names);
+            const ids = new Set(S.screens.flatMap(x => x.shapes.map(s => s.var)).filter(Boolean));
+            for (const s of sc.shapes) if (s.var) s.var = uniqueVar(s.var, ids); // a changing text needs its own function
+            S.screens.splice(S.cur + 1, 0, sc); S.cur++;
+        }
+        if (a === 'del') { S.screens.splice(S.cur, 1); S.cur = Math.min(S.cur, S.screens.length - 1); }
+        switchScreen(S.cur);
+    });
+    tabsEl.addEventListener('dblclick', e => {
+        const t = e.target.closest('[data-k]'); if (!t) return; const sc = S.screens[+t.dataset.k];
+        const inp = document.createElement('input'); inp.type = 'text'; inp.className = 'tab-in'; inp.value = sc.name; inp.setAttribute('aria-label', 'Имя экрана');
+        t.replaceWith(inp); inp.focus(); inp.select();
+        let done = false;
+        const fin = ok => {
+            if (done) return; done = true; const v = inp.value.trim();
+            if (ok && v && v !== sc.name) { push(); sc.name = uniqueName(v, S.screens.filter(x => x !== sc).map(x => x.name)); }
+            inp.remove(); tabsHtml = ''; update();
+        };
+        inp.addEventListener('keydown', ev => { ev.stopPropagation(); if (ev.key === 'Enter') fin(true); if (ev.key === 'Escape') fin(false); });
+        inp.addEventListener('blur', () => fin(true));
+    });
+    function uniqueVar(base, ids) { let n = base, k = 2; while (ids.has(n)) n = base + k++; ids.add(n); return n; }
+
+    // ---------- adding pictures: file button / I, drag and drop onto the stage, paste ----------
+    const fileIn = document.getElementById('imgFile'), stageMsg = document.getElementById('stageMsg');
+    let flashT = 0, saveBad = false;
+    function flash(t) { stageMsg.textContent = t; clearTimeout(flashT); flashT = setTimeout(() => { stageMsg.textContent = saveBad ? SAVE_ERR : ''; }, 4000); }
+    const SAVE_ERR = 'Не удалось сохранить в localStorage: не хватает места (скорее всего, из-за картинок). Изменения пропадут после перезагрузки.';
+    function saveFailed(bad) { if (bad === saveBad) return; saveBad = bad; const el = document.getElementById('stageMsg'); if (el) el.textContent = bad ? SAVE_ERR : ''; }
+    function addImageFile(file, at) {
+        if (!file || !/^image\/(png|jpeg|svg\+xml|gif|webp)$/.test(file.type)) { flash('Нужна картинка PNG, JPG или SVG.'); return; }
+        const rd = new FileReader(); rd.onload = () => addImageUrl(rd.result, file.name, at); rd.readAsDataURL(file);
+    }
+    function addImageUrl(url, fname, at) {
+        const img = new Image();
+        img.onload = () => {
+            let nw = img.naturalWidth || 64, nh = img.naturalHeight || 64;
+            // big rasters are kept downscaled so that localStorage holds them
+            if (!url.startsWith('data:image/svg') && Math.max(nw, nh) > 1024) {
+                const k = 1024 / Math.max(nw, nh), c = document.createElement('canvas'); c.width = Math.round(nw * k); c.height = Math.round(nh * k);
+                c.getContext('2d').drawImage(img, 0, 0, c.width, c.height); url = c.toDataURL('image/png'); nw = c.width; nh = c.height;
+            }
+            const k = Math.min(1, S.W / nw, S.H / nh), w = Math.max(1, Math.round(nw * k)), h = Math.max(1, Math.round(nh * k));
+            const id = 'a' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7); S.assets[id] = url; assetsVer++;
+            const x = at ? at.x - (w >> 1) : Math.round((S.W - w) / 2), y = at ? at.y - (h >> 1) : Math.round((S.H - h) / 2);
+            push(); const s = { t: 'img', x, y, w, h, src: id, nw, nh, mode: 'color', scale: 'avg', thr: 128, inv: false, c: S.color }; addShape(s);
+            const base = (fname || '').replace(/\.[^.]*$/, '').trim(); if (base) s.name = base;
+            S.tool = 'select'; update();
+        };
+        img.onerror = () => flash('Не удалось прочитать картинку.');
+        img.src = url;
+    }
+    fileIn.addEventListener('change', () => { if (fileIn.files[0]) addImageFile(fileIn.files[0]); fileIn.value = ''; });
+    document.getElementById('imgBtn').addEventListener('click', () => fileIn.click());
+    stage.addEventListener('dragover', e => { if ([...e.dataTransfer.types].includes('Files')) { e.preventDefault(); stage.classList.add('drop'); } });
+    stage.addEventListener('dragleave', e => { if (!stage.contains(e.relatedTarget)) stage.classList.remove('drop'); });
+    stage.addEventListener('drop', e => {
+        stage.classList.remove('drop'); const f = [...e.dataTransfer.files][0]; if (!f) return; e.preventDefault();
+        const r = view.getBoundingClientRect(), inside = e.clientX >= r.left && e.clientX < r.right && e.clientY >= r.top && e.clientY < r.bottom;
+        addImageFile(f, inside ? { x: Math.floor((e.clientX - r.left) / scale), y: Math.floor((e.clientY - r.top) / scale) } : null);
+    });
+    // Ctrl/⌘+V pastes the internal clipboard at once; if the same keystroke brings an image from the system clipboard, that paste is taken back and the image wins
+    let justPasted = false, sysCopy = false, clipText = '';
+    document.addEventListener('paste', e => {
+        if (e.target.matches && e.target.matches('input,textarea')) return;
+        const f = [...(e.clipboardData ? e.clipboardData.files : [])].find(f => f.type.startsWith('image/'));
+        if (!f) return; e.preventDefault();
+        if (justPasted) { justPasted = false; undo(); future.pop(); }
+        addImageFile(f);
+    });
+    // after an internal copy the system clipboard gets the code of the copied shapes (and an old image there no longer wins on paste)
+    for (const ev of ['copy', 'cut']) document.addEventListener(ev, e => { if (!sysCopy || !e.clipboardData) return; e.preventDefault(); e.clipboardData.setData('text/plain', clipText); });
 
     // status & keyboard
     const statusEl = document.getElementById('status'), hintEl = document.getElementById('hint');
@@ -1146,14 +1564,15 @@
         if (mod && e.code === 'KeyD') { e.preventDefault(); dupSel(); return; }
         if (mod && e.code === 'KeyG') { e.preventDefault(); act(e.shiftKey ? 'ungroup' : 'group'); return; }
         if (mod && e.code === 'KeyA' && !e.target.closest('#code')) { e.preventDefault(); setSel(S.shapes.map((_, i) => i).filter(i => !hiddenAt(i) && !lockedAt(i))); S.tool = 'select'; update(); return; }
-        // leave native copy alone while text is selected on the page
+        // leave native copy alone while text is selected on the page; no preventDefault, so the copy/paste events still come
         const textSel = !getSelection().isCollapsed;
-        if (mod && !e.altKey && !textSel && (e.code === 'KeyC' || e.code === 'KeyX') && copySel(e.code === 'KeyX')) { e.preventDefault(); return; }
-        if (mod && !e.altKey && e.code === 'KeyV' && paste()) { e.preventDefault(); return; }
+        if (mod && !e.altKey && !textSel && (e.code === 'KeyC' || e.code === 'KeyX') && copySel(e.code === 'KeyX')) { sysCopy = true; setTimeout(() => { sysCopy = false; }, 0); return; }
+        if (mod && !e.altKey && e.code === 'KeyV') { if (paste()) { justPasted = true; setTimeout(() => { justPasted = false; }, 0); } return; }
         if (mod) return;
         const map = { v: 'select', r: 'rect', o: 'rrect', c: 'circle', l: 'line', y: 'tri', p: 'pixel', t: 'text' };
         if (map[k.toLowerCase()]) { setTool(map[k.toLowerCase()]); return; }
         if (k.toLowerCase() === 'f') { toggleFill(); return; }
+        if (e.code === 'KeyI') { fileIn.click(); return; }
         if (k === 'Escape') { triPts = null; preview = null; S.sel = []; update(); return; }
         if ((k === 'Delete' || k === 'Backspace') && S.sel.length) { e.preventDefault(); act('del'); return; }
         const arrows = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
@@ -1163,7 +1582,7 @@
     // ---------- update ----------
     function update(fast) {
         syncPalette();
-        render(); status(); renderCode(); renderLayers(); renderPalette(); renderBgPc();
+        render(); status(); renderCode(); renderLayers(); renderPalette(); renderBgPc(); renderTabs();
         if (!fast || !insBody.contains(document.activeElement)) renderInspector();
         else { const s = one(); if (s) insBody.querySelectorAll('input[data-k]').forEach(inp => { if (inp !== document.activeElement) inp.value = s[inp.dataset.k]; }); }
         rail.querySelectorAll('[data-tool]').forEach(b => b.setAttribute('aria-pressed', b.dataset.tool === S.tool));
@@ -1179,5 +1598,6 @@
         save();
     }
     window.addEventListener('resize', () => render());
-    ensureNames(); normalize(); syncSettings(); update();
+    S.screens.forEach((_, k) => withScreen(k, () => { ensureNames(); normalize(); }));
+    syncSettings(); update();
 })();

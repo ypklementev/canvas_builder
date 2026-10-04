@@ -782,6 +782,83 @@ details summary {
     color: var(--fg)
 }
 
+/* screens */
+.tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    align-items: center;
+    justify-content: center;
+    max-width: 100%
+}
+
+.tab {
+    border: 1px solid var(--line);
+    background: var(--panel);
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-size: 12px;
+    cursor: pointer;
+    max-width: 16ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap
+}
+
+.tab[aria-pressed=true] {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+    color: var(--accent);
+    font-weight: 600
+}
+
+.tab-b {
+    border: 1px solid transparent;
+    background: none;
+    border-radius: 6px;
+    width: 28px;
+    height: 26px;
+    cursor: pointer;
+    color: var(--muted);
+    font-size: 14px
+}
+
+.tab-b:hover:not(:disabled) {
+    border-color: var(--line);
+    color: var(--fg)
+}
+
+.tab-b:disabled {
+    opacity: .35;
+    cursor: default
+}
+
+.tab-in {
+    width: 16ch;
+    font-size: 12px;
+    padding: 4px 8px;
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    background: var(--panel)
+}
+
+.stage.drop .bezel {
+    outline: 3px dashed var(--accent);
+    outline-offset: 6px
+}
+
+#stageMsg:empty {
+    display: none
+}
+
+.code-opts {
+    gap: 14px
+}
+
+.code div.fold {
+    font-style: italic
+}
+
 @media (max-width:980px) {
 
     html,
