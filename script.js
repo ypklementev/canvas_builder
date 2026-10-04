@@ -571,8 +571,12 @@
     // ---------- view ----------
     const view = document.getElementById('view'), vx = view.getContext('2d'), stage = document.getElementById('stage'), emptyHint = document.getElementById('emptyHint');
     let scale = 2, preview = null, hover = null, triPts = null;
+    // integer scales keep pixels square; the view canvas has to stay within what the browser can allocate
+    const ZOOMS = [1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32];
+    const maxScale = () => Math.max(1, Math.floor(8192 / (Math.max(S.W, S.H) * (window.devicePixelRatio || 1))));
+    const zooms = () => ZOOMS.filter(z => z <= maxScale());
     function calcScale() {
-        if (S.zoom !== 'auto') return +S.zoom;
+        if (S.zoom !== 'auto') return Math.max(1, Math.min(+S.zoom, maxScale()));
         const narrow = matchMedia('(max-width:980px)').matches;
         const aw = stage.clientWidth - 32 - 28, ah = (narrow ? window.innerHeight * 0.72 : stage.clientHeight - 40) - 44 - 80;
         return Math.max(1, Math.min(8, Math.floor(Math.min(aw / S.W, ah / S.H))));
@@ -920,6 +924,8 @@
     const inW = document.getElementById('inW'), inH = document.getElementById('inH'), inZoom = document.getElementById('inZoom'), inGrid = document.getElementById('inGrid'), inPreset = document.getElementById('inPreset');
     inPreset.innerHTML = '<option value="">свой</option>' + PRESETS.map(([w, h, n], k) => `<option value="${k}">${w}×${h}${n ? ' · ' + n : ''}</option>`).join('');
     function syncSettings() {
+        const zs = zooms(); if (S.zoom !== 'auto' && !zs.includes(+S.zoom)) S.zoom = String(zs.filter(z => z <= +S.zoom).pop() || 1);
+        inZoom.innerHTML = '<option value="auto">авто</option>' + zs.map(z => `<option>${z}</option>`).join('');
         inW.value = S.W; inH.value = S.H; inZoom.value = S.zoom; inGrid.checked = S.grid;
         const k = PRESETS.findIndex(([w, h]) => Math.min(S.W, S.H) === Math.min(w, h) && Math.max(S.W, S.H) === Math.max(w, h)); inPreset.value = k < 0 ? '' : k;
     }
@@ -928,6 +934,21 @@
     inPreset.addEventListener('change', () => { if (inPreset.value === '') return; const [w, h] = PRESETS[+inPreset.value], land = S.W > S.H; push(); S.W = land ? h : w; S.H = land ? w : h; syncSettings(); update(); });
     document.getElementById('rotBtn').addEventListener('click', () => { push(); [S.W, S.H] = [S.H, S.W]; syncSettings(); update(); });
     inZoom.addEventListener('change', () => { S.zoom = inZoom.value; update(); });
+    // ⌘/Ctrl + wheel (and trackpad pinch, which comes as ctrl+wheel) zooms around the cursor; a plain wheel scrolls
+    let wheelAcc = 0;
+    stage.addEventListener('wheel', e => {
+        if (!(e.ctrlKey || e.metaKey)) return;
+        e.preventDefault();
+        wheelAcc += e.deltaY * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1);
+        if (Math.abs(wheelAcc) < 40) return; // one mouse notch ≈ 100, a pinch gives many small steps
+        const dir = wheelAcc < 0 ? 1 : -1; wheelAcc = 0;
+        const zs = zooms(), cur = scale, next = dir > 0 ? zs.find(z => z > cur) : [...zs].reverse().find(z => z < cur);
+        if (!next) return;
+        const r = view.getBoundingClientRect(), fx = (e.clientX - r.left) / cur, fy = (e.clientY - r.top) / cur;
+        S.zoom = String(next); inZoom.value = S.zoom; update();
+        const r2 = view.getBoundingClientRect(); // keep the canvas point under the cursor where it was
+        stage.scrollLeft += r2.left + fx * scale - e.clientX; stage.scrollTop += r2.top + fy * scale - e.clientY;
+    }, { passive: false });
     inGrid.addEventListener('change', () => { S.grid = inGrid.checked; update(); });
 
     // inspector
@@ -1665,12 +1686,13 @@
     function download(name, text) { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' })); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); }
 
     // ---------- live preview on the board (Web Serial) ----------
-    // frame, little-endian: "LCD2" | W u16 | H u16 | flags u8 (bit 0 = RLE) | seq u8 | len u32 | payload[len] | Fletcher-16(payload) u16
-    // payload: RGB565 words in canvas.getBuffer() order; RLE: byte n, bit 7 set → the next word (n & 127) + 1 times, else n + 1 words as they are
+    // frame, little-endian: "LCD3" | W u16 | H u16 | flags u8 (bit 0 = RLE) | seq u8 | y0 u16 | rows u16 | len u32 | payload[len] | Fletcher-16(payload) u16
+    // payload: rows y0 … y0 + rows - 1 as RGB565 words in canvas.getBuffer() order; RLE: byte n, bit 7 set → the next word (n & 127) + 1 times, else n + 1 words as they are
+    // only the band of rows that differs from the last frame the board confirmed is sent; nothing changed → nothing is sent; after an error, a reconnect or a new size → the whole screen
     // the payload goes in CHUNK-byte pieces: after each full piece the board says "N <seq>" and only then gets the next one,
     // because USB CDC on the ESP32-S3 drops bytes when its receive buffer overflows; the frame ends with "OK <seq>" or "ERR <seq> <reason>"
     // while a frame is on its way only the newest state waits; no answer for REPLY_MS → the board has reset its parser (after 500 ms of silence), start over
-    const LIVE = { port: null, writer: null, reader: null, busy: false, dirty: false, seq: 0, last: 0, done: [], timer: 0, wait: null, errs: 0, err: '', note: '', noReply: false };
+    const LIVE = { port: null, writer: null, reader: null, busy: false, dirty: false, seq: 0, last: 0, done: [], timer: 0, wait: null, errs: 0, err: '', note: '', noReply: false, prev: null, rows: 0 };
     const CHUNK = 4096, REPLY_MS = 1000;
     const FPS = 18;
     function frame565() {
@@ -1690,12 +1712,25 @@
         return out.subarray(0, o);
     }
     function fletcher16(b) { let s1 = 0, s2 = 0; for (let i = 0; i < b.length; i++) { s1 = (s1 + b[i]) % 255; s2 = (s2 + s1) % 255; } return (s2 << 8) | s1; }
+    const HDR = 18;
+    // → { bytes, px, rows } or null when the board already shows exactly this
     function buildFrame(seq) {
-        const px = frame565(), raw = new Uint8Array(px.buffer), packed = rle(px), useRle = packed.length < raw.length, data = useRle ? packed : raw;
-        const f = new Uint8Array(14 + data.length + 2), dv = new DataView(f.buffer);
-        f.set([76, 67, 68, 50]); dv.setUint16(4, S.W, true); dv.setUint16(6, S.H, true); f[8] = useRle ? 1 : 0; f[9] = seq; dv.setUint32(10, data.length, true);
-        f.set(data, 14); dv.setUint16(14 + data.length, fletcher16(data), true);
-        return f;
+        const W = S.W, H = S.H, px = frame565(), prev = LIVE.prev;
+        let y0 = 0, y1 = H;
+        if (prev && prev.w === W && prev.h === H) {
+            let a = 0, b = px.length - 1; const p = prev.px;
+            while (a < px.length && px[a] === p[a]) a++;
+            if (a === px.length) return null;
+            while (px[b] === p[b]) b--;
+            y0 = Math.floor(a / W); y1 = Math.floor(b / W) + 1;
+        }
+        const band = px.subarray(y0 * W, y1 * W), raw = new Uint8Array(band.buffer, band.byteOffset, band.byteLength), packed = rle(band);
+        const useRle = packed.length < raw.length, data = useRle ? packed : raw;
+        const f = new Uint8Array(HDR + data.length + 2), dv = new DataView(f.buffer);
+        f.set([76, 67, 68, 51]); dv.setUint16(4, W, true); dv.setUint16(6, H, true); f[8] = useRle ? 1 : 0; f[9] = seq;
+        dv.setUint16(10, y0, true); dv.setUint16(12, y1 - y0, true); dv.setUint32(14, data.length, true);
+        f.set(data, HDR); dv.setUint16(HDR + data.length, fletcher16(data), true);
+        return { bytes: f, px, w: W, h: H, rows: y1 - y0 };
     }
     // the board's next line for this frame: 'N', 'OK', 'ERR' or 'timeout'
     function reply(seq) {
@@ -1709,14 +1744,14 @@
         if (m[1] === 'ERR') LIVE.err = m[3];
         LIVE.wait.res(m[1]);
     }
-    async function sendFrame(seq) {
-        const f = buildFrame(seq), len = f.length - 16, cuts = [0];
-        for (let k = CHUNK; k < len; k += CHUNK) cuts.push(14 + k);
+    async function sendFrame(fr, seq) {
+        const f = fr.bytes, len = f.length - HDR - 2, cuts = [0];
+        for (let k = CHUNK; k < len; k += CHUNK) cuts.push(HDR + k);
         cuts.push(f.length);
         for (let k = 0; k < cuts.length - 1; k++) {
             const r = reply(seq); // armed before writing, so a fast answer isn't missed
             await LIVE.writer.write(f.subarray(cuts[k], cuts[k + 1]));
-            const v = await r; if (v !== (k < cuts.length - 2 ? 'N' : 'OK')) return v === 'N' ? 'ERR' : v;
+            const v = await r; if (v !== (k < cuts.length - 2 ? 'N' : 'OK')) return v === 'N' || v === 'OK' ? 'ERR' : v; // an answer out of turn means the board lost track
         }
         return 'OK';
     }
@@ -1724,13 +1759,14 @@
         if (!LIVE.writer || LIVE.busy || !LIVE.dirty) return;
         const wait = LIVE.last + 1000 / FPS - performance.now();
         if (wait > 0) { clearTimeout(LIVE.timer); LIVE.timer = setTimeout(pump, wait); return; }
-        const port = LIVE.port; LIVE.dirty = false; LIVE.busy = true; LIVE.last = performance.now(); LIVE.seq = (LIVE.seq + 1) & 255;
-        let r; try { r = await sendFrame(LIVE.seq); } catch (e) { r = 'closed'; }
+        LIVE.dirty = false;
+        const seq = (LIVE.seq + 1) & 255, fr = buildFrame(seq); if (!fr) return; // the board already shows this
+        const port = LIVE.port; LIVE.busy = true; LIVE.last = performance.now(); LIVE.seq = seq;
+        let r; try { r = await sendFrame(fr, seq); } catch (e) { r = 'closed'; }
         if (LIVE.port !== port) return; if (r === 'closed') return lost();
         LIVE.busy = false;
-        if (r === 'OK') { LIVE.done.push(performance.now()); LIVE.noReply = false; }
-        else if (r === 'timeout') { LIVE.noReply = true; LIVE.dirty = true; }
-        else { LIVE.errs++; LIVE.noReply = false; LIVE.dirty = true; } // a broken frame is sent again
+        if (r === 'OK') { LIVE.done.push(performance.now()); LIVE.noReply = false; LIVE.prev = fr; LIVE.rows = fr.rows; }
+        else { LIVE.prev = null; LIVE.dirty = true; if (r === 'timeout') LIVE.noReply = true; else { LIVE.errs++; LIVE.noReply = false; } } // the board's state is unknown: resend the whole screen
         renderLive(); pump();
     }
     async function readLoop(port) {
@@ -1751,7 +1787,7 @@
         try { port = await navigator.serial.requestPort(); } catch (e) { return; } // the chooser was closed
         try { await port.open({ baudRate: 921600 }); }
         catch (e) { LIVE.note = 'Порт не открылся: ' + e.message + ' Возможно, он занят Arduino IDE или монитором порта.'; renderLive(); return; }
-        Object.assign(LIVE, { port, writer: port.writable.getWriter(), busy: false, dirty: true, done: [], errs: 0, err: '', note: '', noReply: false });
+        Object.assign(LIVE, { port, writer: port.writable.getWriter(), busy: false, dirty: true, done: [], errs: 0, err: '', note: '', noReply: false, prev: null, rows: 0 });
         readLoop(port); renderLive(); pump();
     }
     async function disconnect(note) {
@@ -1772,8 +1808,8 @@
         liveBtn.textContent = on ? 'Отключить' : 'Подключить плату'; liveBtn.classList.toggle('primary', !on);
         liveDot.dataset.s = !on ? 'off' : LIVE.noReply ? 'warn' : 'on'; liveWarn.hidden = !on;
         liveStatus.textContent = !on ? (LIVE.note || 'не подключена')
-            : LIVE.noReply ? 'плата не отвечает — залит ли свежий скетч-приёмник (протокол LCD2)?'
-                : `подключена · ${LIVE.done.length} кадр/с · ${S.W}×${S.H}${LIVE.errs ? ` · ошибок: ${LIVE.errs} (${LIVE.err})` : ''}`;
+            : LIVE.noReply ? 'плата не отвечает — залит ли свежий скетч-приёмник (протокол LCD3)?'
+                : `подключена · ${LIVE.done.length} кадр/с · ${S.W}×${S.H}${LIVE.rows && LIVE.rows < S.H ? ` · последний кадр: ${LIVE.rows} строк` : ''}${LIVE.errs ? ` · ошибок: ${LIVE.errs} (${LIVE.err})` : ''}`;
     }
     setInterval(() => { if (LIVE.port) renderLive(); }, 500);
     function receiverSketch() {
@@ -1782,8 +1818,10 @@
 // Плата: Waveshare ESP32-S3-LCD-1.47B. В Arduino IDE: Tools → USB CDC On Boot → Enabled.
 //
 // Кадр (всё little-endian):
-//   "LCD2" | W u16 | H u16 | flags u8 (бит 0 — RLE) | seq u8 | len u32 | payload[len] | Fletcher-16(payload) u16
-// payload — слова RGB565 в порядке canvas.getBuffer(). RLE: байт n; если бит 7 = 1 —
+//   "LCD3" | W u16 | H u16 | flags u8 (бит 0 — RLE) | seq u8 | y0 u16 | rows u16 | len u32 | payload[len] | Fletcher-16(payload) u16
+// payload — строки y0 … y0 + rows - 1 словами RGB565 в порядке canvas.getBuffer(): редактор шлёт только
+// полосу строк, изменившихся с прошлого принятого кадра (после ошибки или смены размера — весь экран).
+// RLE: байт n; если бит 7 = 1 —
 // следующее слово повторить (n & 127) + 1 раз, иначе дальше идут n + 1 слов как есть.
 // Payload идёт кусками по CHUNK байт: после каждого полного куска плата пишет "N <seq>",
 // и только тогда редактор шлёт следующий (USB CDC теряет байты, если буфер приёма переполнен).
@@ -1802,8 +1840,8 @@ uint16_t cw = 0, ch = 0;
 
 enum State : uint8_t { WAIT_MAGIC, HEADER, PAYLOAD, CHECKSUM };
 State state = WAIT_MAGIC;
-uint8_t hdr[10], sum[2], got = 0;
-uint16_t fw, fh;
+uint8_t hdr[14], sum[2], got = 0;
+uint16_t fw, fh, top, nrows;   // полоса строк кадра (имя y0 занято функцией из math.h)
 uint8_t flags, seq;
 uint32_t len, done;
 uint16_t s1, s2;               // Fletcher-16
@@ -1826,10 +1864,13 @@ bool resize(uint16_t w, uint16_t h) {
 
 void startFrame() {
   fw = hdr[0] | hdr[1] << 8; fh = hdr[2] | hdr[3] << 8; flags = hdr[4]; seq = hdr[5];
-  len = hdr[6] | hdr[7] << 8 | (uint32_t)hdr[8] << 16 | (uint32_t)hdr[9] << 24;
+  top = hdr[6] | hdr[7] << 8; nrows = hdr[8] | hdr[9] << 8;
+  len = hdr[10] | hdr[11] << 8 | (uint32_t)hdr[12] << 16 | (uint32_t)hdr[13] << 24;
   done = 0; s1 = s2 = 0; pos = 0; left = 0; haveLo = false; bad = false; why = "";
-  if (resize(fw, fh)) { px = canvas->getBuffer(); total = (uint32_t)cw * ch; }
+  bool fresh = !canvas || fw != cw || fh != ch;
+  if (resize(fw, fh) && nrows && top + nrows <= ch) { px = canvas->getBuffer() + (uint32_t)top * cw; total = (uint32_t)cw * nrows; }
   else { px = nullptr; total = 0; bad = true; why = "size"; }
+  if (!bad && fresh && nrows != ch) { bad = true; why = "resync"; }   // новый холст: нужен полный кадр
   if (!bad && !(flags & 1) && len != total * 2) { bad = true; why = "length"; }
 }
 
@@ -1853,13 +1894,13 @@ void payloadByte(uint8_t b) {
 void endFrame() {
   if (!bad && (uint16_t)(sum[0] | sum[1] << 8) != (uint16_t)(s2 << 8 | s1)) { bad = true; why = "checksum"; }
   if (!bad && pos != total) { bad = true; why = "short"; }
-  if (!bad) lcd->drawImage(0, 0, cw, ch, canvas->getBuffer());
+  if (!bad) lcd->drawImage(0, top, cw, nrows, canvas->getBuffer() + (uint32_t)top * cw);   // выводим только пришедшую полосу
   if (bad) Serial.printf("ERR %u %s\\n", seq, why);
   else Serial.printf("OK %u\\n", seq);
 }
 
 void feed(uint8_t b) {
-  static const uint8_t magic[4] = { 'L', 'C', 'D', '2' };
+  static const uint8_t magic[4] = { 'L', 'C', 'D', '3' };
   switch (state) {
     case WAIT_MAGIC:
       if (b == magic[got]) { if (++got == 4) { state = HEADER; got = 0; } }
@@ -1867,7 +1908,7 @@ void feed(uint8_t b) {
       break;
     case HEADER:
       hdr[got++] = b;
-      if (got == 10) { startFrame(); got = 0; state = len ? PAYLOAD : CHECKSUM; }
+      if (got == sizeof(hdr)) { startFrame(); got = 0; state = len ? PAYLOAD : CHECKSUM; }
       break;
     case PAYLOAD:
       payloadByte(b);
@@ -1961,7 +2002,7 @@ void loop() {
         hintEl.textContent = HINTS[S.tool];
         save();
     }
-    window.addEventListener('resize', () => render());
+    window.addEventListener('resize', () => { syncSettings(); render(); });
     S.screens.forEach((_, k) => withScreen(k, () => { ensureNames(); normalize(); }));
     syncSettings(); update();
 })();

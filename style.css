@@ -245,7 +245,7 @@ textarea:focus-visible {
     overflow: auto;
     display: flex;
     flex-direction: column;
-    align-items: center;
+    align-items: safe center; /* a zoomed canvas wider than the stage stays scrollable from its left edge */
     justify-content: flex-start;
     padding: 20px 16px;
     gap: 10px
