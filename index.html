@@ -35,7 +35,10 @@
     <nav class="rail" id="rail" aria-label="Инструменты"></nav>
 
     <main class="stage" id="stage">
-      <div class="bezel"><canvas id="view"></canvas></div>
+      <div class="bezel">
+        <canvas id="view"></canvas>
+        <div class="empty-hint" id="emptyHint" hidden><span>Выбери инструмент слева или вставь код через „Загрузить из кода“</span></div>
+      </div>
       <div class="status" id="status"></div>
       <div class="hint" id="hint"></div>
     </main>
@@ -90,6 +93,7 @@
       </section>
     </aside>
   </div>
+  <script src="fonts.js"></script>
   <script src="script.js"></script>
 </body>
 
