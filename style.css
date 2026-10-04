@@ -928,6 +928,17 @@ dialog#rxDlg::backdrop {
     flex: 1
 }
 
+.paint {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 10px
+}
+
+.paint .stop {
+    gap: 6px
+}
+
 @media (max-width:980px) {
 
     html,

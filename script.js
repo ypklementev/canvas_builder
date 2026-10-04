@@ -60,8 +60,14 @@
 
     // ---------- Adafruit GFX rasterizer (same algorithms as the library) ----------
     const off = document.createElement('canvas'), offx = off.getContext('2d');
-    let img, u32, idb, curCol = 0, curId = -1;
-    function px(x, y) { if (x < 0 || y < 0 || x >= S.W || y >= S.H) return; const i = y * S.W + x; u32[i] = curCol; if (curId !== -3) idb[i] = curId; } // id -3: locked, keeps what is below clickable
+    let img, u32, idb, curCol = 0, cur565 = 0, curId = -1;
+    // a: coverage 0…16 (16 = solid); with a gradient (paint) the colour comes from the pixel position; id -3: locked, keeps what is below clickable
+    function px(x, y, a = 16) {
+        if (x < 0 || y < 0 || x >= S.W || y >= S.H || a <= 0) return; const i = y * S.W + x;
+        if (paint || a < 16) { let c = paint ? paintColor(x, y) : cur565; if (a < 16) c = blend565(from32(u32[i]), c, a); u32[i] = toU32(c); }
+        else u32[i] = curCol;
+        if (curId !== -3) idb[i] = curId;
+    }
     function hline(x, y, w) { if (w < 0) { w = -w; x -= w - 1; } for (let i = 0; i < w; i++)px(x + i, y); }
     function vline(x, y, h) { if (h < 0) { h = -h; y -= h - 1; } for (let i = 0; i < h; i++)px(x, y + i); }
     function line(x0, y0, x1, y1) {
@@ -138,7 +144,7 @@
     const CP = new Map(); { const dec = new TextDecoder('windows-1251'); for (let b = 0x20; b <= 0xFF; b++) { const ch = dec.decode(Uint8Array.of(b)); if (b !== 0x7F && !(ch >= '\x80' && ch <= '\x9F')) CP.set(ch, b); } }
     function registerFont(f) {
         let asc = 0, desc = 0; for (const g of f.g) if (g[1] && g[2]) { asc = Math.max(asc, -g[5]); desc = Math.max(desc, g[5] + g[2]); }
-        FONT_DATA[f.n] = { first: f.f, last: f.l, ya: f.y, bmp: b64(f.b), g: f.g, asc, desc, cp: true, custom: true };
+        FONT_DATA[f.n] = { first: f.f, last: f.l, ya: f.y, bmp: b64(f.b), g: f.g, asc, desc, cp: true, custom: true, ab: f.ab ? b64(f.ab) : null, ag: f.ag || null };
     }
     S.fonts.forEach(registerFont);
     const codeOf = (F, ch) => F.cp ? (CP.get(ch) ?? -1) : ch.charCodeAt(0);
@@ -227,16 +233,118 @@
     FONT_GROUPS.slice(2).forEach(g => g[1].sort((a, b) => a.replace(/\d+pt7b/, '').localeCompare(b.replace(/\d+pt7b/, '')) || ptOf(a) - ptOf(b)));
 
     function raster(s, id) {
-        curCol = toU32(s.c); curId = id;
+        curCol = toU32(s.c); cur565 = s.c; curId = id;
+        paint = gradOk(s) ? makePaint(s) : null; if (paint) [pbx, pby, pbw, pbh] = bbox(s);
+        const aa = aaOk(s);
         switch (s.t) {
-            case 'text': if (s.var) drawVarText(s); else for (const l of layoutText(s)) drawStr(s.font, s.size, l.t, l.cx, l.cy); break;
+            case 'text': if (s.var) drawVarText(s, aa); else for (const l of layoutText(s)) (aa ? drawStrAA : drawStr)(s.font, s.size, l.t, l.cx, l.cy); break;
             case 'img': drawImg(s); break;
             case 'rect': s.fill ? fillRect(s.x, s.y, s.w, s.h) : drawRect(s.x, s.y, s.w, s.h); break;
-            case 'rrect': s.fill ? fillRoundRect(s.x, s.y, s.w, s.h, s.r) : drawRoundRect(s.x, s.y, s.w, s.h, s.r); break;
-            case 'circle': s.fill ? fillCircle(s.x, s.y, s.r) : drawCircle(s.x, s.y, s.r); break;
-            case 'line': line(s.x0, s.y0, s.x1, s.y1); break;
-            case 'tri': if (s.fill) fillTriangle(s.x0, s.y0, s.x1, s.y1, s.x2, s.y2); else { line(s.x0, s.y0, s.x1, s.y1); line(s.x1, s.y1, s.x2, s.y2); line(s.x2, s.y2, s.x0, s.y0); } break;
+            case 'rrect': aa ? aaRoundRect(s.x, s.y, s.w, s.h, s.r, !s.fill) : s.fill ? fillRoundRect(s.x, s.y, s.w, s.h, s.r) : drawRoundRect(s.x, s.y, s.w, s.h, s.r); break;
+            case 'circle': aa ? aaCircle(s.x, s.y, s.r, !s.fill) : s.fill ? fillCircle(s.x, s.y, s.r) : drawCircle(s.x, s.y, s.r); break;
+            case 'line': (aa ? aaLine : line)(s.x0, s.y0, s.x1, s.y1); break;
+            case 'tri':
+                if (aa && s.fill) aaTriangle(s.x0, s.y0, s.x1, s.y1, s.x2, s.y2);
+                else if (s.fill) fillTriangle(s.x0, s.y0, s.x1, s.y1, s.x2, s.y2);
+                else { const L = aa ? aaLine : line; L(s.x0, s.y0, s.x1, s.y1); L(s.x1, s.y1, s.x2, s.y2); L(s.x2, s.y2, s.x0, s.y0); } break;
             case 'pixel': px(s.x, s.y); break;
+        }
+        paint = null;
+    }
+
+    // ---------- gradients and anti-aliasing: the same integer maths as the generated lcb… functions ----------
+    const GRAD_T = ['rect', 'rrect', 'circle', 'line', 'tri', 'text', 'img'], AA_T = ['rrect', 'circle', 'line', 'tri', 'text'];
+    const gradOk = s => !!s.grad && GRAD_T.includes(s.t) && (s.t !== 'img' || s.mode === 'icon') && s.grad.stops && s.grad.stops.length >= 2;
+    const aaFont = s => { const F = FONT_DATA[s.font]; return !!(F && F.ab); };
+    const aaOk = s => !!s.aa && AA_T.includes(s.t) && (s.t !== 'text' || aaFont(s));
+    const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+    let paint = null, pbx = 0, pby = 0, pbw = 0, pbh = 0; // the current gradient and the box it spans
+    const gradDir = a => [Math.round(Math.cos(a * Math.PI / 180) * 1024), Math.round(Math.sin(a * Math.PI / 180) * 1024)];
+    // stops sorted by position; positions 0…100 % → 0…4096
+    function makePaint(s) {
+        const g = s.grad, st = [...g.stops].sort((a, b) => a.p - b.p).slice(0, 4), [dx, dy] = g.type === 'radial' ? [0, 0] : gradDir(g.angle || 0);
+        return { type: g.type === 'radial' ? 2 : 1, dx, dy, n: st.length, c: st.map(x => x.c), pc: st.map(x => x.pc), p: st.map(x => Math.round(x.p * 4096 / 100)), dither: !!g.dither };
+    }
+    function isqrt(n) { let r = Math.floor(Math.sqrt(n)); while (r * r > n) r--; while ((r + 1) * (r + 1) <= n) r++; return r; }
+    // t (0…4096) along the gradient for the pixel centre: linear — projection on the direction across the box, radial — distance from the box centre / half of its larger side
+    function paintColor(x, y) {
+        const p = paint, X = 2 * x + 1 - (2 * pbx + pbw), Y = 2 * y + 1 - (2 * pby + pbh); let t;
+        if (p.type === 1) { const half = Math.abs(p.dx) * pbw + Math.abs(p.dy) * pbh; t = half ? Math.trunc((X * p.dx + Y * p.dy + half) * 4096 / (2 * half)) : 0; }
+        else { const R = Math.max(pbw, pbh); t = R ? Math.trunc(isqrt((X * X + Y * Y) * 256) * 4096 / (R * 16)) : 0; }
+        if (t < 0) t = 0; if (t > 4096) t = 4096;
+        let i = 0; while (i < p.n - 2 && t >= p.p[i + 1]) i++;
+        const f = t <= p.p[i] ? 0 : t >= p.p[i + 1] ? 256 : Math.trunc((t - p.p[i]) * 256 / (p.p[i + 1] - p.p[i]));
+        const d = p.dither ? BAYER[(y & 3) * 4 + (x & 3)] * 16 + 8 : 128, a = p.c[i], b = p.c[i + 1];
+        const ch = (sh, m) => Math.min(m, (((a >> sh) & m) * 256 + (((b >> sh) & m) - ((a >> sh) & m)) * f + d) >> 8);
+        return ch(11, 31) << 11 | ch(5, 63) << 5 | ch(0, 31);
+    }
+    const from32 = v => ((v & 0xF8) << 8) | ((v >> 5) & 0x7E0) | ((v >> 19) & 0x1F); // preview colours expand RGB565 losslessly
+    function blend565(b, f, a) { const ch = (sh, m) => { const bv = (b >> sh) & m, fv = (f >> sh) & m; return bv + Math.trunc((fv - bv) * a / 16); }; return ch(11, 31) << 11 | ch(5, 63) << 5 | ch(0, 31); }
+    // coverage: 4×4 samples per pixel in 1/8 px units at 8x+1, 8x+3, 8x+5, 8x+7; shapes are measured from pixel centres (8x+4)
+    function cover(x, y, inside) { let n = 0; for (let j = 1; j < 8; j += 2) for (let i = 1; i < 8; i += 2) if (inside(8 * x + i, 8 * y + j)) n++; return n; }
+    // filled: radius r + ½ around the centre pixel (as wide as fillCircle); ring: 1 px between r − ½ and r + ½
+    function aaCircle(cx, cy, r, ring) {
+        const C = 8 * cx + 4, D = 8 * cy + 4, ro = (8 * r + 4) ** 2, ri = ring && r > 0 ? (8 * r - 4) ** 2 : -1;
+        const inside = (sx, sy) => { const d = (sx - C) ** 2 + (sy - D) ** 2; return d <= ro && d >= ri; };
+        for (let y = cy - r - 1; y <= cy + r + 1; y++) for (let x = cx - r - 1; x <= cx + r + 1; x++) px(x, y, cover(x, y, inside));
+    }
+    function inRR(sx, sy, x, y, w, h, r) {
+        if (w <= 0 || h <= 0 || sx < 8 * x || sy < 8 * y || sx >= 8 * (x + w) || sy >= 8 * (y + h)) return false;
+        if (r <= 0) return true;
+        const l = 8 * (x + r) + 4, t = 8 * (y + r) + 4, rr = 8 * (x + w - r - 1) + 4, b = 8 * (y + h - r - 1) + 4;
+        const dx = sx - (sx < l ? l : sx > rr ? rr : sx), dy = sy - (sy < t ? t : sy > b ? b : sy);
+        return dx * dx + dy * dy <= (8 * r + 4) ** 2;
+    }
+    // ring: the shape minus the same shape 1 px inside (radius − 1)
+    function aaRoundRect(x, y, w, h, r, ring) {
+        r = clampR(w, h, r);
+        const inside = ring ? (sx, sy) => inRR(sx, sy, x, y, w, h, r) && !inRR(sx, sy, x + 1, y + 1, w - 2, h - 2, r - 1) : (sx, sy) => inRR(sx, sy, x, y, w, h, r);
+        for (let j = y; j < y + h; j++) for (let i = x; i < x + w; i++) px(i, j, cover(i, j, inside));
+    }
+    // 1 px wide capsule between the pixel centres of the ends
+    function aaLine(x0, y0, x1, y1) {
+        const ax = 8 * x0 + 4, ay = 8 * y0 + 4, bx = 8 * x1 + 4, by = 8 * y1 + 4, dx = bx - ax, dy = by - ay, L = dx * dx + dy * dy;
+        const inside = (sx, sy) => {
+            const vx = sx - ax, vy = sy - ay, t = vx * dx + vy * dy;
+            if (L === 0 || t <= 0) return vx * vx + vy * vy <= 16;
+            if (t >= L) return (sx - bx) ** 2 + (sy - by) ** 2 <= 16;
+            const v = vx * vx + vy * vy;
+            return v * L < 4e15 ? v * L - t * t <= 16 * L : BigInt(v) * BigInt(L) - BigInt(t) * BigInt(t) <= 16n * BigInt(L); // exact like int64 on the board
+        };
+        // along the longer axis; only ±2 px around the ideal line can be touched
+        if (Math.abs(x1 - x0) >= Math.abs(y1 - y0)) {
+            for (let x = Math.min(x0, x1) - 1; x <= Math.max(x0, x1) + 1; x++) {
+                const xc = Math.max(Math.min(x0, x1), Math.min(Math.max(x0, x1), x)), yc = x1 === x0 ? y0 : y0 + Math.trunc((xc - x0) * (y1 - y0) / (x1 - x0));
+                for (let y = yc - 2; y <= yc + 2; y++) px(x, y, cover(x, y, inside));
+            }
+        } else {
+            for (let y = Math.min(y0, y1) - 1; y <= Math.max(y0, y1) + 1; y++) {
+                const yc = Math.max(Math.min(y0, y1), Math.min(Math.max(y0, y1), y)), xc = x0 + Math.trunc((yc - y0) * (x1 - x0) / (y1 - y0));
+                for (let x = xc - 2; x <= xc + 2; x++) px(x, y, cover(x, y, inside));
+            }
+        }
+    }
+    // vertices at pixel centres; a flat triangle is drawn as its edges
+    function aaTriangle(x0, y0, x1, y1, x2, y2) {
+        const A = [8 * x0 + 4, 8 * y0 + 4], B = [8 * x1 + 4, 8 * y1 + 4], C = [8 * x2 + 4, 8 * y2 + 4];
+        const e = (p, q, sx, sy) => (q[0] - p[0]) * (sy - p[1]) - (q[1] - p[1]) * (sx - p[0]), area = e(A, B, C[0], C[1]);
+        if (!area) { aaLine(x0, y0, x1, y1); aaLine(x1, y1, x2, y2); return; }
+        const sg = area > 0 ? 1 : -1, inside = (sx, sy) => sg * e(A, B, sx, sy) >= 0 && sg * e(B, C, sx, sy) >= 0 && sg * e(C, A, sx, sy) >= 0;
+        for (let y = Math.min(y0, y1, y2); y <= Math.max(y0, y1, y2); y++) for (let x = Math.min(x0, x1, x2); x <= Math.max(x0, x1, x2); x++) px(x, y, cover(x, y, inside));
+    }
+    // smooth text: 4-bit alpha glyphs of a project font (a 0…15 → coverage (a·16 + 7) / 15)
+    function drawStrAA(font, size, str, cx, cy) {
+        const F = FONT_DATA[font]; let x = cx;
+        for (const ch of str) {
+            const code = codeOf(F, ch); if (code < F.first || code > F.last) continue;
+            const k = code - F.first, [off, w, h, xo, yo] = F.ag[k];
+            for (let yy = 0; yy < h; yy++) for (let xx = 0; xx < w; xx++) {
+                const n = yy * w + xx, byte = F.ab[off + (n >> 1)], a4 = n & 1 ? byte & 15 : byte >> 4; if (!a4) continue;
+                const a = Math.trunc((a4 * 16 + 7) / 15);
+                if (size === 1) px(x + xo + xx, cy + yo + yy, a);
+                else for (let j = 0; j < size; j++) for (let i = 0; i < size; i++) px(x + (xo + xx) * size + i, cy + (yo + yy) * size + j, a);
+            }
+            x += F.g[k][3] * size;
         }
     }
 
@@ -262,9 +370,9 @@
         const cy = s.valign === 'middle' ? s.y + Math.trunc((s.h - b.h) / 2) - b.y : s.valign === 'bottom' ? s.y + s.h - b.h - b.y : s.y - b.y;
         return { t, cx, cy };
     }
-    function drawVarText(s) {
-        const col = curCol; curCol = toU32(s.erase === 'color' ? s.ec : S.bg); fillRect(s.x, s.y, s.w, s.h); curCol = col;
-        const l = varLayout(s); drawStr(s.font, s.size, l.t, l.cx, l.cy);
+    function drawVarText(s, aa) {
+        const col = curCol, P = paint; paint = null; curCol = toU32(s.erase === 'color' ? s.ec : S.bg); fillRect(s.x, s.y, s.w, s.h); curCol = col; paint = P; // the erase is a plain fillRect
+        const l = varLayout(s); (aa ? drawStrAA : drawStr)(s.font, s.size, l.t, l.cx, l.cy);
     }
 
     // ---------- pictures ----------
@@ -332,7 +440,7 @@
             for (let i = 0; i < s.w; i++) {
                 if (s.mode === 'icon') { if (i & 7) b <<= 1; else b = d.bits[j * bw + (i >> 3)]; if (b & 0x80) px(s.x + i, s.y + j); continue; }
                 if (d.mask) { if (i & 7) b <<= 1; else b = d.mask[j * bw + (i >> 3)]; if (!(b & 0x80)) continue; }
-                curCol = toU32(d.px[j * s.w + i]); px(s.x + i, s.y + j);
+                cur565 = d.px[j * s.w + i]; curCol = toU32(cur565); px(s.x + i, s.y + j);
             }
         }
     }
@@ -405,7 +513,7 @@
     // colors that point at the palette follow it; a deleted entry leaves the last value as a literal
     function syncPalette() {
         const fix = (o, k, pk) => { if (!o[pk]) return; const p = palEntry(o[pk]); if (p) o[k] = p.c; else delete o[pk]; };
-        for (const sc of S.screens) { for (const s of sc.shapes) { fix(s, 'c', 'pc'); fix(s, 'ec', 'epc'); } if (sc.bgPc) { const p = palEntry(sc.bgPc); if (p) sc.bg = p.c; else sc.bgPc = ''; } }
+        for (const sc of S.screens) { for (const s of sc.shapes) { fix(s, 'c', 'pc'); fix(s, 'ec', 'epc'); if (s.grad) for (const st of s.grad.stops) fix(st, 'c', 'pc'); } if (sc.bgPc) { const p = palEntry(sc.bgPc); if (p) sc.bg = p.c; else sc.bgPc = ''; } }
         if (S.colorPc) { const p = palEntry(S.colorPc); if (p) S.color = p.c; else S.colorPc = ''; }
     }
 
@@ -914,7 +1022,7 @@
             const v = e.target.value.trim(), warn = document.getElementById('palWarn');
             if (v === p.n) return;
             if (!validName(v, p)) { warn.textContent = 'Имя — идентификатор C++ (латиница, цифры, _), не W/H/имя цвета и без повторов.'; e.target.value = p.n; return; }
-            push(); for (const sc of S.screens) { for (const s of sc.shapes) { if (s.pc === p.n) s.pc = v; if (s.epc === p.n) s.epc = v; } if (sc.bgPc === p.n) sc.bgPc = v; } if (S.colorPc === p.n) S.colorPc = v; p.n = v; warn.textContent = ''; update();
+            push(); for (const sc of S.screens) { for (const s of sc.shapes) { if (s.pc === p.n) s.pc = v; if (s.epc === p.n) s.epc = v; if (s.grad) for (const st of s.grad.stops) if (st.pc === p.n) st.pc = v; } if (sc.bgPc === p.n) sc.bgPc = v; } if (S.colorPc === p.n) S.colorPc = v; p.n = v; warn.textContent = ''; update();
         }
     });
     palEl.addEventListener('focusout', () => setTimeout(() => { renderPalette(); renderBgPc(); }, 0));
@@ -970,11 +1078,12 @@
         insBody.innerHTML = `<div class="row" style="justify-content:space-between"><span><span class="chip" style="background:${toHex(s.c)}"></span><b>${esc(s.name || m.name)}</b> <span class="spec">${[(s.name || '').startsWith(m.name) ? '' : m.name, s.pc].filter(Boolean).join(' · ')}</span></span>
     ${m.canFill ? `<span class="seg" id="insFill"><button data-f="0" aria-pressed="${!s.fill}">draw</button><button data-f="1" aria-pressed="${!!s.fill}">fill</button></span>` : ''}</div>
     <div class="fields" style="margin-top:10px">${m.f.map(([k, l]) => `<label>${l}<input type="number" data-k="${k}" id="f-${k}" value="${s[k]}"></label>`).join('')}</div>
-    ${s.t === 'text' ? textInspector(s) : ''}${s.t === 'img' ? imgInspector(s) : ''}
+    ${paintInspector(s)}${s.t === 'text' ? textInspector(s) : ''}${s.t === 'img' ? imgInspector(s) : ''}
     ${alignHtml('data-al', ALIGN, 'По экрану', 'Выравнивание по экрану')}`;
         insBody.querySelectorAll('input[data-k]').forEach(inp => inp.addEventListener('input', () => {
             if (inp.value === '' || isNaN(+inp.value)) return; push('f' + i + inp.dataset.k); S.shapes[i][inp.dataset.k] = Math.trunc(+inp.value); update(true);
         }));
+        bindPaintInspector(s, i);
         if (s.t === 'text') bindTextInspector(s, i);
         if (s.t === 'img') bindImgInspector(s, i);
         const f = document.getElementById('insFill');
@@ -1017,6 +1126,56 @@
         const el = document.getElementById('txtWarn'); if (!el) return;
         const m = fontMetrics(s.font, s.size), over = m.block(wrapText(s).length) > s.h;
         el.textContent = (bad.length ? `Нет в шрифте и будут пропущены: ${bad.slice(0, 12).join(' ')}. ` : '') + (over ? 'Текст выше рамки — увеличь h или нажми «Высота по тексту».' : '');
+    }
+    // fill: plain colour or gradient (2–4 stops), plus smoothing where it applies
+    function paintInspector(s) {
+        const canGrad = GRAD_T.includes(s.t) && (s.t !== 'img' || s.mode === 'icon'), canAA = AA_T.includes(s.t);
+        if (!canGrad && !canAA) return '';
+        const g = s.grad, on = !!g && canGrad, aaDis = s.t === 'text' && !aaFont(s);
+        let h = `<div class="paint"><div class="row">${canGrad ? `<span class="set">Заливка</span><span class="seg" id="pMode"><button data-v="solid" aria-pressed="${!on}">цвет</button><button data-v="grad" aria-pressed="${on}">градиент</button></span>` : ''}
+      ${canAA ? `<label class="set" title="${aaDis ? 'Сглаживание текста — только для своих шрифтов из TTF (раздел «Шрифты с кириллицей»); шрифт, созданный до этой версии, нужно пересоздать' : 'Края считаются по 4×4 подвыборкам на пиксель и смешиваются с тем, что под ними'}"><input type="checkbox" id="pAA"${s.aa && !aaDis ? ' checked' : ''}${aaDis ? ' disabled' : ''}> сглаживание</label>` : ''}</div>`;
+        if (on) {
+            const ang = g.angle || 0;
+            h += `<div class="row"><span class="seg" id="pType"><button data-v="linear" aria-pressed="${g.type !== 'radial'}">линейный</button><button data-v="radial" aria-pressed="${g.type === 'radial'}" title="От центра рамки к краям: радиус — половина большей стороны">радиальный</button></span>`
+                + (g.type !== 'radial' ? `<label class="set" title="0° — слева направо, 90° — сверху вниз">угол <input type="number" id="pAngle" value="${ang}" style="width:56px">°</label><span class="seg" id="pAngles">${[[0, '→'], [90, '↓'], [45, '↘'], [135, '↙'], [180, '←'], [270, '↑']].map(([a, l]) => `<button data-v="${a}" title="${a}°" aria-pressed="${ang === a}">${l}</button>`).join('')}</span>` : '') + '</div>';
+            h += g.stops.map((st, k) => `<div class="row stop" data-k="${k}"><input type="color" value="${toHex(st.c)}" data-f="c" aria-label="Цвет ${k + 1}">`
+                + (S.palette.length ? `<select data-f="pc" aria-label="Цвет ${k + 1} из палитры"><option value="">${fmt565(st.c)}</option>${S.palette.map(p => `<option${p.n === st.pc ? ' selected' : ''}>${p.n}</option>`).join('')}</select>` : `<span class="spec">${fmt565(st.c)}</span>`)
+                + `<label class="set"><input type="number" data-f="p" min="0" max="100" value="${st.p}" style="width:52px" aria-label="Позиция цвета ${k + 1}">%</label>${g.stops.length > 2 ? `<button class="btn" data-f="del" title="Убрать цвет" aria-label="Убрать цвет ${k + 1}">×</button>` : ''}</div>`).join('');
+            h += `<div class="row">${g.stops.length < 4 ? '<button class="btn" id="pAdd">+ цвет</button>' : ''}<button class="btn" id="pRev" title="Развернуть градиент">⇄</button><label class="set" title="Упорядоченный дизеринг 4×4 сглаживает полосы RGB565"><input type="checkbox" id="pDither"${g.dither ? ' checked' : ''}> дизеринг</label></div>`;
+        }
+        return h + '</div>';
+    }
+    function bindPaintInspector(s, i) {
+        const box = insBody.querySelector('.paint'); if (!box) return;
+        const seg = (id, fn) => { const el = document.getElementById(id); if (el) el.onclick = e => { const b = e.target.closest('button'); if (b) fn(b.dataset.v); }; };
+        seg('pMode', v => {
+            push();
+            if (v === 'solid') delete s.grad;
+            else if (!s.grad) { const a = { c: s.c, p: 0 }; if (s.pc) a.pc = s.pc; s.grad = { type: 'linear', angle: 90, stops: [a, { c: s.c ? 0x0000 : 0xFFFF, p: 100 }], dither: false }; }
+            update();
+        });
+        const aa = document.getElementById('pAA'); if (aa) aa.onchange = () => { push(); if (aa.checked) s.aa = true; else delete s.aa; update(); };
+        const g = s.grad; if (!g) return;
+        seg('pType', v => { push(); g.type = v; update(); });
+        seg('pAngles', v => { push(); g.angle = +v; update(); });
+        const an = document.getElementById('pAngle');
+        if (an) an.addEventListener('input', () => { if (an.value === '' || isNaN(+an.value)) return; push('ang' + i); g.angle = ((Math.round(+an.value) % 360) + 360) % 360; update(true); });
+        box.addEventListener('input', e => {
+            const row = e.target.closest('.stop'), f = e.target.dataset.f; if (!row || !f) return; const st = g.stops[+row.dataset.k];
+            if (f === 'c') { push('stc' + i + row.dataset.k); st.c = to565(e.target.value); delete st.pc; update(true); }
+            if (f === 'p' && e.target.value !== '' && !isNaN(+e.target.value)) { push('stp' + i + row.dataset.k); st.p = Math.max(0, Math.min(100, Math.round(+e.target.value))); update(true); }
+        });
+        box.addEventListener('change', e => {
+            const row = e.target.closest('.stop'); if (!row || e.target.dataset.f !== 'pc') return; const st = g.stops[+row.dataset.k], p = palEntry(e.target.value);
+            push(); if (p) { st.pc = p.n; st.c = p.c; } else delete st.pc; update();
+        });
+        box.addEventListener('click', e => {
+            const del = e.target.closest('[data-f=del]');
+            if (del) { push(); g.stops.splice(+del.closest('.stop').dataset.k, 1); update(); return; }
+            if (e.target.closest('#pAdd')) { push(); g.stops.sort((a, b) => a.p - b.p); const a = g.stops[g.stops.length - 2], b = g.stops[g.stops.length - 1]; g.stops.splice(g.stops.length - 1, 0, { c: a.c, p: Math.round((a.p + b.p) / 2) }); update(); return; }
+            if (e.target.closest('#pRev')) { push(); g.stops = g.stops.map(st => ({ ...st, p: 100 - st.p })).reverse(); update(); }
+        });
+        const di = document.getElementById('pDither'); if (di) di.onchange = () => { push(); g.dither = di.checked; update(); };
     }
     function imgInspector(s) {
         const seg = (id, key, items) => `<span class="seg" id="${id}">${items.map(([v, l, t]) => `<button data-v="${v}" title="${t}" aria-pressed="${s[key] === v}">${l}</button>`).join('')}</span>`;
@@ -1238,6 +1397,14 @@
         }
     }
     function textCode(s, st, e) {
+        if (usesLcb(s)) { // gradient / smooth text: drawn by lcbText, the canvas text settings are left alone
+            const lines = layoutText(s); if (!lines.length) return [];
+            return lcbWrap(s, P => lines.map(l => {
+                const lit = `"${cstr(l.t)}"`, cp = FONT_DATA[s.font] && FONT_DATA[s.font].cp && /[^\x00-\x7F]/.test(l.t);
+                const cx = e && e.pre ? plus(V(s, e, 'x'), l.cx - s.x) : l.cx, cy = e && e.pre ? plus(V(s, e, 'y'), l.cy - s.y) : l.cy;
+                return lcbTextCall(s, e, P, cx, cy, cp ? `cp1251(${lit})` : lit);
+            }));
+        }
         const out = [], col = colStr(s);
         if (!st.wrap) { out.push('canvas.setTextWrap(false);  // переносы уже посчитаны редактором'); st.wrap = true; }
         if (st.font !== s.font) { out.push(s.font ? `canvas.setFont(&${s.font});` : 'canvas.setFont();  // встроенный 5×7'); st.font = s.font; }
@@ -1253,7 +1420,7 @@
     function shapeCode(s, e, st) {
         // the function sets font, size and colour itself, so the next static text must set them again
         if (s.t === 'text' && s.var) { st.font = st.size = undefined; st.color = null; return [`${e.fn}("${cstr(varText(s))}");`]; }
-        return s.t === 'text' ? textCode(s, st, e) : [codeLine(s, e)];
+        return s.t === 'text' ? textCode(s, st, e) : usesLcb(s) ? lcbWrap(s, P => [lcbCall(s, e, P)]) : [codeLine(s, e)];
     }
     // drawing lines of screen k in draw order; named elements and groups get a «// name» comment; i/k point back at the shape
     function screenLines(k, P, unknown) {
@@ -1292,13 +1459,306 @@
         const er = s.erase === 'color' ? (s.epc && palEntry(s.epc) ? s.epc : fmt565(s.ec)) : bg;
         const cx = s.align === 'center' ? `${x} + (${w} - bw) / 2 - bx` : s.align === 'right' ? `${x} + ${w} - bw - bx` : `${x} - bx`;
         const cy = s.valign === 'middle' ? `${y} + (${h} - bh) / 2 - by` : s.valign === 'bottom' ? `${y} + ${h} - bh - by` : `${y} - by`;
+        const lcb = usesLcb(s);
         return [`// меняющийся текст «${s.var}»${customName(s) ? ' — ' + s.name : ''}`, `void ${e.fn}(const char* value) {`,
             `  canvas.fillRect(${x}, ${y}, ${w}, ${h}, ${er});  // стереть область блока`,
-            s.font ? `  canvas.setFont(&${s.font});` : '  canvas.setFont();  // встроенный 5×7', `  canvas.setTextSize(${s.size});`, `  canvas.setTextColor(${colStr(s)});`, '  canvas.setTextWrap(false);',
+            s.font ? `  canvas.setFont(&${s.font});` : '  canvas.setFont();  // встроенный 5×7', `  canvas.setTextSize(${s.size});`, ...(lcb ? [] : [`  canvas.setTextColor(${colStr(s)});`]), '  canvas.setTextWrap(false);',
             ...(FONT_DATA[s.font] && FONT_DATA[s.font].cp ? ['  value = cp1251(value);  // UTF-8 → CP1251 для шрифта с кириллицей'] : []),
             '  // выравнивание считается на плате через getTextBounds', '  int16_t bx, by; uint16_t bw, bh;', '  canvas.getTextBounds(value, 0, 0, &bx, &by, &bw, &bh);',
-            `  canvas.setCursor(${cx}, ${cy});`, '  canvas.print(value);', '}'];
+            ...(lcb ? [...(gradOk(s) ? [`  const LcbPaint p = ${paintLit(s)};`] : []), '  ' + lcbTextCall(s, e, gradOk(s) ? 'p' : `lcbSolid(${colStr(s)})`, cx, cy, 'value')]
+                : [`  canvas.setCursor(${cx}, ${cy});`, '  canvas.print(value);']), '}'];
     }
+    // ---------- lcb…: gradients and anti-aliasing in the sketch (C++ twin of paintColor / px / aa… above) ----------
+    const usesLcb = s => gradOk(s) || aaOk(s);
+    function lcbLib(glcd) {
+        const lib = `// ---------- LCD Canvas Builder: градиенты и сглаживание ----------
+// Свои функции рисования: те же алгоритмы, что у Adafruit GFX, но цвет каждого пикселя берётся из LcbPaint,
+// а сглаженные фигуры смешиваются с тем, что уже нарисовано. Математика целочисленная и совпадает с превью.
+enum : uint8_t { LCB_SOLID, LCB_LINEAR, LCB_RADIAL };
+// градиент: направление (dx, dy) × 1024 для линейного; n опорных цветов c[] на позициях p[] (0…4096); дизеринг 4×4
+struct LcbPaint { uint8_t type; int16_t dx, dy; uint8_t n; uint16_t c[4]; uint16_t p[4]; bool dither; };
+inline LcbPaint lcbSolid(uint16_t c) { LcbPaint p = { LCB_SOLID, 0, 0, 1, { c, 0, 0, 0 }, { 0, 0, 0, 0 }, false }; return p; }
+${lcbAlphaTypes().join('\n')}
+
+const LcbPaint* lcbP_ = nullptr;
+int16_t lcbBx_, lcbBy_, lcbBw_, lcbBh_;   // рамка элемента, по которой растягивается градиент
+inline void lcbUse(const LcbPaint& p, int16_t x, int16_t y, int16_t w, int16_t h) { lcbP_ = &p; lcbBx_ = x; lcbBy_ = y; lcbBw_ = w; lcbBh_ = h; }
+
+inline uint32_t lcbIsqrt(uint64_t n) {
+  uint64_t r = 0, b = 1ULL << 62;
+  while (b > n) b >>= 2;
+  while (b) { if (n >= r + b) { n -= r + b; r = (r >> 1) + b; } else r >>= 1; b >>= 2; }
+  return (uint32_t)r;
+}
+
+// цвет градиента в центре пикселя (x, y)
+inline uint16_t lcbColor(int16_t x, int16_t y) {
+  const LcbPaint& p = *lcbP_;
+  if (p.type == LCB_SOLID || p.n < 2) return p.c[0];
+  int64_t X = 2 * x + 1 - (2 * lcbBx_ + lcbBw_), Y = 2 * y + 1 - (2 * lcbBy_ + lcbBh_), t;
+  if (p.type == LCB_LINEAR) {
+    int64_t half = (int64_t)abs(p.dx) * lcbBw_ + (int64_t)abs(p.dy) * lcbBh_;
+    t = half ? (X * p.dx + Y * p.dy + half) * 4096 / (2 * half) : 0;
+  } else {
+    int64_t R = lcbBw_ > lcbBh_ ? lcbBw_ : lcbBh_;
+    t = R ? (int64_t)lcbIsqrt((uint64_t)(X * X + Y * Y) * 256) * 4096 / (R * 16) : 0;
+  }
+  if (t < 0) t = 0;
+  if (t > 4096) t = 4096;
+  int i = 0;
+  while (i < p.n - 2 && t >= p.p[i + 1]) i++;
+  int f = t <= p.p[i] ? 0 : t >= p.p[i + 1] ? 256 : (int)((t - p.p[i]) * 256 / (p.p[i + 1] - p.p[i]));
+  static const uint8_t bayer[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };
+  int d = p.dither ? bayer[(y & 3) * 4 + (x & 3)] * 16 + 8 : 128;
+  uint16_t a = p.c[i], b = p.c[i + 1];
+  int r = ((a >> 11) * 256 + ((b >> 11) - (a >> 11)) * f + d) >> 8;
+  int g = (((a >> 5) & 63) * 256 + (((b >> 5) & 63) - ((a >> 5) & 63)) * f + d) >> 8;
+  int bl = ((a & 31) * 256 + ((b & 31) - (a & 31)) * f + d) >> 8;
+  if (r > 31) r = 31;
+  if (g > 63) g = 63;
+  if (bl > 31) bl = 31;
+  return r << 11 | g << 5 | bl;
+}
+
+// пиксель с покрытием a из 16: при a < 16 смешивается с тем, что уже на холсте
+inline void lcbPx(int16_t x, int16_t y, uint8_t a = 16) {
+  if (!a || x < 0 || y < 0 || x >= canvas.width() || y >= canvas.height()) return;
+  uint16_t c = lcbColor(x, y);
+  if (a < 16) {
+    uint16_t b = canvas.getPixel(x, y);
+    int br = b >> 11, bg = (b >> 5) & 63, bb = b & 31, fr = c >> 11, fg = (c >> 5) & 63, fb = c & 31;
+    c = (br + (fr - br) * a / 16) << 11 | (bg + (fg - bg) * a / 16) << 5 | (bb + (fb - bb) * a / 16);
+  }
+  canvas.drawPixel(x, y, c);
+}
+
+// ----- те же алгоритмы, что в Adafruit_GFX.cpp -----
+inline void lcbH(int16_t x, int16_t y, int16_t w) { if (w < 0) { w = -w; x -= w - 1; } for (int16_t i = 0; i < w; i++) lcbPx(x + i, y); }
+inline void lcbV(int16_t x, int16_t y, int16_t h) { if (h < 0) { h = -h; y -= h - 1; } for (int16_t i = 0; i < h; i++) lcbPx(x, y + i); }
+inline void lcbLine(int16_t x0, int16_t y0, int16_t x1, int16_t y1) {
+  bool steep = abs(y1 - y0) > abs(x1 - x0);
+  int16_t t;
+  if (steep) { t = x0; x0 = y0; y0 = t; t = x1; x1 = y1; y1 = t; }
+  if (x0 > x1) { t = x0; x0 = x1; x1 = t; t = y0; y0 = y1; y1 = t; }
+  int16_t dx = x1 - x0, dy = abs(y1 - y0), err = dx / 2, ys = y0 < y1 ? 1 : -1;
+  for (; x0 <= x1; x0++) { if (steep) lcbPx(y0, x0); else lcbPx(x0, y0); err -= dy; if (err < 0) { y0 += ys; err += dx; } }
+}
+inline void lcbFR(int16_t x, int16_t y, int16_t w, int16_t h) { for (int16_t i = x; i < x + w; i++) lcbV(i, y, h); }
+inline void lcbDR(int16_t x, int16_t y, int16_t w, int16_t h) { lcbH(x, y, w); lcbH(x, y + h - 1, w); lcbV(x, y, h); lcbV(x + w - 1, y, h); }
+inline void lcbDC(int16_t x0, int16_t y0, int16_t r) {
+  int16_t f = 1 - r, ddx = 1, ddy = -2 * r, x = 0, y = r;
+  lcbPx(x0, y0 + r); lcbPx(x0, y0 - r); lcbPx(x0 + r, y0); lcbPx(x0 - r, y0);
+  while (x < y) {
+    if (f >= 0) { y--; ddy += 2; f += ddy; } x++; ddx += 2; f += ddx;
+    lcbPx(x0 + x, y0 + y); lcbPx(x0 - x, y0 + y); lcbPx(x0 + x, y0 - y); lcbPx(x0 - x, y0 - y);
+    lcbPx(x0 + y, y0 + x); lcbPx(x0 - y, y0 + x); lcbPx(x0 + y, y0 - x); lcbPx(x0 - y, y0 - x);
+  }
+}
+inline void lcbCH(int16_t x0, int16_t y0, int16_t r, uint8_t c) {
+  int16_t f = 1 - r, ddx = 1, ddy = -2 * r, x = 0, y = r;
+  while (x < y) {
+    if (f >= 0) { y--; ddy += 2; f += ddy; } x++; ddx += 2; f += ddx;
+    if (c & 4) { lcbPx(x0 + x, y0 + y); lcbPx(x0 + y, y0 + x); }
+    if (c & 2) { lcbPx(x0 + x, y0 - y); lcbPx(x0 + y, y0 - x); }
+    if (c & 8) { lcbPx(x0 - y, y0 + x); lcbPx(x0 - x, y0 + y); }
+    if (c & 1) { lcbPx(x0 - y, y0 - x); lcbPx(x0 - x, y0 - y); }
+  }
+}
+inline void lcbFCH(int16_t x0, int16_t y0, int16_t r, uint8_t corners, int16_t delta) {
+  int16_t f = 1 - r, ddx = 1, ddy = -2 * r, x = 0, y = r, px = x, py = y;
+  delta++;
+  while (x < y) {
+    if (f >= 0) { y--; ddy += 2; f += ddy; } x++; ddx += 2; f += ddx;
+    if (x < y + 1) { if (corners & 1) lcbV(x0 + x, y0 - y, 2 * y + delta); if (corners & 2) lcbV(x0 - x, y0 - y, 2 * y + delta); }
+    if (y != py) { if (corners & 1) lcbV(x0 + py, y0 - px, 2 * px + delta); if (corners & 2) lcbV(x0 - py, y0 - px, 2 * px + delta); py = y; }
+    px = x;
+  }
+}
+inline int16_t lcbClampR(int16_t w, int16_t h, int16_t r) { int16_t m = (w < h ? w : h) / 2; return r > m ? m : r; }
+inline void lcbDRR(int16_t x, int16_t y, int16_t w, int16_t h, int16_t r) {
+  r = lcbClampR(w, h, r);
+  lcbH(x + r, y, w - 2 * r); lcbH(x + r, y + h - 1, w - 2 * r); lcbV(x, y + r, h - 2 * r); lcbV(x + w - 1, y + r, h - 2 * r);
+  lcbCH(x + r, y + r, r, 1); lcbCH(x + w - r - 1, y + r, r, 2); lcbCH(x + w - r - 1, y + h - r - 1, r, 4); lcbCH(x + r, y + h - r - 1, r, 8);
+}
+inline void lcbFRR(int16_t x, int16_t y, int16_t w, int16_t h, int16_t r) {
+  r = lcbClampR(w, h, r);
+  lcbFR(x + r, y, w - 2 * r, h); lcbFCH(x + w - r - 1, y + r, r, 1, h - 2 * r - 1); lcbFCH(x + r, y + r, r, 2, h - 2 * r - 1);
+}
+inline void lcbFT(int16_t x0, int16_t y0, int16_t x1, int16_t y1, int16_t x2, int16_t y2) {
+  int16_t a, b, y, last, t;
+  if (y0 > y1) { t = y0; y0 = y1; y1 = t; t = x0; x0 = x1; x1 = t; }
+  if (y1 > y2) { t = y2; y2 = y1; y1 = t; t = x2; x2 = x1; x1 = t; }
+  if (y0 > y1) { t = y0; y0 = y1; y1 = t; t = x0; x0 = x1; x1 = t; }
+  if (y0 == y2) {
+    a = b = x0;
+    if (x1 < a) a = x1; else if (x1 > b) b = x1;
+    if (x2 < a) a = x2; else if (x2 > b) b = x2;
+    lcbH(a, y0, b - a + 1); return;
+  }
+  int16_t dx01 = x1 - x0, dy01 = y1 - y0, dx02 = x2 - x0, dy02 = y2 - y0, dx12 = x2 - x1, dy12 = y2 - y1;
+  int32_t sa = 0, sb = 0;
+  last = y1 == y2 ? y1 : y1 - 1;
+  for (y = y0; y <= last; y++) { a = x0 + sa / dy01; b = x0 + sb / dy02; sa += dx01; sb += dx02; if (a > b) { t = a; a = b; b = t; } lcbH(a, y, b - a + 1); }
+  sa = (int32_t)dx12 * (y - y1); sb = (int32_t)dx02 * (y - y0);
+  for (; y <= y2; y++) { a = x1 + sa / dy12; b = x0 + sb / dy02; sa += dx12; sb += dx02; if (a > b) { t = a; a = b; b = t; } lcbH(a, y, b - a + 1); }
+}
+
+// ----- сглаживание: покрытие по 4×4 подвыборкам, координаты в 1/8 пикселя -----
+template <typename F> inline uint8_t lcbCover(int16_t x, int16_t y, F inside) {
+  uint8_t n = 0;
+  for (int j = 1; j < 8; j += 2) for (int i = 1; i < 8; i += 2) if (inside((int32_t)8 * x + i, (int32_t)8 * y + j)) n++;
+  return n;
+}
+inline void lcbAACircle(int16_t cx, int16_t cy, int16_t r, bool ring) {
+  int32_t C = 8 * cx + 4, D = 8 * cy + 4, ro = (8 * r + 4) * (8 * r + 4), ri = ring && r > 0 ? (8 * r - 4) * (8 * r - 4) : -1;
+  auto in = [&](int32_t sx, int32_t sy) { int32_t d = (sx - C) * (sx - C) + (sy - D) * (sy - D); return d <= ro && d >= ri; };
+  for (int16_t y = cy - r - 1; y <= cy + r + 1; y++) for (int16_t x = cx - r - 1; x <= cx + r + 1; x++) lcbPx(x, y, lcbCover(x, y, in));
+}
+inline bool lcbInRR(int32_t sx, int32_t sy, int16_t x, int16_t y, int16_t w, int16_t h, int16_t r) {
+  if (w <= 0 || h <= 0 || sx < 8 * x || sy < 8 * y || sx >= 8 * (x + w) || sy >= 8 * (y + h)) return false;
+  if (r <= 0) return true;
+  int32_t l = 8 * (x + r) + 4, t = 8 * (y + r) + 4, rr = 8 * (x + w - r - 1) + 4, b = 8 * (y + h - r - 1) + 4, R = 8 * r + 4;
+  int32_t dx = sx - (sx < l ? l : sx > rr ? rr : sx), dy = sy - (sy < t ? t : sy > b ? b : sy);
+  return dx * dx + dy * dy <= R * R;
+}
+inline void lcbAARR(int16_t x, int16_t y, int16_t w, int16_t h, int16_t r, bool ring) {
+  r = lcbClampR(w, h, r);
+  auto in = [&](int32_t sx, int32_t sy) { return lcbInRR(sx, sy, x, y, w, h, r) && !(ring && lcbInRR(sx, sy, x + 1, y + 1, w - 2, h - 2, r - 1)); };
+  for (int16_t j = y; j < y + h; j++) for (int16_t i = x; i < x + w; i++) lcbPx(i, j, lcbCover(i, j, in));
+}
+inline void lcbAALine(int16_t x0, int16_t y0, int16_t x1, int16_t y1) {
+  int32_t ax = 8 * x0 + 4, ay = 8 * y0 + 4, bx = 8 * x1 + 4, by = 8 * y1 + 4, dx = bx - ax, dy = by - ay;
+  int64_t L = (int64_t)dx * dx + (int64_t)dy * dy;
+  auto in = [&](int32_t sx, int32_t sy) {
+    int64_t vx = sx - ax, vy = sy - ay, t = vx * dx + vy * dy;
+    if (L == 0 || t <= 0) return vx * vx + vy * vy <= 16;
+    if (t >= L) return (int64_t)(sx - bx) * (sx - bx) + (int64_t)(sy - by) * (sy - by) <= 16;
+    return (vx * vx + vy * vy) * L - t * t <= 16 * L;
+  };
+  if (abs(x1 - x0) >= abs(y1 - y0)) {
+    int16_t lo = x0 < x1 ? x0 : x1, hi = x0 < x1 ? x1 : x0;
+    for (int16_t x = lo - 1; x <= hi + 1; x++) {
+      int16_t xc = x < lo ? lo : x > hi ? hi : x, yc = x1 == x0 ? y0 : y0 + (int32_t)(xc - x0) * (y1 - y0) / (x1 - x0);
+      for (int16_t y = yc - 2; y <= yc + 2; y++) lcbPx(x, y, lcbCover(x, y, in));
+    }
+  } else {
+    int16_t lo = y0 < y1 ? y0 : y1, hi = y0 < y1 ? y1 : y0;
+    for (int16_t y = lo - 1; y <= hi + 1; y++) {
+      int16_t yc = y < lo ? lo : y > hi ? hi : y, xc = x0 + (int32_t)(yc - y0) * (x1 - x0) / (y1 - y0);
+      for (int16_t x = xc - 2; x <= xc + 2; x++) lcbPx(x, y, lcbCover(x, y, in));
+    }
+  }
+}
+inline int64_t lcbEdge(int32_t px, int32_t py, int32_t qx, int32_t qy, int32_t sx, int32_t sy) { return (int64_t)(qx - px) * (sy - py) - (int64_t)(qy - py) * (sx - px); }
+inline void lcbAATriangle(int16_t x0, int16_t y0, int16_t x1, int16_t y1, int16_t x2, int16_t y2) {
+  int32_t ax = 8 * x0 + 4, ay = 8 * y0 + 4, bx = 8 * x1 + 4, by = 8 * y1 + 4, cx = 8 * x2 + 4, cy = 8 * y2 + 4;
+  int64_t area = lcbEdge(ax, ay, bx, by, cx, cy);
+  if (!area) { lcbAALine(x0, y0, x1, y1); lcbAALine(x1, y1, x2, y2); return; }
+  int sg = area > 0 ? 1 : -1;
+  auto in = [&](int32_t sx, int32_t sy) { return sg * lcbEdge(ax, ay, bx, by, sx, sy) >= 0 && sg * lcbEdge(bx, by, cx, cy, sx, sy) >= 0 && sg * lcbEdge(cx, cy, ax, ay, sx, sy) >= 0; };
+  int16_t xa = min(x0, min(x1, x2)), xb = max(x0, max(x1, x2)), ya = min(y0, min(y1, y2)), yb = max(y0, max(y1, y2));
+  for (int16_t y = ya; y <= yb; y++) for (int16_t x = xa; x <= xb; x++) lcbPx(x, y, lcbCover(x, y, in));
+}
+
+// ----- то, что вызывает код экрана -----
+inline void lcbBoxRect(const LcbPaint& p, int16_t x, int16_t y, int16_t w, int16_t h) { lcbUse(p, w < 0 ? x + w : x, h < 0 ? y + h : y, abs(w), abs(h)); }
+inline void lcbFillRect(int16_t x, int16_t y, int16_t w, int16_t h, const LcbPaint& p) { lcbBoxRect(p, x, y, w, h); lcbFR(x, y, w, h); }
+inline void lcbDrawRect(int16_t x, int16_t y, int16_t w, int16_t h, const LcbPaint& p) { lcbBoxRect(p, x, y, w, h); lcbDR(x, y, w, h); }
+inline void lcbFillRoundRect(int16_t x, int16_t y, int16_t w, int16_t h, int16_t r, const LcbPaint& p, bool aa) { lcbBoxRect(p, x, y, w, h); if (aa) lcbAARR(x, y, w, h, r, false); else lcbFRR(x, y, w, h, r); }
+inline void lcbDrawRoundRect(int16_t x, int16_t y, int16_t w, int16_t h, int16_t r, const LcbPaint& p, bool aa) { lcbBoxRect(p, x, y, w, h); if (aa) lcbAARR(x, y, w, h, r, true); else lcbDRR(x, y, w, h, r); }
+inline void lcbFillCircle(int16_t x, int16_t y, int16_t r, const LcbPaint& p, bool aa) { lcbUse(p, x - r, y - r, 2 * r + 1, 2 * r + 1); if (aa) lcbAACircle(x, y, r, false); else { lcbV(x, y - r, 2 * r + 1); lcbFCH(x, y, r, 3, 0); } }
+inline void lcbDrawCircle(int16_t x, int16_t y, int16_t r, const LcbPaint& p, bool aa) { lcbUse(p, x - r, y - r, 2 * r + 1, 2 * r + 1); if (aa) lcbAACircle(x, y, r, true); else lcbDC(x, y, r); }
+inline void lcbBoxPts(const LcbPaint& p, int16_t xa, int16_t xb, int16_t ya, int16_t yb) { lcbUse(p, xa, ya, xb - xa + 1, yb - ya + 1); }
+inline void lcbDrawLine(int16_t x0, int16_t y0, int16_t x1, int16_t y1, const LcbPaint& p, bool aa) {
+  lcbBoxPts(p, min(x0, x1), max(x0, x1), min(y0, y1), max(y0, y1));
+  if (aa) lcbAALine(x0, y0, x1, y1); else lcbLine(x0, y0, x1, y1);
+}
+inline void lcbFillTriangle(int16_t x0, int16_t y0, int16_t x1, int16_t y1, int16_t x2, int16_t y2, const LcbPaint& p, bool aa) {
+  lcbBoxPts(p, min(x0, min(x1, x2)), max(x0, max(x1, x2)), min(y0, min(y1, y2)), max(y0, max(y1, y2)));
+  if (aa) lcbAATriangle(x0, y0, x1, y1, x2, y2); else lcbFT(x0, y0, x1, y1, x2, y2);
+}
+inline void lcbDrawTriangle(int16_t x0, int16_t y0, int16_t x1, int16_t y1, int16_t x2, int16_t y2, const LcbPaint& p, bool aa) {
+  lcbBoxPts(p, min(x0, min(x1, x2)), max(x0, max(x1, x2)), min(y0, min(y1, y2)), max(y0, max(y1, y2)));
+  if (aa) { lcbAALine(x0, y0, x1, y1); lcbAALine(x1, y1, x2, y2); lcbAALine(x2, y2, x0, y0); }
+  else { lcbLine(x0, y0, x1, y1); lcbLine(x1, y1, x2, y2); lcbLine(x2, y2, x0, y0); }
+}
+// 1-битная картинка (тот же формат, что у drawBitmap)
+inline void lcbDrawBitmap(int16_t x, int16_t y, const uint8_t* bitmap, int16_t w, int16_t h, const LcbPaint& p) {
+  lcbUse(p, x, y, w, h);
+  int16_t bw = (w + 7) / 8;
+  for (int16_t j = 0; j < h; j++) {
+    uint8_t b = 0;
+    for (int16_t i = 0; i < w; i++) { if (i & 7) b <<= 1; else b = pgm_read_byte(&bitmap[j * bw + i / 8]); if (b & 0x80) lcbPx(x + i, y + j); }
+  }
+}
+// строка шрифтом GFXfont от курсора (x — начало, y — базовая линия), как print(); bx…bh — рамка текстового блока для градиента;
+// aa — сглаженная копия шрифта (только для шрифтов проекта)
+inline void lcbText(int16_t x, int16_t y, const char* s, const GFXfont* f, uint8_t size, const LcbPaint& p, int16_t bx, int16_t by, int16_t bw, int16_t bh, const LcbAlphaFont* aa = nullptr) {
+  lcbUse(p, bx, by, bw, bh);
+  for (; *s; s++) {
+    uint8_t c = *s;
+    if (c < f->first || c > f->last) continue;
+    const GFXglyph* g = &f->glyph[c - f->first];
+    if (aa) {
+      const LcbAlphaGlyph* ag = &aa->glyph[c - f->first];
+      for (int yy = 0; yy < ag->height; yy++) for (int xx = 0; xx < ag->width; xx++) {
+        int n = yy * ag->width + xx;
+        uint8_t v = pgm_read_byte(&aa->bitmap[ag->offset + (n >> 1)]), a4 = n & 1 ? v & 15 : v >> 4;
+        if (!a4) continue;
+        uint8_t a = (a4 * 16 + 7) / 15;
+        if (size == 1) lcbPx(x + ag->xOffset + xx, y + ag->yOffset + yy, a);
+        else for (int j = 0; j < size; j++) for (int i = 0; i < size; i++) lcbPx(x + (ag->xOffset + xx) * size + i, y + (ag->yOffset + yy) * size + j, a);
+      }
+    } else {
+      uint16_t bo = g->bitmapOffset;
+      uint8_t bits = 0, bit = 0;
+      for (int yy = 0; yy < g->height; yy++) for (int xx = 0; xx < g->width; xx++) {
+        if (!(bit++ & 7)) bits = pgm_read_byte(&f->bitmap[bo++]);
+        if (bits & 0x80) { if (size == 1) lcbPx(x + g->xOffset + xx, y + g->yOffset + yy); else lcbFR(x + (g->xOffset + xx) * size, y + (g->yOffset + yy) * size, size, size); }
+        bits <<= 1;
+      }
+    }
+    x += g->xAdvance * size;
+  }
+}`;
+        if (!glcd) return lib.split('\n');
+        const rows = []; for (let k = 0; k < GLCD.length; k += 20) rows.push('  ' + Array.from(GLCD.slice(k, k + 20), v => '0x' + v.toString(16).toUpperCase().padStart(2, '0')).join(', ') + ',');
+        return [...lib.split('\n'), '// встроенный шрифт 5×7 (копия glcdfont.c из Adafruit GFX: в библиотеке он недоступен скетчу)', 'const uint8_t lcbGlcd[] PROGMEM = {', ...rows, '};',
+            '// строка встроенным шрифтом 5×7 от курсора (y — верх строки), как print()',
+            'inline void lcbTextGlcd(int16_t x, int16_t y, const char* s, uint8_t size, const LcbPaint& p, int16_t bx, int16_t by, int16_t bw, int16_t bh) {',
+            '  lcbUse(p, bx, by, bw, bh);',
+            '  for (; *s; s++, x += 6 * size) {',
+            '    uint8_t c = *s;',
+            '    for (int8_t i = 0; i < 5; i++) {',
+            '      uint8_t line = pgm_read_byte(&lcbGlcd[c * 5 + i]);',
+            '      for (int8_t j = 0; j < 8; j++, line >>= 1) if (line & 1) { if (size == 1) lcbPx(x + i, y + j); else lcbFR(x + i * size, y + j * size, size, size); }',
+            '    }', '  }', '}'];
+    }
+    // gradient as a C++ initialiser; colours keep palette names
+    function paintLit(s) {
+        const P = makePaint(s), col = k => P.pc[k] && palEntry(P.pc[k]) ? P.pc[k] : fmt565(P.c[k]), pad = (a, z) => [...a, ...Array(4 - a.length).fill(z)];
+        return `{ ${P.type === 2 ? 'LCB_RADIAL' : 'LCB_LINEAR'}, ${P.dx}, ${P.dy}, ${P.n}, { ${pad(P.c.map((_, k) => col(k)), '0').join(', ')} }, { ${pad(P.p, 0).join(', ')} }, ${P.dither} }`;
+    }
+    function lcbCall(s, e, P) {
+        const v = k => V(s, e, k), aa = aaOk(s) ? 'true' : 'false', F = s.fill ? 'Fill' : 'Draw';
+        switch (s.t) {
+            case 'rect': return `lcb${F}Rect(${v('x')}, ${v('y')}, ${v('w')}, ${v('h')}, ${P});`;
+            case 'rrect': return `lcb${F}RoundRect(${v('x')}, ${v('y')}, ${v('w')}, ${v('h')}, ${v('r')}, ${P}, ${aa});`;
+            case 'circle': return `lcb${F}Circle(${v('x')}, ${v('y')}, ${v('r')}, ${P}, ${aa});`;
+            case 'line': return `lcbDrawLine(${v('x0')}, ${v('y0')}, ${v('x1')}, ${v('y1')}, ${P}, ${aa});`;
+            case 'tri': return `lcb${F}Triangle(${v('x0')}, ${v('y0')}, ${v('x1')}, ${v('y1')}, ${v('x2')}, ${v('y2')}, ${P}, ${aa});`;
+            case 'img': return `lcbDrawBitmap(${v('x')}, ${v('y')}, ${e.arr}, ${v('w')}, ${v('h')}, ${P});`;
+        }
+    }
+    // one call, or a block with the gradient as a local constant
+    const lcbWrap = (s, body) => gradOk(s) ? [`{ const LcbPaint p = ${paintLit(s)};`, ...body('p').map((l, k, a) => '  ' + l + (k === a.length - 1 ? ' }' : ''))] : body(`lcbSolid(${colStr(s)})`);
+    // a text line through lcbText / lcbTextGlcd; the box is the text block
+    function lcbTextCall(s, e, P, cx, cy, lit) {
+        const v = k => V(s, e, k), F = FONT_DATA[s.font], box = `${v('x')}, ${v('y')}, ${v('w')}, ${v('h')}`;
+        if (!s.font || !F) return `lcbTextGlcd(${cx}, ${cy}, ${lit}, ${s.size}, ${P}, ${box});`;
+        return `lcbText(${cx}, ${cy}, ${lit}, &${s.font}, ${s.size}, ${P}, ${box}${aaOk(s) ? `, &${s.font}AA` : ''});`;
+    }
+
     function buildLines(P = plan()) {
         const L = t => ({ t, i: -1 }), ind = l => ({ ...l, t: l.t ? '  ' + l.t : l.t });
         const pal = S.palette.map(p => L(`constexpr uint16_t ${p.n} = ${fmt565(p.c)};`));
@@ -1310,6 +1770,7 @@
             const cur = P.vis[S.cur], notes = [];
             if (cur.some(s => s.t === 'img')) notes.push(L(`// массивы картинок — в режиме «весь скетч»${header ? ' (images.h)' : ''}`));
             if (cur.some(s => s.t === 'text' && s.var)) notes.push(L('// функции меняющегося текста — в режиме «весь скетч»'));
+            if (cur.some(usesLcb)) notes.push(L('// функции lcb… (градиенты и сглаживание) — в режиме «весь скетч»'));
             const pre = [...pal, ...constLines(cur, P).map(L), ...notes], body = screenLines(S.cur, P, false);
             return pre.length ? [...pre, L(''), ...body] : body;
         }
@@ -1321,6 +1782,7 @@
             ...(consts.length ? [L('// координаты именованных элементов'), ...consts, L('')] : []),
             L('St7789* lcd;                 // драйвер (твоя библиотека)'), L('GFXcanvas16 canvas(W, H);    // холст в памяти, на нём рисуем'), L(''),
             ...(header ? [] : arrays()),
+            ...(all.some(o => usesLcb(o.s)) ? [...lcbLib(all.some(o => o.s.t === 'text' && usesLcb(o.s) && !FONT_DATA[o.s.font])).map(t => ({ t, i: -1, lib: true })), L('')] : []),
             L('// Показать холст на экране'), L('void present() {'), L('  lcd->drawImage(0, 0, W, H, canvas.getBuffer());'), L('}'), L(''),
             ...vars.flatMap(o => [...varFnLines(o.s, o.e, bgExpr(S.screens[o.k])).map(L), L('')]),
         ];
@@ -1339,6 +1801,7 @@
         for (let n = 0; n < lines.length; n++) {
             const l = lines[n];
             if (l.data) { let m = n; while (m < lines.length && lines[m].data) m++; html.push(`<div class="t-c fold">  …  // ${m - n} строк данных — целиком при копировании</div>`); n = m - 1; continue; }
+            if (l.lib) { let m = n; while (m < lines.length && lines[m].lib) m++; html.push(`<div>${hl(l.t)}</div><div class="t-c fold">…  // ещё ${m - n - 1} строк библиотеки lcb — целиком при копировании</div>`); n = m - 1; continue; }
             const k = l.k ?? S.cur, on = l.i >= 0 && k === S.cur && sel.has(l.i);
             html.push(`<div class="${l.i >= 0 ? 'shape' : ''}${on ? ' on' : ''}"${l.i >= 0 ? ` data-i="${l.i}" data-k="${k}"` : ''}>${hl(l.t) || ' '}</div>`);
         }
@@ -1383,6 +1846,33 @@
         return out;
     }
     // a generated changing-text function → block geometry, style and alignment
+    // arguments at the top level: commas inside strings and brackets don't split
+    function splitArgs(raw) {
+        const out = []; let cur = '', d = 0, q = false;
+        for (let i = 0; i < raw.length; i++) {
+            const ch = raw[i];
+            if (q) { cur += ch; if (ch === '\\') cur += raw[++i]; else if (ch === '"') q = false; continue; }
+            if (ch === '"') q = true; else if ('({['.includes(ch)) d++; else if (')}]'.includes(ch)) d--;
+            if (ch === ',' && !d) { out.push(cur.trim()); cur = ''; } else cur += ch;
+        }
+        if (cur.trim()) out.push(cur.trim());
+        return out;
+    }
+    // { LCB_LINEAR, dx, dy, n, { c… }, { p… }, dither } → grad of the model (angle back from dx, dy; positions back to %)
+    function parsePaint(body, ctx) {
+        const m = body.match(/^\s*(LCB_LINEAR|LCB_RADIAL)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(\d)\s*,\s*\{([^}]*)\}\s*,\s*\{([^}]*)\}\s*,\s*(true|false)\s*$/); if (!m) return null;
+        const n = Math.min(4, +m[4]), cs = m[5].split(',').map(t => t.trim()), ps = m[6].split(',').map(t => +t.trim()), stops = [];
+        for (let k = 0; k < n; k++) { const c = evalNum(cs[k], ctx.pal, ctx.vars); if (c == null) return null; const st = { c, p: Math.round(ps[k] * 100 / 4096) }; const pc = ctx.pcOf(cs[k]); if (pc) st.pc = pc; stops.push(st); }
+        return { type: m[1] === 'LCB_RADIAL' ? 'radial' : 'linear', angle: m[1] === 'LCB_RADIAL' ? 0 : ((Math.round(Math.atan2(+m[3], +m[2]) * 180 / Math.PI) % 360) + 360) % 360, stops, dither: m[7] === 'true' };
+    }
+    // a paint argument: lcbSolid(colour) or the name of a LcbPaint constant
+    function paintArg(t, ctx, paints) {
+        t = (t || '').trim(); const so = t.match(/^lcbSolid\s*\((.*)\)$/);
+        if (so) { const c = evalNum(so[1], ctx.pal, ctx.vars); return c == null ? null : { c, pc: ctx.pcOf(so[1]) }; }
+        const g = paints[t]; return g ? { c: g.stops[0].c, pc: g.stops[0].pc || '', grad: g } : null;
+    }
+    const setPaint = (sh, P) => { sh.c = P.c; if (P.pc) sh.pc = P.pc; if (P.grad) sh.grad = JSON.parse(JSON.stringify(P.grad)); };
+    const strArg = t => { const q = (t || '').match(/^"((?:\\.|[^"\\])*)"$/) || (t || '').match(/^cp1251\s*\(\s*"((?:\\.|[^"\\])*)"\s*\)$/); return q ? cunesc(q[1]) : null; };
     function parseVarFn(f, ctx) {
         const v = { font: '', size: 1, c: 0xFFFF, pc: '', align: 'left', valign: 'top' }; let rect = false;
         for (const m of f.body.matchAll(/canvas\s*\.\s*(\w+)\s*\(([^;]*)\)\s*;/g)) {
@@ -1392,6 +1882,14 @@
             if (fn === 'setTextSize') v.size = Math.max(1, num(parts[0]) || 1);
             if (fn === 'setTextColor') { v.c = num(parts[0]) ?? 0xFFFF; v.pc = ctx.pcOf(parts[0]); }
             if (fn === 'setCursor') { v.align = !/\bbw\b/.test(parts[0]) ? 'left' : /\/\s*2/.test(parts[0]) ? 'center' : 'right'; v.valign = !/\bbh\b/.test(parts[1] || '') ? 'top' : /\/\s*2/.test(parts[1]) ? 'middle' : 'bottom'; }
+        }
+        // the gradient / smooth version: lcbText(cursor x, cursor y, value, font, size, paint, box…[, smooth font])
+        const paints = {}; for (const m of f.body.matchAll(/const\s+LcbPaint\s+(\w+)\s*=\s*\{((?:[^{};]|\{[^{}]*\})*)\}\s*;/g)) { const g = parsePaint(m[2], ctx); if (g) paints[m[1]] = g; }
+        const lt = f.body.match(/\blcbText(Glcd)?\s*\(([^;]*)\)\s*;/);
+        if (lt) {
+            const a = splitArgs(lt[2]), P = paintArg(a[lt[1] ? 4 : 5], ctx, paints);
+            v.align = !/\bbw\b/.test(a[0]) ? 'left' : /\/\s*2/.test(a[0]) ? 'center' : 'right'; v.valign = !/\bbh\b/.test(a[1] || '') ? 'top' : /\/\s*2/.test(a[1]) ? 'middle' : 'bottom';
+            if (P) { v.c = P.c; v.pc = P.pc; v.grad = P.grad; } v.aa = !lt[1] && a.length > 10;
         }
         return rect ? v : null;
     }
@@ -1422,16 +1920,53 @@
             if (g.pc) sh.pc = g.pc; out.push(sh);
         };
         // canvas.fn(args); or a call of a changing-text function: drawTemp("example");
-        const re = /canvas\s*\.\s*(\w+)\s*\(((?:"(?:\\.|[^"\\])*"|[^;"])*)\)\s*;|\b([A-Za-z_]\w*)\s*\(\s*"((?:\\.|[^"\\])*)"\s*\)\s*;/g; let m;
+        // canvas.fn(…); | const LcbPaint p = {…}; | lcbFill…/lcbDraw…/lcbText…(…); | a changing-text call drawTemp("example");
+        const re = /canvas\s*\.\s*(\w+)\s*\(((?:"(?:\\.|[^"\\])*"|[^;"])*)\)\s*;|const\s+LcbPaint\s+(\w+)\s*=\s*\{((?:[^{};]|\{[^{}]*\})*)\}\s*;|\b(lcb(?:Fill|Draw)\w+|lcbText\w*)\s*\(((?:"(?:\\.|[^"\\])*"|[^;"])*)\)\s*;|\b([A-Za-z_]\w*)\s*\(\s*"((?:\\.|[^"\\])*)"\s*\)\s*;/g; let m;
+        const paints = {}; let tg = null;
+        // consecutive lcbText lines of one block → one text block; its alignment is the one whose layout gives exactly these cursors
+        const flushT = () => {
+            if (!tg) return; const g = tg; tg = null;
+            const sh = { t: 'text', x: g.X, y: g.Y, w: g.W, h: g.H, text: g.lines.map(l => l.t).join('\n'), font: g.font, size: g.size, align: 'left', valign: 'top' };
+            search: for (const al of ['left', 'center', 'right']) for (const va of ['top', 'middle', 'bottom']) {
+                const L = layoutText({ ...sh, align: al, valign: va });
+                if (L.length === g.lines.length && L.every((l, k) => l.t === g.lines[k].t && l.cx === g.lines[k].cx && l.cy === g.lines[k].cy)) { sh.align = al; sh.valign = va; break search; }
+            }
+            setPaint(sh, g.P); if (g.aa) sh.aa = true; out.push(sh);
+        };
+        const lcbShape = (fn, a) => {
+            const num = t => evalNum(t, pal, vars);
+            if (fn === 'lcbDrawBitmap') { ctx.imgSkipped++; return; }
+            if (fn === 'lcbText' || fn === 'lcbTextGlcd') {
+                const glcd = fn === 'lcbTextGlcd', o = glcd ? 3 : 4, t = strArg(a[2]), font = glcd ? '' : (a[3] || '').replace(/^&/, '');
+                const nums = [a[0], a[1], a[o], a[o + 2], a[o + 3], a[o + 4], a[o + 5]].map(num), P = paintArg(a[o + 1], ctx, paints);
+                if (t == null || !P || nums.some(x => x == null) || (!glcd && !FONT_DATA[font])) { ctx.skipped++; return; }
+                const [cx, cy, size, X, Y, W, H] = nums, aa = !glcd && a.length > 10, key = [X, Y, W, H, font, size, a[o + 1], aa].join('|');
+                flush(); if (tg && tg.key !== key) flushT();
+                if (!tg) tg = { key, X, Y, W, H, font, size: Math.max(1, size), P, aa, lines: [] };
+                tg.lines.push({ t, cx, cy }); return;
+            }
+            const k = fn.match(/^lcb(Fill|Draw)(Rect|RoundRect|Circle|Line|Triangle)$/);
+            const D = k && { Rect: ['rect', ['x', 'y', 'w', 'h']], RoundRect: ['rrect', ['x', 'y', 'w', 'h', 'r']], Circle: ['circle', ['x', 'y', 'r']], Line: ['line', ['x0', 'y0', 'x1', 'y1']], Triangle: ['tri', ['x0', 'y0', 'x1', 'y1', 'x2', 'y2']] }[k[2]];
+            if (!D) { ctx.skipped++; return; }
+            const nums = a.slice(0, D[1].length).map(num), P = paintArg(a[D[1].length], ctx, paints);
+            if (nums.length < D[1].length || nums.some(x => x == null) || !P) { ctx.skipped++; return; }
+            flush(); flushT();
+            const sh = { t: D[0] }; if (META[D[0]].canFill) sh.fill = k[1] === 'Fill'; D[1].forEach((key, i) => sh[key] = nums[i]); setPaint(sh, P);
+            if (/^\s*true\s*$/.test(a[D[1].length + 1] || '')) sh.aa = true;
+            out.push(sh);
+        };
         while ((m = re.exec(src))) {
+            if (m[3]) { const g = parsePaint(m[4], ctx); if (g) paints[m[3]] = g; continue; }
+            if (m[5]) { lcbShape(m[5], splitArgs(m[6])); continue; }
+            if (m[7]) { m[3] = m[7]; m[4] = m[8]; }
             if (m[3]) {
-                const v = ctx.varFns[m[3]]; if (!v) continue; flush();
+                const v = ctx.varFns[m[3]]; if (!v) continue; flush(); flushT();
                 const sh = { t: 'text', x: v.x, y: v.y, w: v.w, h: v.h, text: cunesc(m[4]), font: v.font, size: v.size, align: v.align, valign: v.valign, c: v.c, var: m[3].replace(/^draw(?=\w)/, '').replace(/^\w/, ch => ch.toLowerCase()) };
-                if (v.pc) sh.pc = v.pc;
+                if (v.pc) sh.pc = v.pc; if (v.grad) sh.grad = JSON.parse(JSON.stringify(v.grad)); if (v.aa) sh.aa = true;
                 if (v.eraseExpr === bgRaw) sh.erase = 'bg'; else { sh.erase = 'color'; sh.ec = v.ec; if (v.epc) sh.epc = v.epc; }
                 out.push(sh); ts.font = v.font; ts.size = v.size; ts.c = v.c; ts.pc = v.pc; continue;
             }
-            const fn = m[1], raw = m[2].trim();
+            const fn = m[1], raw = m[2].trim(); flushT(); // keep the order of blocks
             if (fn === 'print' || fn === 'println') {
                 const q = raw.match(/^"((?:\\.|[^"\\])*)"$/) || raw.match(/^cp1251\s*\(\s*"((?:\\.|[^"\\])*)"\s*\)$/); if (!q && raw) { ctx.skipped++; continue; }
                 const fm = fontMetrics(ts.font, ts.size);
@@ -1461,11 +1996,11 @@
             const k = fn.match(/^(draw|fill)(Rect|RoundRect|Circle|Triangle|Line|Pixel)$/);
             if (!k) { ctx.skipped++; continue; }
             const D = T[k[2]]; if (args.length !== D[1].length + 1) { ctx.skipped++; continue; }
-            flush();
+            flush(); flushT();
             const sh = { t: D[0] }; if (META[D[0]].canFill) sh.fill = k[1] === 'fill'; D[1].forEach((key, i) => sh[key] = args[i]); sh.c = args[args.length - 1];
             const pc = pcOf(parts[parts.length - 1]); if (pc) sh.pc = pc; out.push(sh);
         }
-        flush();
+        flush(); flushT();
         return { out, bg, bgPc };
     }
     const importMsg = document.getElementById('importMsg');
@@ -1600,14 +2135,25 @@
             const draw = (ch, fb) => { x.clearRect(0, 0, size, size); x.font = `${px}px "${fam}", ${fb}`; x.fillStyle = '#000'; x.textBaseline = 'alphabetic'; x.fillText(ch, ox, by); return x.getImageData(0, 0, size, size).data; };
             x.font = `${px}px "${fam}"`; const m = x.measureText('Ag');
             const ya = Math.round((m.fontBoundingBoxAscent || px) + (m.fontBoundingBoxDescent || px / 4));
-            const bytes = [], g = []; let missing = 0;
+            const bytes = [], g = [], ab = [], ag = []; let missing = 0;
+            // 4-bit alpha copy of every glyph for smooth text: rows of nibbles (high first), each glyph starts on a byte
+            const alphaGlyph = a => {
+                const q = i => Math.round(a[i * 4 + 3] * 15 / 255); let x0 = size, y0 = size, x1 = -1, y1 = -1;
+                for (let yy = 0; yy < size; yy++) for (let xx = 0; xx < size; xx++) if (q(yy * size + xx)) { if (xx < x0) x0 = xx; if (xx > x1) x1 = xx; if (yy < y0) y0 = yy; if (yy > y1) y1 = yy; }
+                if (x1 < 0) { ag.push([ab.length, 0, 0, 0, 0]); return; }
+                const off = ab.length, w = x1 - x0 + 1, h = y1 - y0 + 1; let n = 0;
+                for (let yy = y0; yy <= y1; yy++) for (let xx = x0; xx <= x1; xx++, n++) { const v = q(yy * size + xx); if (n & 1) ab[ab.length - 1] |= v; else ab.push(v << 4); }
+                ag.push([off, w, h, x0 - ox, y0 - by]);
+            };
+            const empty = () => { g.push([bytes.length, 0, 0, 0, 0, 0]); ag.push([ab.length, 0, 0, 0, 0]); };
             for (let code = 0x20; code <= 0xFF; code++) {
                 const ch = cpChar(code);
-                if (!CP.has(ch) || code === 0xAD) { g.push([bytes.length, 0, 0, 0, 0, 0]); continue; } // no character at this code: empty glyph
+                if (!CP.has(ch) || code === 0xAD) { empty(); continue; } // no character at this code: empty glyph
                 const a = draw(ch, 'monospace');
                 // a glyph the font doesn't have comes from the fallback font: monospace and serif fallbacks then differ
-                if (ch.trim()) { const b = draw(ch, 'serif'); let same = true; for (let i = 3; i < a.length; i += 4) if ((a[i] >= 128) !== (b[i] >= 128)) { same = false; break; } if (!same) { missing++; g.push([bytes.length, 0, 0, 0, 0, 0]); continue; } }
+                if (ch.trim()) { const b = draw(ch, 'serif'); let same = true; for (let i = 3; i < a.length; i += 4) if ((a[i] >= 128) !== (b[i] >= 128)) { same = false; break; } if (!same) { missing++; empty(); continue; } }
                 x.font = `${px}px "${fam}", monospace`; const xa = Math.round(x.measureText(ch).width);
+                alphaGlyph(a);
                 let x0 = size, y0 = size, x1 = -1, y1 = -1;
                 for (let yy = 0; yy < size; yy++) for (let xx = 0; xx < size; xx++) if (a[(yy * size + xx) * 4 + 3] >= 128) { if (xx < x0) x0 = xx; if (xx > x1) x1 = xx; if (yy < y0) y0 = yy; if (yy > y1) y1 = yy; }
                 if (x1 < 0) { g.push([bytes.length, 0, 0, xa, 0, 0]); continue; }
@@ -1617,10 +2163,10 @@
                 if (n) bytes.push(acc << (8 - n));
                 g.push([off, x1 - x0 + 1, y1 - y0 + 1, xa, x0 - ox, y0 - by]);
             }
-            if (bytes.length > 65535) throw new Error('шрифт слишком большой для GFXfont (больше 64 КБ битмапов) — уменьши размер');
-            if (!bytes.length) bytes.push(0);
-            let bin = ''; for (let k = 0; k < bytes.length; k += 4096) bin += String.fromCharCode(...bytes.slice(k, k + 4096));
-            return { n: name, f: 0x20, l: 0xFF, y: ya, b: btoa(bin), g, pt, src: file.name, missing };
+            if (bytes.length > 65535 || ab.length > 65535) throw new Error('шрифт слишком большой (больше 64 КБ битмапов) — уменьши размер');
+            if (!bytes.length) bytes.push(0); if (!ab.length) ab.push(0);
+            const enc = arr => { let bin = ''; for (let k = 0; k < arr.length; k += 4096) bin += String.fromCharCode(...arr.slice(k, k + 4096)); return btoa(bin); };
+            return { n: name, f: 0x20, l: 0xFF, y: ya, b: enc(bytes), g, ab: enc(ab), ag, pt, src: file.name, missing };
         } finally { document.fonts.delete(face); }
     }
     // cp1251(): UTF-8 → CP1251 on the board; lives in every font .h behind a guard
@@ -1638,6 +2184,17 @@
             "    char r = '?';", '    if (u < 0x80) r = (char)u;', '    else if (u >= 0x410 && u <= 0x44F) r = (char)(0xC0 + (u - 0x410));',
             '    else for (int k = 0; k < 64; k++) if (hi[k] == u) { r = (char)(0x80 + k); break; }', '    out[n++] = r;', '  }', '  out[n] = 0;', '  return out;', '}', '#endif'];
     }
+    // the 4-bit copy for smooth text: lcbText(…, &NameAA) draws it, blending each pixel by its alpha
+    function alphaFontLines(f) {
+        const N = f.n, bytes = b64(f.ab), rows = [];
+        for (let k = 0; k < bytes.length; k += 16) rows.push('  ' + Array.from(bytes.slice(k, k + 16), v => '0x' + v.toString(16).toUpperCase().padStart(2, '0')).join(', ') + ',');
+        return ['// Сглаженная копия для lcbText(): 4 бита альфы на пиксель, два пикселя в байте (старшая тетрада — левый).', ...lcbAlphaTypes(),
+            `const uint8_t ${N}AlphaBitmaps[] PROGMEM = {`, ...rows, '};',
+            `const LcbAlphaGlyph ${N}AlphaGlyphs[] PROGMEM = {`, '  // offset, w, h, xOffset, yOffset (xAdvance — из GFXfont)', ...f.ag.map(g => `  { ${g.join(', ')} },`), '};',
+            `const LcbAlphaFont ${N}AA = { ${N}AlphaBitmaps, ${N}AlphaGlyphs, &${N} };`, ''];
+    }
+    const lcbAlphaTypes = () => ['#ifndef LCB_ALPHA_TYPES', '#define LCB_ALPHA_TYPES', 'struct LcbAlphaGlyph { uint16_t offset; uint8_t width, height; int8_t xOffset, yOffset; };',
+        'struct LcbAlphaFont { const uint8_t* bitmap; const LcbAlphaGlyph* glyph; const GFXfont* font; };', '#endif'];
     function fontHeader(f) {
         const N = f.n, bytes = b64(f.b), hex = (v, n = 2) => '0x' + v.toString(16).toUpperCase().padStart(n, '0'), rows = [];
         for (let k = 0; k < bytes.length; k += 16) rows.push('  ' + Array.from(bytes.slice(k, k + 16), v => hex(v)).join(', ') + ',');
@@ -1649,6 +2206,7 @@
             `const uint8_t ${N}Bitmaps[] PROGMEM = {`, ...rows, '};', '',
             `const GFXglyph ${N}Glyphs[] PROGMEM = {`, '  // offset, w, h, xAdvance, xOffset, yOffset', ...gl, '};', '',
             `const GFXfont ${N} PROGMEM = { (uint8_t *)${N}Bitmaps, (GFXglyph *)${N}Glyphs, ${hex(f.f)}, ${hex(f.l)}, ${f.y} };`, '',
+            ...(f.ab ? alphaFontLines(f) : []),
             ...cp1251Helper(), ''].join('\n');
     }
     const fontFile = document.getElementById('fontFile'), fontName = document.getElementById('fontName'), fontPt = document.getElementById('fontPt'), fontMsg = document.getElementById('fontMsg'), fontList = document.getElementById('fontList');
