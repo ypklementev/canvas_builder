@@ -30,7 +30,6 @@
 
     <main class="stage" id="stage">
       <div class="tabs" id="tabs" role="group" aria-label="Экраны"></div>
-      <div class="trbar" id="trBar" role="group" aria-label="Переход на экран" hidden></div>
       <div class="bezel">
         <canvas id="view"></canvas>
         <div class="empty-hint" id="emptyHint" hidden><span>Выбери инструмент слева или вставь код через „Загрузить из кода“</span></div>
@@ -55,17 +54,21 @@
           <div class="swatches" id="swatches"></div>
         </div>
         <div id="palette"></div>
-        <div class="row">
-          <span class="set">Фон</span>
-          <input type="color" id="inBg" aria-label="Цвет фона">
-          <input type="text" id="inBg565" style="width:84px" aria-label="Фон RGB565">
-          <select id="inBgPc" aria-label="Фон из палитры" hidden></select>
-        </div>
       </section>
 
       <section class="sec" id="inspector" data-sec="shape">
-        <h2>Фигура <span class="r" id="insBtns"></span></h2>
+        <h2><span id="insTitle">Фигура</span> <span class="r" id="insBtns"></span></h2>
         <div id="insBody"></div>
+        <!-- nothing selected: the settings of the current screen -->
+        <div class="scr-panel" id="scrPanel" hidden>
+          <div class="row">
+            <span class="set">Фон экрана</span>
+            <input type="color" id="inBg" aria-label="Цвет фона">
+            <input type="text" id="inBg565" style="width:84px" aria-label="Фон RGB565">
+            <select id="inBgPc" aria-label="Фон из палитры" hidden></select>
+          </div>
+          <div class="trbar" id="trBar" role="group" aria-label="Переход на этот экран" hidden></div>
+        </div>
       </section>
 
       <section class="sec" data-sec="layers">

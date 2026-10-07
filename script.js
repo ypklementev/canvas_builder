@@ -1402,12 +1402,15 @@
     const insBody = document.getElementById('insBody'), insBtns = document.getElementById('insBtns');
     const alignHtml = (attr, list, label, aria, dis) => `<div class="align" role="group" aria-label="${aria}"><span class="set">${label}</span>${list.map(([k, n, ic]) => `<button class="ab${k === 'c' ? ' wide' : ''}" ${attr}="${k}" title="${n}" aria-label="${n}"${dis && dis(k) ? ' disabled' : ''}><svg viewBox="0 0 20 20">${ic}</svg>${k === 'c' ? 'центр' : ''}</button>`).join('')}</div>`;
     const stepBtns = '<button class="btn" data-a="up" title="Выше (рисуется позже)">↑</button><button class="btn" data-a="down" title="Ниже (рисуется раньше)">↓</button>';
+    // nothing selected: the panel shows the current screen (background, the transition onto it); a selection: the shape(s)
+    const insTitle = document.getElementById('insTitle'), scrPanel = document.getElementById('scrPanel');
     function renderInspector() {
         const s = one();
+        scrPanel.hidden = S.sel.length > 0;
+        insTitle.textContent = !S.sel.length ? `Экран «${S.screens[S.cur].name}»` : s ? 'Фигура' : 'Выделение';
         if (!S.sel.length) {
             insBtns.innerHTML = '';
-            insBody.innerHTML = `<div class="empty">Ничего не выбрано. Новые фигуры: <b>${S.fill ? 'заливка' : 'контур'}</b>, цвет ${S.colorPc || fmt565(S.color)}.</div>
-      <div class="row" style="margin-top:8px"><span class="set">Радиус для новых скруглённых</span><input type="number" id="inRad" value="${S.radius}" style="width:60px"></div>`;
+            insBody.innerHTML = `<div class="empty">Ничего не выбрано — здесь настройки экрана. Новые фигуры: <b>${S.fill ? 'заливка' : 'контур'}</b>, цвет ${S.colorPc || fmt565(S.color)}, радиус скругления <input type="number" id="inRad" value="${S.radius}" style="width:52px" aria-label="Радиус для новых скруглённых">.</div>`;
             document.getElementById('inRad').onchange = e => { S.radius = Math.max(0, +e.target.value | 0); save(); };
             return;
         }
@@ -1447,9 +1450,14 @@
             + `<label title="Ось поворота: её можно тянуть на холсте">ось x<input type="number" data-k="ox" id="f-ox" value="${fieldVal(s, 'ox')}"></label><label>ось y<input type="number" data-k="oy" id="f-oy" value="${fieldVal(s, 'oy')}"></label></div>`
             + (on ? `<div class="row"><button class="btn" id="rotMid" title="Ось — в середину фигуры">ось в центр</button><button class="btn" id="rotOff" title="Убрать поворот вместе с его ключами">без поворота</button>${pt ? '<span class="msg">поворачивается как точка: двигается центр</span>' : rotOk(s) && s.t !== 'line' && s.t !== 'tri' ? '<span class="msg">ручки размера скрыты — размер в полях выше</span>' : ''}</div>` : '');
         if (s.t === 'chart') return rot;
-        return rot + `<div class="row"><label class="set" title="0 — не видно, 255 — непрозрачно; смешивается с тем, что уже нарисовано под фигурой">непрозрачность <input type="range" data-k="o" id="f-or" min="0" max="255" value="${o}"></label><input type="number" data-k="o" id="f-o" min="0" max="255" value="${o}" style="width:56px" aria-label="Непрозрачность 0…255"></div>`;
+        const body = rot + `<div class="row"><label class="set" title="0 — не видно, 255 — непрозрачно; смешивается с тем, что уже нарисовано под фигурой">непрозрачность <input type="range" data-k="o" id="f-or" min="0" max="255" value="${o}"></label><input type="number" data-k="o" id="f-o" min="0" max="255" value="${o}" style="width:56px" aria-label="Непрозрачность 0…255"></div>`;
+        // folded unless used (or opened before); the title says what is set
+        const used = rotOk(s) || o < 255, open = used || !!(S.ui && S.ui.xfOpen), what = [rotOk(s) ? `${s.rot}°` : '', o < 255 ? `непрозрачность ${o}` : ''].filter(Boolean).join(', ');
+        return `<details class="ins-more" id="xfMore"${open ? ' open' : ''}><summary>${canRot(s) ? 'Поворот и непрозрачность' : 'Непрозрачность'}<span class="spec">${what}</span></summary>${body}</details>`;
     }
     function bindXform(s) {
+        const more = document.getElementById('xfMore');
+        if (more) more.addEventListener('toggle', () => { const u = S.ui || (S.ui = {}); if (u.xfOpen !== more.open) { u.xfOpen = more.open; save(); } });
         const mid = document.getElementById('rotMid'), off = document.getElementById('rotOff');
         if (mid) mid.onclick = () => { const r = s.rot; delete s.rot; const [x, y] = pivotOf(s); s.rot = r; if (x === s.ox && y === s.oy) return; push(); s.ox = x; s.oy = y; update(); };
         if (off) off.onclick = () => { push(); for (const a of anims()) a.tracks = a.tracks.filter(tr => tr.id !== s.id || !['rot', 'ox', 'oy'].includes(tr.p)); delete s.rot; delete s.ox; delete s.oy; animBase = new Map(); update(); };
@@ -1753,7 +1761,7 @@
     function fxHtml(ss) {
         const list = FX.filter(f => ss.length && ss.every(s => animProps(s).length && f[3](s)));
         if (!list.length) return '';
-        return `<div class="row fx"><span class="set">Эффект</span><select id="fxSel" aria-label="Добавить готовый эффект"><option value="">— добавить —</option>${list.map(([k, n, t]) => `<option value="${k}" title="${t}">${n}</option>`).join('')}</select><span class="msg">станет новой анимацией с обычными ключами</span></div>`;
+        return `<div class="row fx"><span class="set">Эффект</span><select id="fxSel" aria-label="Добавить готовый эффект" title="Эффект станет новой анимацией с обычными ключами — их можно доправить на таймлайне"><option value="">— добавить —</option>${list.map(([k, n, t]) => `<option value="${k}" title="${t}">${n}</option>`).join('')}</select></div>`;
     }
     function bindFx() { const sel = document.getElementById('fxSel'); if (sel) sel.onchange = () => { const k = sel.value; sel.value = ''; if (k) applyFx(k, selShapes()); }; }
     // a bigger copy of the geometry around its middle (pulse)
@@ -3168,7 +3176,7 @@ void lcbTick(uint32_t now) {
     function renderTabs() {
         if (tabsEl.querySelector('input')) return; // rename in progress
         const html = S.screens.map((s, k) => `<button class="tab" data-k="${k}" aria-pressed="${k === S.cur}" title="Двойной клик — переименовать">${esc(s.name)}</button>`).join('')
-            + '<button class="tab-b" data-a="add" title="Новый экран" aria-label="Новый экран">+</button><button class="tab-b" data-a="dup" title="Дублировать экран" aria-label="Дублировать экран">⧉</button>'
+            + '<button class="tab-b" data-a="cfg" title="Настройки экрана: фон и переход на него" aria-label="Настройки экрана">⚙</button><button class="tab-b" data-a="add" title="Новый экран" aria-label="Новый экран">+</button><button class="tab-b" data-a="dup" title="Дублировать экран" aria-label="Дублировать экран">⧉</button>'
             + `<button class="tab-b" data-a="del" title="Удалить экран" aria-label="Удалить экран"${S.screens.length < 2 ? ' disabled' : ''}>×</button>`;
         if (html !== tabsHtml) tabsEl.innerHTML = tabsHtml = html;
     }
@@ -3177,6 +3185,7 @@ void lcbTick(uint32_t now) {
         const t = e.target.closest('[data-k]'), b = e.target.closest('[data-a]');
         if (t) { if (+t.dataset.k !== S.cur) switchScreen(+t.dataset.k); return; }
         if (!b || b.disabled) return; const a = b.dataset.a, names = S.screens.map(sc => sc.name);
+        if (a === 'cfg') { showScreenPanel(); return; }
         push();
         if (a === 'add') { const sc = blankScreen(uniqueName('Экран ' + (S.screens.length + 1), names)); sc.bg = S.bg; sc.bgPc = S.bgPc; S.screens.splice(S.cur + 1, 0, sc); S.cur++; }
         if (a === 'dup') {
@@ -3201,6 +3210,12 @@ void lcbTick(uint32_t now) {
         inp.addEventListener('keydown', ev => { ev.stopPropagation(); if (ev.key === 'Enter') fin(true); if (ev.key === 'Escape') fin(false); });
         inp.addEventListener('blur', () => fin(true));
     });
+    // ⚙: nothing selected → the panel shows this screen; its section is unfolded and scrolled into view
+    function showScreenPanel() {
+        S.sel = []; S.tool = 'select'; triPts = null; preview = null;
+        const u = S.ui || (S.ui = {}); u.folded = (u.folded || []).filter(id => id !== 'shape'); applyLayout();
+        update(); const sec = document.getElementById('inspector'); sec.scrollIntoView({ block: 'nearest' }); setArea(sec);
+    }
     function uniqueVar(base, ids) { let n = base, k = 2; while (ids.has(n)) n = base + k++; ids.add(n); return n; }
 
     // ---------- timeline: animations of the current screen ----------
@@ -3509,16 +3524,15 @@ void lcbTick(uint32_t now) {
         const sc = S.screens[S.cur], tr = trOf(sc), on = tr.type !== 'none', scr = plan(true).scr[S.cur] || 'SCR_' + upperId(sc.name);
         if (TV.from === S.cur || !S.screens[TV.from]) TV.from = S.cur ? S.cur - 1 : 1;
         let h;
-        if (S.mgr === false) h = `<span class="msg">Переходов нет: экраны переключает твой код (в «Коде» выключено «экраны через goTo()»).</span><button class="btn" id="trMgrOn">Включить goTo() и переходы</button>`;
+        if (S.mgr === false) h = `<div class="row"><span class="set">Переход сюда</span><span class="msg">нет: экраны переключает твой код (в «Коде» выключено «экраны через goTo()»)</span></div><div class="row"><button class="btn" id="trMgrOn">Включить goTo() и переходы</button></div>`;
         else {
-            h = `<span class="set" title="Так экран появляется, когда скетч вызывает ${scr === 'SCR_' ? 'goTo(…)' : `goTo(${scr})`}. «нет» — сразу, без анимации">Когда скетч вызывает <code>goTo(${esc(scr)})</code>, «${esc(sc.name)}» появляется:</span>`
-                + `<select id="trType" aria-label="Переход на этот экран">${TRANS.map(([v, l]) => `<option value="${v}"${v === tr.type ? ' selected' : ''}>${v === 'none' ? 'сразу, без перехода' : l}</option>`).join('')}</select>`
-                + (on ? `<label class="set">за <input type="number" id="trDur" min="1" max="60000" value="${tr.dur}" style="width:64px" aria-label="Длительность перехода, мс"> мс</label><select id="trEase" aria-label="Плавность перехода">${EASES.filter(x => x[0] !== 'step').map(([v, l]) => `<option value="${v}"${v === tr.ease ? ' selected' : ''}>${l}</option>`).join('')}</select>` : '')
-                + (tr.type === 'fade' ? `<label class="set">через цвет <input type="color" id="trC" value="${toHex(tr.c)}" aria-label="Цвет затухания"></label>${S.palette.length ? `<select id="trPc" aria-label="Цвет затухания из палитры"><option value="">${fmt565(tr.c)}</option>${S.palette.map(p => `<option${p.n === tr.pc ? ' selected' : ''}>${p.n}</option>`).join('')}</select>` : ''}` : '');
-            h += on ? `<span class="grow"></span><span class="trtry"><span class="set">Проверить:</span><label class="set">с экрана <select id="trFrom">${S.screens.map((x, k) => k === S.cur ? '' : `<option value="${k}"${k === TV.from ? ' selected' : ''}>${esc(x.name)}</option>`).join('')}</select></label>`
-                + `<button class="btn primary" id="trPlay" title="Проиграть переход на холсте (и на плате, если подключена)"></button>`
-                + `<input type="range" id="trT" min="0" max="${tr.dur}" value="0" aria-label="Момент перехода, мс" title="Тяни — любой момент перехода"><span class="spec" id="trTime"></span></span>`
-                : '<span class="msg">Выбери переход — тут же можно будет его проиграть.</span>';
+            h = `<div class="row"><span class="set" title="Так экран появляется, когда скетч вызывает goTo(${scr}). «сразу» — без анимации">Переход сюда</span><select id="trType" aria-label="Переход на этот экран">${TRANS.map(([v, l]) => `<option value="${v}"${v === tr.type ? ' selected' : ''}>${v === 'none' ? 'сразу, без перехода' : l}</option>`).join('')}</select></div>`
+                + (on ? `<div class="row"><label class="set">за <input type="number" id="trDur" min="1" max="60000" value="${tr.dur}" style="width:64px" aria-label="Длительность перехода, мс"> мс</label><select id="trEase" aria-label="Плавность перехода">${EASES.filter(x => x[0] !== 'step').map(([v, l]) => `<option value="${v}"${v === tr.ease ? ' selected' : ''}>${l}</option>`).join('')}</select>`
+                    + (tr.type === 'fade' ? `<label class="set">через <input type="color" id="trC" value="${toHex(tr.c)}" aria-label="Цвет затухания"></label>${S.palette.length ? `<select id="trPc" aria-label="Цвет затухания из палитры"><option value="">${fmt565(tr.c)}</option>${S.palette.map(p => `<option${p.n === tr.pc ? ' selected' : ''}>${p.n}</option>`).join('')}</select>` : ''}` : '') + '</div>' : '')
+                + `<div class="msg">Срабатывает, когда скетч вызывает <code>goTo(${esc(scr)})</code>.</div>`
+                + (on ? `<div class="row trtry"><label class="set">проверить с экрана <select id="trFrom">${S.screens.map((x, k) => k === S.cur ? '' : `<option value="${k}"${k === TV.from ? ' selected' : ''}>${esc(x.name)}</option>`).join('')}</select></label>`
+                    + `<button class="btn primary" id="trPlay" title="Проиграть переход на холсте (и на плате, если подключена)"></button>`
+                    + `<input type="range" id="trT" min="0" max="${tr.dur}" value="0" aria-label="Момент перехода, мс" title="Тяни — любой момент перехода"><span class="spec" id="trTime"></span></div>` : '');
         }
         if (h !== trHtml) trBar.innerHTML = trHtml = h;
         syncTrBar();
@@ -4138,7 +4152,7 @@ void loop() {
         sw.querySelectorAll('.sw').forEach(b => b.setAttribute('aria-pressed', +b.dataset.c === col));
         inBg.value = toHex(S.bg); if (document.activeElement !== inBg565) inBg565.value = fmt565(S.bg);
         document.getElementById('spec').textContent = `GFXcanvas16 · ${S.W}×${S.H} · RGB565`;
-        hintEl.textContent = HINTS[S.tool];
+        hintEl.textContent = HINTS[S.tool]; hintEl.title = HINTS[S.tool];
         save();
     }
     window.addEventListener('resize', () => { syncSettings(); applyLayout(); render(); renderTimeline(); });
