@@ -3074,7 +3074,7 @@ void lcbTick(uint32_t now) {
         const as = anims(), a = openAnim(), sc = S.screens[S.cur];
         const chips = as.map((x, k) => `<button class="tl-a" data-k="${k}" aria-pressed="${k === AN.k}" title="Двойной клик — переименовать">${esc(x.name)}<span class="tl-n">${x.tracks.length}</span></button>`).join('');
         let h = `<div class="tl-head"><span class="tl-title">Анимации</span>${chips}<button class="tab-b" data-a="add" title="Новая анимация экрана" aria-label="Новая анимация">+</button>`;
-        tlEl.toggleAttribute('data-folded', !!S.tlFolded && !!a);
+        tlEl.toggleAttribute('data-folded', !!S.tlFolded && !!a); document.getElementById('splitTl').hidden = !a;
         if (!a) { tlEl.dataset.empty = ''; h += '<span class="msg">У этого экрана анимаций нет. Нажми +, двигай фигуры с включённой записью ● — получатся ключевые кадры.</span></div>'; }
         else {
             delete tlEl.dataset.empty;
@@ -3097,7 +3097,7 @@ void lcbTick(uint32_t now) {
             for (const s of [...sc.shapes].reverse()) {
                 const trs = byShape.get(s.id); if (!trs) continue;
                 const fold = AN.fold.has(s.id), on = S.sel.some(i => S.shapes[i] === s), times = [...new Set(trs.flatMap(tr => tr.keys.map(k => k.t)))];
-                h += `<div class="tl-row tl-shape${on ? ' on' : ''}" data-id="${s.id}"><div class="tl-lbl"><button class="ly-tw" data-a="fold" aria-label="${fold ? 'Развернуть' : 'Свернуть'}">${fold ? '▸' : '▾'}</button><svg class="ly-ic" viewBox="0 0 24 24">${ICONS[s.t]}</svg><span class="tl-nm">${esc(s.name || '')}</span></div><div class="tl-lane" data-lane>${times.map(t => `<span class="kf-sum" style="left:${tlPos(t / a.dur)}"></span>`).join('')}</div></div>`;
+                h += `<div class="tl-row tl-shape${on ? ' on' : ''}" data-id="${s.id}"><div class="tl-lbl"><button class="ly-tw" data-a="fold" aria-label="${fold ? 'Развернуть' : 'Свернуть'}">${fold ? '▸' : '▾'}</button><svg class="ly-ic" viewBox="0 0 24 24">${ICONS[s.t]}</svg><span class="tl-nm">${esc(s.name || '')}</span></div><div class="tl-lane" data-lane>${times.map(t => `<span class="kf-sum${trs.every(tr => tr.keys.every(k => k.t !== t || sel.has(k))) ? ' on' : ''}" data-t="${t}" style="left:${tlPos(t / a.dur)}" title="${escA(`${s.name} · ${keyLabel(a, t)}: все ключи фигуры в этот момент`)}"></span>`).join('')}</div></div>`;
                 if (!fold) for (const tr of trs.sort((p, q) => animProps(s).indexOf(p.p) - animProps(s).indexOf(q.p))) h += `<div class="tl-row"><div class="tl-lbl tl-prop">${esc(propName(s, tr.p))}</div><div class="tl-lane" data-lane>${tr.keys.map(k => kf(k, tr)).join('')}</div></div>`;
             }
             if (!a.tracks.length) h += `<div class="tl-row"><div class="tl-lbl"></div><div class="msg tl-empty">Ключей пока нет. ${AN.rec ? 'Запись включена: поставь бегунок и измени фигуру — двигай, тяни ручки, меняй цвет.' : 'Включи ● запись и измени фигуру или нажми ◆ у свойства в панели фигуры.'}</div></div>`;
@@ -3112,7 +3112,7 @@ void lcbTick(uint32_t now) {
         if (!AN.sel.length) return '';
         const ks = AN.sel, k = ks[0], tr = trackOfKey(k), s = tr && S.shapes.find(x => x.id === tr.id); if (!tr || !s) return '';
         const eSel = ks.every(x => !STEP_P(trackOfKey(x).p)) ? `<label class="set">плавность до следующего <select id="kfE">${EASES.map(([v, l]) => `<option value="${v}"${ks.every(x => x.e === v) ? ' selected' : ''}>${l}</option>`).join('')}${ks.some(x => x.e !== k.e) ? '<option value="" selected>—</option>' : ''}</select></label>` : '';
-        if (ks.length > 1) return `<div class="tl-key"><span class="set">выбрано ключей: <b>${ks.length}</b></span>${eSel}<button class="btn danger" id="kfDel">Удалить</button><span class="msg">Shift+клик — добавить ключ, тяни — сдвинуть все, ⌘/Ctrl+C / V — копировать на бегунок.</span></div>`;
+        if (ks.length > 1) return `<div class="tl-key"><span class="set">выбрано ключей: <b>${ks.length}</b></span>${eSel}<button class="btn danger" id="kfDel">Удалить</button><span class="msg">Рамка или Shift+клик — выбрать ещё, тяни или ← → — сдвинуть все (Shift — по 100 мс), ⌘/Ctrl+C / V — копировать на бегунок, ⌘/Ctrl+A — все ключи.</span></div>`;
         let val;
         if (tr.p === 'vis') val = `<label class="set"><input type="checkbox" id="kfVis"${k.v ? ' checked' : ''}> видна</label>`;
         else if (tr.p === 'text') val = `<input type="text" id="kfText" value="${escA(k.v)}" style="width:160px" aria-label="Текст">`;
@@ -3241,29 +3241,51 @@ void lcbTick(uint32_t now) {
         }
         AN.sel = sel; update(); return true;
     }
-    // pointer: a key — select (Shift adds) and drag; a lane — move the playhead
+    // pointer: a key — select (Shift adds) and drag all selected; a shape's summary diamond — all its keys at that moment;
+    // the ruler — move the playhead; an empty lane — a frame selects the keys it touches (a plain click moves the playhead)
     let tlDrag = null;
+    const sumKeys = (a, el) => { const id = +el.closest('[data-id]').dataset.id, t = +el.dataset.t; return a.tracks.filter(tr => tr.id === id).flatMap(tr => tr.keys.filter(k => k.t === t)); };
+    const dragKeys = (e, a, k, lane) => { tlEl.setPointerCapture(e.pointerId); tlDrag = { mode: 'keys', r: lane.getBoundingClientRect(), k, x0: e.clientX, orig: new Map(AN.sel.map(x => [x, x.t])), snap: snapshot(), moved: false }; update(); };
     tlEl.addEventListener('pointerdown', e => {
         AN.focus = true; const a = openAnim(); if (!a || e.button !== 0) return;
-        const kf = e.target.closest('.kf'), lane = e.target.closest('[data-lane]');
+        const kf = e.target.closest('.kf'), sum = e.target.closest('.kf-sum'), lane = e.target.closest('[data-lane]');
         if (kf) {
             const tr = a.tracks[+kf.dataset.tr], k = tr.keys[+kf.dataset.kk];
             if (e.shiftKey) { AN.sel = AN.sel.includes(k) ? AN.sel.filter(x => x !== k) : [...AN.sel, k]; update(); return; }
             if (!AN.sel.includes(k)) AN.sel = [k];
-            tlEl.setPointerCapture(e.pointerId);
-            tlDrag = { mode: 'keys', r: kf.parentElement.getBoundingClientRect(), k, x0: e.clientX, orig: new Map(AN.sel.map(x => [x, x.t])), snap: snapshot(), moved: false };
-            update(); return;
+            dragKeys(e, a, k, kf.parentElement); return;
         }
-        if (lane) {
-            stopPlay(); tlEl.setPointerCapture(e.pointerId);
-            const keys = [...new Set(a.tracks.flatMap(tr => tr.keys.map(k => k.t)))];
-            tlDrag = { mode: 'scrub', r: lane.getBoundingClientRect(), keys }; if (!e.shiftKey) AN.sel = []; // the lanes are rebuilt while dragging: keep the rectangle
-            AN.t = laneT(e, tlDrag.r, a, keys); renderTimeline(); showFrame();
+        if (sum) {
+            const ks = sumKeys(a, sum); if (!ks.length) return;
+            const all = ks.every(k => AN.sel.includes(k));
+            if (e.shiftKey) { AN.sel = all ? AN.sel.filter(k => !ks.includes(k)) : [...new Set([...AN.sel, ...ks])]; update(); return; }
+            if (!all) AN.sel = ks;
+            dragKeys(e, a, ks[0], sum.parentElement); return;
         }
+        // a frame may start anywhere in the grid, also on the labels (but not on their buttons and names)
+        if (!lane && (!e.target.closest('#tlGrid') || e.target.closest('button, .tl-nm'))) return;
+        stopPlay(); tlEl.setPointerCapture(e.pointerId);
+        const keys = [...new Set(a.tracks.flatMap(tr => tr.keys.map(k => k.t)))], r = (lane || tlEl.querySelector('.tl-ruler [data-lane]')).getBoundingClientRect(); // the lanes are rebuilt while dragging: keep the rectangle
+        if (lane && lane.closest('.tl-ruler')) { tlDrag = { mode: 'scrub', r, keys }; if (!e.shiftKey) AN.sel = []; AN.t = laneT(e, r, a, keys); renderTimeline(); showFrame(); return; }
+        tlDrag = { mode: 'box', r, keys, x0: e.clientX, y0: e.clientY, e0: e, onLane: !!lane, base: e.shiftKey ? AN.sel.slice() : [], sel: null, el: null };
     });
+    // keys under the frame: diamonds of the property rows and the summary diamonds of the shape rows
+    function boxSelect(d, e) {
+        const a = openAnim(), grid = document.getElementById('tlGrid'); if (!a || !grid) return;
+        const L = Math.min(d.x0, e.clientX), R = Math.max(d.x0, e.clientX), T = Math.min(d.y0, e.clientY), B = Math.max(d.y0, e.clientY), g = grid.getBoundingClientRect();
+        if (!d.el) { d.el = document.createElement('div'); d.el.className = 'tl-box'; }
+        if (d.el.parentElement !== grid) grid.appendChild(d.el);
+        Object.assign(d.el.style, { left: L - g.left + 'px', top: T - g.top + 'px', width: R - L + 'px', height: B - T + 'px' });
+        const hit = el => { const b = el.getBoundingClientRect(); return b.right >= L && b.left <= R && b.bottom >= T && b.top <= B; }, sel = new Set(d.base);
+        tlEl.querySelectorAll('.kf').forEach(el => { if (hit(el)) sel.add(a.tracks[+el.dataset.tr].keys[+el.dataset.kk]); });
+        tlEl.querySelectorAll('.kf-sum').forEach(el => { if (hit(el)) sumKeys(a, el).forEach(k => sel.add(k)); });
+        d.sel = [...sel];
+        tlEl.querySelectorAll('.kf').forEach(el => el.setAttribute('aria-pressed', sel.has(a.tracks[+el.dataset.tr].keys[+el.dataset.kk])));
+    }
     tlEl.addEventListener('pointermove', e => {
         const a = openAnim(); if (!tlDrag || !a) return;
         if (tlDrag.mode === 'scrub') { AN.t = laneT(e, tlDrag.r, a, tlDrag.keys); showFrame(); return; }
+        if (tlDrag.mode === 'box') { if (tlDrag.sel || Math.hypot(e.clientX - tlDrag.x0, e.clientY - tlDrag.y0) >= 4) boxSelect(tlDrag, e); return; }
         const w = tlDrag.r.width - 2 * INSET; let dt = Math.round((e.clientX - tlDrag.x0) / w * a.dur);
         if (!tlDrag.moved && Math.abs(e.clientX - tlDrag.x0) < 3) return;
         if (!e.altKey) { const t = tlDrag.orig.get(tlDrag.k) + dt, near = Math.abs((t - AN.t) / a.dur * w) <= 5 ? AN.t : Math.round(t / 10) * 10; dt = near - tlDrag.orig.get(tlDrag.k); }
@@ -3274,11 +3296,22 @@ void lcbTick(uint32_t now) {
         showFrame(); renderTimeline();
     });
     const tlUp = () => {
-        if (!tlDrag) return; const d = tlDrag; tlDrag = null;
+        if (!tlDrag) return; const d = tlDrag, a = openAnim(); tlDrag = null;
         if (d.mode === 'keys' && d.moved) moveKeys(new Map([...d.orig.keys()].map(k => [k, k.t])));
+        if (d.mode === 'box') {
+            if (d.el) d.el.remove();
+            if (d.sel) AN.sel = d.sel;
+            else if (a) { if (!d.e0.shiftKey) AN.sel = []; if (d.onLane) AN.t = laneT(d.e0, d.r, a, d.keys); } // a click without a frame: the playhead goes there
+        }
         update();
     };
     tlEl.addEventListener('pointerup', tlUp); tlEl.addEventListener('pointercancel', tlUp);
+    // the timeline in focus: ← → move the selected keys by 10 ms (Shift — 100 ms), ⌘/Ctrl + A selects every key of the open animation
+    function nudgeKeys(dt) {
+        const a = openAnim(); if (!a || !AN.sel.length) return;
+        const lo = Math.min(...AN.sel.map(k => k.t)), hi = Math.max(...AN.sel.map(k => k.t)); dt = Math.max(-lo, Math.min(a.dur - hi, dt)); if (!dt) return;
+        push('knudge'); moveKeys(new Map(AN.sel.map(k => [k, k.t + dt]))); update();
+    }
     document.addEventListener('pointerdown', e => { if (!tlEl.contains(e.target)) AN.focus = false; }, true);
 
     // ---------- transitions in the editor: the same frames lcbTick() / lcbTransFrame() give on the board ----------
@@ -3854,6 +3887,8 @@ void loop() {
         if (AN.focus && AN.sel.length && !mod && (k === 'Delete' || k === 'Backspace')) { e.preventDefault(); delKeys(); return; }
         if (AN.focus && mod && !e.altKey && e.code === 'KeyC' && getSelection().isCollapsed && copyKeys()) { e.preventDefault(); return; }
         if (AN.focus && mod && !e.altKey && e.code === 'KeyV' && AN.clip) { e.preventDefault(); pasteKeys(); return; }
+        if (AN.focus && mod && e.code === 'KeyA' && openAnim()) { e.preventDefault(); AN.sel = openAnim().tracks.flatMap(tr => tr.keys); update(); return; }
+        if (AN.focus && !mod && (k === 'ArrowLeft' || k === 'ArrowRight' || k === 'ArrowUp' || k === 'ArrowDown')) { e.preventDefault(); if (k === 'ArrowLeft' || k === 'ArrowRight') nudgeKeys((k === 'ArrowLeft' ? -1 : 1) * (e.shiftKey ? 100 : 10)); return; }
         if (k === ' ' && !mod && openAnim()) { e.preventDefault(); togglePlay(); return; }
         // e.code, so shortcuts work with any keyboard layout
         if (mod && e.code === 'KeyZ') { e.preventDefault(); e.shiftKey ? redo() : undo(); return; }
@@ -3875,6 +3910,58 @@ void loop() {
         const arrows = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
         if (arrows[k] && S.sel.length) { e.preventDefault(); const n = e.shiftKey ? 10 : 1; push('nudge' + S.sel.join()); shiftSel(S.sel, arrows[k][0] * n, arrows[k][1] * n); update(); }
     });
+
+    // ---------- layout: resizable areas (the sizes are kept with the project in S.ui) and the area in focus ----------
+    const appEl = document.querySelector('.app'), splitSide = document.getElementById('splitSide'), splitTl = document.getElementById('splitTl'), sideOpen = document.getElementById('sideOpen');
+    const ui = () => S.ui || (S.ui = {});
+    const narrow = () => matchMedia('(max-width:980px)').matches;
+    function applyLayout() {
+        const u = ui(), folded = !!u.sideFolded && !narrow();
+        appEl.style.setProperty('--side-w', (folded ? 28 : u.sideW || 380) + 'px'); appEl.toggleAttribute('data-side-folded', folded); sideOpen.hidden = !folded;
+        if (u.tlH) tlEl.style.setProperty('--tl-h', u.tlH + 'px'); else tlEl.style.removeProperty('--tl-h');
+        for (const el of document.querySelectorAll('[data-resize]')) { const box = el.previousElementSibling, h = u[el.dataset.resize]; box.style.height = h ? h + 'px' : ''; box.style.maxHeight = h ? 'none' : ''; }
+        document.querySelectorAll('.side .sec[data-sec]').forEach(sec => sec.classList.toggle('folded', (u.folded || []).includes(sec.dataset.sec)));
+    }
+    // after a size change the canvas picks its scale again («авто») and the timeline its ruler
+    function relayout() { applyLayout(); render(); renderTimeline(); save(); }
+    let dragged = false;
+    function splitter(el, move, dbl) {
+        el.addEventListener('pointerdown', e => {
+            if (e.button) return; e.preventDefault(); el.setPointerCapture(e.pointerId); el.classList.add('drag');
+            const st = move.start(), mv = ev => { if (Math.abs(ev.clientX - e.clientX) + Math.abs(ev.clientY - e.clientY) > 2) dragged = true; move.to(st, ev.clientX - e.clientX, ev.clientY - e.clientY); relayout(); }; dragged = false;
+            const up = () => { el.classList.remove('drag'); el.removeEventListener('pointermove', mv); el.removeEventListener('pointerup', up); el.removeEventListener('pointercancel', up); relayout(); };
+            el.addEventListener('pointermove', mv); el.addEventListener('pointerup', up); el.addEventListener('pointercancel', up);
+        });
+        el.addEventListener('dblclick', () => { if (dragged) return; dbl(); relayout(); }); // a drag right after a click is not a double click
+    }
+    // the right panel: narrower than 220 px folds it into a strip with ‹
+    splitter(splitSide, {
+        start: () => ui().sideFolded ? 0 : document.querySelector('.side').getBoundingClientRect().width,
+        to: (w0, dx) => { const w = w0 - dx, u = ui(); u.sideFolded = w < 220; if (!u.sideFolded) u.sideW = Math.round(Math.max(280, Math.min(window.innerWidth * .6, w))); else if (w0) u.sideW = Math.round(w0); }, // folded: it opens at the width it had
+    }, () => { ui().sideFolded = !ui().sideFolded; });
+    sideOpen.addEventListener('click', () => { ui().sideFolded = false; relayout(); });
+    // the timeline: lower than 70 px folds it (as ▾ does)
+    splitter(splitTl, {
+        start: () => S.tlFolded ? 40 : tlEl.getBoundingClientRect().height,
+        to: (h0, dx, dy) => { const h = h0 - dy; S.tlFolded = h < 70; if (!S.tlFolded) ui().tlH = Math.round(Math.max(110, Math.min(window.innerHeight * .75, h))); },
+    }, () => { S.tlFolded = !S.tlFolded; });
+    // the layer list and the code: any height; a double click goes back to the usual one
+    for (const el of document.querySelectorAll('[data-resize]')) splitter(el, {
+        start: () => el.previousElementSibling.getBoundingClientRect().height,
+        to: (h0, dx, dy) => { ui()[el.dataset.resize] = Math.round(Math.max(60, Math.min(window.innerHeight * .85, h0 + dy))); },
+    }, () => { delete ui()[el.dataset.resize]; });
+    // a panel section folds by a click on its title (not on its buttons)
+    document.querySelectorAll('.side .sec[data-sec] > h2').forEach(h => h.insertAdjacentHTML('afterbegin', '<span class="caret" aria-hidden="true">▾</span>'));
+    document.querySelector('.side').addEventListener('click', e => {
+        const h = e.target.closest('.sec[data-sec] > h2'); if (!h || e.target.closest('.r, button, input, select, label')) return;
+        const u = ui(), id = h.parentElement.dataset.sec, f = new Set(u.folded || []); f.has(id) ? f.delete(id) : f.add(id); u.folded = [...f]; relayout();
+    });
+    // the area the keyboard works in: the canvas, the timeline or a panel section — the last one clicked, outlined
+    let areaEl = null;
+    function setArea(el) { if (el === areaEl) return; if (areaEl) areaEl.classList.remove('area-focus'); areaEl = el; if (el) el.classList.add('area-focus'); }
+    const areaOf = t => t.closest('.rail') ? stage : t.closest('.stage, .tl, .side .sec');
+    for (const ev of ['pointerdown', 'focusin']) document.addEventListener(ev, e => { if (e.target.closest && !e.target.closest('dialog')) { const a = areaOf(e.target); if (a) setArea(a); } }, true);
+    setArea(stage);
 
     // ---------- update ----------
     function update(fast) {
@@ -3898,7 +3985,7 @@ void loop() {
         hintEl.textContent = HINTS[S.tool];
         save();
     }
-    window.addEventListener('resize', () => { syncSettings(); render(); renderTimeline(); });
+    window.addEventListener('resize', () => { syncSettings(); applyLayout(); render(); renderTimeline(); });
     ensureIds(); S.screens.forEach((_, k) => withScreen(k, () => { ensureNames(); normalize(); }));
-    syncSettings(); update();
+    applyLayout(); syncSettings(); update();
 })();

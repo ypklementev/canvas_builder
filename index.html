@@ -42,9 +42,12 @@
     </main>
 
     <section class="tl" id="tl" aria-label="Анимации"></section>
+    <div class="split sv" id="splitSide" role="separator" aria-orientation="vertical" aria-label="Ширина правой панели" title="Тяни — ширина панели. Двойной клик — свернуть или развернуть"></div>
+    <div class="split sh" id="splitTl" role="separator" aria-orientation="horizontal" aria-label="Высота таймлайна" title="Тяни — высота таймлайна. Двойной клик — свернуть или развернуть"></div>
 
     <aside class="side">
-      <section class="sec">
+      <button class="side-open" id="sideOpen" title="Развернуть панель" aria-label="Развернуть правую панель" hidden>‹</button>
+      <section class="sec" data-sec="color">
         <h2>Цвет <span class="r"><span class="spec" id="hex565"></span></span></h2>
         <div class="row">
           <input type="color" id="inColor" aria-label="Цвет">
@@ -60,17 +63,18 @@
         </div>
       </section>
 
-      <section class="sec" id="inspector">
+      <section class="sec" id="inspector" data-sec="shape">
         <h2>Фигура <span class="r" id="insBtns"></span></h2>
         <div id="insBody"></div>
       </section>
 
-      <section class="sec">
+      <section class="sec" data-sec="layers">
         <h2>Слои</h2>
         <div class="layers" id="layers"></div>
+        <div class="split sh in" data-resize="layersH" role="separator" aria-orientation="horizontal" aria-label="Высота списка слоёв" title="Тяни — высота списка. Двойной клик — как было"></div>
       </section>
 
-      <section class="sec" id="liveSec">
+      <section class="sec" id="liveSec" data-sec="live">
         <h2>Плата
           <span class="r">
             <button class="btn" id="rxBtn" title="Скетч для платы, который принимает кадры из редактора">Скетч-приёмник</button>
@@ -81,7 +85,7 @@
         <div class="msg warn" id="liveWarn" hidden>Пока редактор подключён, порт занят: Arduino IDE не сможет прошить плату или открыть монитор порта. Сначала нажми «Отключить».</div>
       </section>
 
-      <section class="sec">
+      <section class="sec" data-sec="code">
         <h2>Код
           <span class="r">
             <span class="seg" id="codeMode">
@@ -95,6 +99,7 @@
           <label class="set" title="Массивы картинок идут в отдельный файл images.h, скетч его подключает"><input type="checkbox" id="optImgH"> картинки в images.h</label>
         </div>
         <div class="code" id="code" tabindex="0"></div>
+        <div class="split sh in" data-resize="codeH" role="separator" aria-orientation="horizontal" aria-label="Высота панели кода" title="Тяни — высота кода. Двойной клик — как было"></div>
         <div class="msg" id="copyMsg"></div>
       </section>
 
