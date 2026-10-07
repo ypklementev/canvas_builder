@@ -97,6 +97,7 @@
         <div class="row code-opts">
           <label class="set" title="Для переименованных элементов: constexpr int ИМЯ_X = …; и вызовы используют эти константы"><input type="checkbox" id="optConsts"> константы координат</label>
           <label class="set" title="Массивы картинок идут в отдельный файл images.h, скетч его подключает"><input type="checkbox" id="optImgH"> картинки в images.h</label>
+          <label class="set" id="optMgrL" title="Несколько экранов: enum Screen, goTo(SCR_…) с переходами и один lcbTick(millis()) в loop(). Выключи, если переключаешь экраны своим кодом: тогда каждый экран — функция drawИмя() (с анимациями — ещё tickИмя(now)), переходов нет" hidden><input type="checkbox" id="optMgr"> экраны через goTo()</label>
         </div>
         <div class="code" id="code" tabindex="0"></div>
         <div class="split sh in" data-resize="codeH" role="separator" aria-orientation="horizontal" aria-label="Высота панели кода" title="Тяни — высота кода. Двойной клик — как было"></div>

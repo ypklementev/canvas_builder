@@ -6,19 +6,20 @@
     // assets: {id: dataURL} of uploaded pictures, shape.src points here; not part of undo snapshots, so history stays small
     // shape.id: stable within its screen (animation tracks point at it); screen.anims: [{name, mode, dur, lo, hi, follow, tracks: [{id, p, keys: [{t, v, e, pc}]}]}]
     // screen.tr: the transition onto this screen {type, dur, ease, c, pc}
+    // chart: {t: 'chart', x, y, w, h, kind, var, data, lo, hi, auto, grid, gc, border, dots, gap, fc, cols, erase, ec, c}; S.mgr === false: no screen manager in the sketch
     // shape.rot: degrees around the pivot ox, oy (screen pixels); shape.o: opacity 0…254 (absent = 255); text.scroll: one clipped line moved by sx
     // sprite: {t: 'sprite', x, y, w, h, mode, scale, thr, inv, c, f, nw, nh, frames: [{d, src} | {d, shapes}]}; frame shapes are relative to the frame's top-left
     const START = [];
     const blankScreen = name => ({ name, shapes: [], groups: [], bg: 0x0000, bgPc: '', anims: [] });
     const S = { W: 172, H: 320, screens: [Object.assign(blankScreen('Main'), { shapes: START })], cur: 0, palette: [], assets: {}, nextG: 1, nextId: 1, sel: [], tool: 'select', fill: false, color: 0xFFFF, colorPc: '', radius: 8, zoom: 'auto', grid: true, codeMode: 'snippet', textFont: '', textSize: 2, coordConsts: false, imgHeader: false, fonts: [], tlFolded: false };
     for (const k of ['shapes', 'groups', 'bg', 'bgPc']) Object.defineProperty(S, k, { get: () => S.screens[S.cur][k], set: v => { S.screens[S.cur][k] = v; }, enumerable: false });
-    const KEY = 'lcd-canvas-builder-v6', OLD_KEYS = ['lcd-canvas-builder-v5', 'lcd-canvas-builder-v4', 'lcd-canvas-builder-v3', 'lcd-canvas-builder-v2', 'lcd-canvas-builder-v1'];
+    const KEY = 'lcd-canvas-builder-v7', OLD_KEYS = ['lcd-canvas-builder-v6', 'lcd-canvas-builder-v5', 'lcd-canvas-builder-v4', 'lcd-canvas-builder-v3', 'lcd-canvas-builder-v2', 'lcd-canvas-builder-v1'];
     try {
         let d = JSON.parse(localStorage.getItem(KEY) || 'null');
         if (!d) for (const k of OLD_KEYS) { const o = JSON.parse(localStorage.getItem(k) || 'null'); if (o && Array.isArray(o.screens)) { d = o; break; } if (o && Array.isArray(o.shapes)) { d = migrate(o); break; } }
         if (d && Array.isArray(d.screens) && d.screens.length) { delete d.sel; Object.assign(S, d); S.cur = Math.min(Math.max(0, S.cur | 0), S.screens.length - 1); }
     } catch (e) { }
-    // v5 → v6: screens get an optional default transition tr: {type, dur, ease, c, pc}; v4 → v5: only new optional fields (rot, ox, oy, o, scroll, sx) and the sprite type, so a v4 state loads as it is; the v4 key is left untouched
+    // v6 → v7: the chart type and the project option mgr (screens through goTo), both optional; v5 → v6: screens get an optional default transition tr: {type, dur, ease, c, pc}; v4 → v5: only new optional fields (rot, ox, oy, o, scroll, sx) and the sprite type, so a v4 state loads as it is; the v4 key is left untouched
     // v3 → v4: screens get an (empty) list of animations; shapes get ids from ensureIds() at start-up; the v3 key is left untouched
     for (const sc of S.screens) if (!Array.isArray(sc.anims)) sc.anims = [];
     if (!(S.nextId > 0)) S.nextId = 1;
@@ -264,6 +265,7 @@
                 for (const l of layoutText(s)) (aa ? drawStrAA : drawStr)(s.font, s.size, l.t, l.cx + (scrolls(s) ? s.sx | 0 : 0), l.cy);
                 break;
             case 'img': case 'sprite': s.q ? drawImgRot(s) : drawImg(s); break;
+            case 'chart': drawChart(s); break;
             case 'rect':
                 if (s.q) { const [a, b, c, d] = s.q; if (s.fill) { fillTriangle(...a, ...b, ...c); fillTriangle(...a, ...c, ...d); } else { line(...a, ...b); line(...b, ...c); line(...c, ...d); line(...d, ...a); } }
                 else s.fill ? fillRect(s.x, s.y, s.w, s.h) : drawRect(s.x, s.y, s.w, s.h);
@@ -448,6 +450,45 @@
         const l = varLayout(s); (aa ? drawStrAA : drawStr)(s.font, s.size, l.t, l.cx, l.cy);
     }
 
+    // ---------- charts: what the generated drawИмяChart() does on the board, with the sample data ----------
+    // line / area / bars over lo…hi (or the data's own range), a pie by the share of every value; grid lines, a frame, dots
+    const CHART_KINDS = [['line', 'линия'], ['area', 'область'], ['bar', 'столбцы'], ['pie', 'круговая']];
+    function chartRange(s, d) { let lo = s.lo | 0, hi = s.hi | 0; if (s.auto) { lo = Math.min(...d); hi = Math.max(...d); } if (hi <= lo) hi = lo + 1; return [lo, hi]; }
+    // a point of the pie: angle a from the top, clockwise
+    const piePt = (cx, cy, r, a) => [cx + ((r * isin(a) + 8192) >> 14), cy - ((r * isin(a + 90) + 8192) >> 14)];
+    function drawChart(s) {
+        const d = s.data || [], n = d.length, { x, y, w, h } = s; if (w < 2 || h < 2 || n < 2) return;
+        const keep = [curCol, cur565], set = c => { cur565 = c; curCol = toU32(c); };
+        if (s.erase !== 'none') { set(s.erase === 'color' ? s.ec : S.bg); fillRect(x, y, w, h); }
+        if (s.kind === 'pie') {
+            let total = 0; for (const v of d) if (v > 0) total += v;
+            const cx = x + Math.trunc((w - 1) / 2), cy = y + Math.trunc((h - 1) / 2), r = Math.trunc(Math.min(w, h) / 2) - 1, cols = s.cols && s.cols.length ? s.cols : [s.c]; let cum = 0;
+            if (total) for (let i = 0; i < n; i++) {
+                const a0 = Math.trunc(cum * 360 / total); cum += Math.max(0, d[i]); const a1 = Math.trunc(cum * 360 / total); set(cols[i % cols.length]);
+                for (let a = a0; a < a1;) { const b = Math.min(a + 5, a1); fillTriangle(cx, cy, ...piePt(cx, cy, r, a), ...piePt(cx, cy, r, b)); a = b; }
+            }
+        } else {
+            const [lo, hi] = chartRange(s, d), cl = v => Math.min(hi, Math.max(lo, v)), G = s.grid | 0;
+            set(s.gc);
+            for (let g = 1; g <= G; g++) hline(x, y + Math.trunc((h - 1) * g / (G + 1)), w);
+            if (s.border) drawRect(x, y, w, h);
+            const X = i => x + Math.trunc(i * (w - 1) / (n - 1)), Y = v => y + h - 1 - Math.trunc((cl(v) - lo) * (h - 1) / (hi - lo)), B = y + h - 1;
+            if (s.kind === 'bar') {
+                set(s.c);
+                for (let i = 0; i < n; i++) {
+                    const bx = x + Math.trunc(i * w / n), bw = Math.max(1, x + Math.trunc((i + 1) * w / n) - bx - (s.gap | 0)), bh = Math.trunc((cl(d[i]) - lo) * h / (hi - lo));
+                    if (bh > 0) fillRect(bx, y + h - bh, bw, bh);
+                }
+            } else {
+                if (s.kind === 'area') { set(s.fc); for (let i = 1; i < n; i++) { fillTriangle(X(i - 1), Y(d[i - 1]), X(i), Y(d[i]), X(i), B); fillTriangle(X(i - 1), Y(d[i - 1]), X(i), B, X(i - 1), B); } }
+                set(s.c);
+                for (let i = 1; i < n; i++) line(X(i - 1), Y(d[i - 1]), X(i), Y(d[i]));
+                if (s.dots) for (let i = 0; i < n; i++) fillCircle(X(i), Y(d[i]), 2);
+            }
+        }
+        [curCol, cur565] = keep;
+    }
+
     // ---------- pictures ----------
     // the source is decoded once; the w×h result (RGB565 + mask, or 1-bit) is cached; preview draws from those arrays like the library does
     const decoded = new Map(), processed = new Map();
@@ -559,6 +600,7 @@
         text: { name: 'Текст', f: [['x', 'x'], ['y', 'y'], ['w', 'w'], ['h', 'h']] },
         img: { name: 'Картинка', f: [['x', 'x'], ['y', 'y'], ['w', 'w'], ['h', 'h']] },
         sprite: { name: 'Спрайт', f: [['x', 'x'], ['y', 'y'], ['w', 'w'], ['h', 'h']] },
+        chart: { name: 'График', f: [['x', 'x'], ['y', 'y'], ['w', 'w'], ['h', 'h']] },
     };
     const isPic = s => s.t === 'img' || s.t === 'sprite';
     const colStr = s => s.pc && palEntry(s.pc) ? s.pc : fmt565(s.c);
@@ -585,7 +627,7 @@
     function shapeHandles(s) {
         const setR = (s, nx, ny) => { s.r = Math.round(Math.hypot(nx - s.x, ny - s.y)); };
         switch (s.t) {
-            case 'rect': case 'rrect': case 'text': case 'img': case 'sprite': return boxHandles(s);
+            case 'rect': case 'rrect': case 'text': case 'img': case 'sprite': case 'chart': return boxHandles(s);
             case 'circle': return [{ x: s.x + s.r, y: s.y, cur: 'ew-resize', set: setR }, { x: s.x - s.r, y: s.y, cur: 'ew-resize', set: setR }, { x: s.x, y: s.y - s.r, cur: 'ns-resize', set: setR }, { x: s.x, y: s.y + s.r, cur: 'ns-resize', set: setR }];
             case 'line': return [{ x: s.x0, y: s.y0, cur: 'move', pt: true, set: (s, a, b) => { s.x0 = a; s.y0 = b; } }, { x: s.x1, y: s.y1, cur: 'move', pt: true, set: (s, a, b) => { s.x1 = a; s.y1 = b; } }];
             case 'tri': return [0, 1, 2].map(i => ({ x: s['x' + i], y: s['y' + i], cur: 'move', pt: true, set: (s, a, b) => { s['x' + i] = a; s['y' + i] = b; } }));
@@ -597,7 +639,7 @@
         if (s.q) { const xs = s.q.map(p => p[0]), ys = s.q.map(p => p[1]), x = Math.min(...xs), y = Math.min(...ys); return [x, y, Math.max(...xs) - x + 1, Math.max(...ys) - y + 1]; }
         if (rotOk(s)) return bbox(turned(s));
         switch (s.t) {
-            case 'rect': case 'rrect': case 'text': case 'img': case 'sprite': return [Math.min(s.x, s.x + s.w), Math.min(s.y, s.y + s.h), Math.abs(s.w), Math.abs(s.h)];
+            case 'rect': case 'rrect': case 'text': case 'img': case 'sprite': case 'chart': return [Math.min(s.x, s.x + s.w), Math.min(s.y, s.y + s.h), Math.abs(s.w), Math.abs(s.h)];
             case 'circle': return [s.x - s.r, s.y - s.r, 2 * s.r + 1, 2 * s.r + 1];
             case 'pixel': return [s.x, s.y, 1, 1];
             default: {
@@ -655,7 +697,7 @@
     // a changing text isn't animated (its function draws whatever value it gets); text wraps inside its box and a picture's array has a fixed size, so their w/h stay
     // rotation (angle, pivot) once it is switched on; opacity always; a scrolling text — its shift sx; a sprite — its frame f (by steps)
     function animProps(s) {
-        if (s.t === 'text' && s.var) return [];
+        if ((s.t === 'text' && s.var) || s.t === 'chart') return [];
         const out = [...ANIM_F[s.t]];
         if (canRot(s)) out.push('rot', ...(s.rot != null ? ['ox', 'oy'] : []));
         if (gradOk(s)) for (const st of s.grad.stops) out.push('g' + st.id); else if (!isPic(s) || s.mode === 'icon') out.push('c');
@@ -1091,7 +1133,7 @@
     // locked shapes don't write the ID buffer, so clicks go through them
     function pick(x, y) {
         let box = -1;
-        for (let i = S.shapes.length - 1; i >= 0; i--) { const s = S.shapes[i]; if ((s.t !== 'text' && !isPic(s)) || hiddenAt(i) || lockedAt(i) || s.vis === 0) continue; const [bx, by, bw, bh] = bbox(s); if (x >= bx && y >= by && x < bx + bw && y < by + bh) { box = i; break; } }
+        for (let i = S.shapes.length - 1; i >= 0; i--) { const s = S.shapes[i]; if ((s.t !== 'text' && s.t !== 'chart' && !isPic(s)) || hiddenAt(i) || lockedAt(i) || s.vis === 0) continue; const [bx, by, bw, bh] = bbox(s); if (x >= bx && y >= by && x < bx + bw && y < by + bh) { box = i; break; } }
         for (let rad = 0; rad <= 3; rad++) {
             let best = -1;
             for (let dy = -rad; dy <= rad; dy++)for (let dx = -rad; dx <= rad; dx++) { const X = x + dx, Y = y + dy; if (X < 0 || Y < 0 || X >= S.W || Y >= S.H) continue; const v = idb[Y * S.W + X]; if (v > best) best = v; }
@@ -1116,8 +1158,14 @@
             case 'text': { const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y); return { t: 'text', x, y, w: Math.abs(b.x - a.x) + 1, h: Math.abs(b.y - a.y) + 1, text: 'Text', font: S.textFont, size: S.textSize, align: 'left', valign: 'top', c }; }
             case 'rect': case 'rrect': { let w = b.x - a.x, h = b.y - a.y; const s = { t, fill: f, x: Math.min(a.x, b.x), y: Math.min(a.y, b.y), w: Math.abs(w) + 1, h: Math.abs(h) + 1, c }; if (drag && drag.shift) { const m = Math.max(s.w, s.h); s.w = s.h = m; s.x = w < 0 ? a.x - m + 1 : a.x; s.y = h < 0 ? a.y - m + 1 : a.y; } if (t === 'rrect') s.r = S.radius; return s; }
             case 'circle': return { t, fill: f, x: a.x, y: a.y, r: Math.round(Math.hypot(b.x - a.x, b.y - a.y)), c };
+            case 'chart': return newChart(Math.min(a.x, b.x), Math.min(a.y, b.y), Math.abs(b.x - a.x) + 1, Math.abs(b.y - a.y) + 1, c);
             case 'line': { let x1 = b.x, y1 = b.y; if (drag && drag.shift) { if (Math.abs(x1 - a.x) > Math.abs(y1 - a.y)) y1 = a.y; else x1 = a.x; } return { t, x0: a.x, y0: a.y, x1, y1, c }; }
         }
+    }
+    // a new chart: a wave of 24 sample points over 0…100; its id (var) names the array and the functions in the sketch
+    function newChart(x, y, w, h, c) {
+        return { t: 'chart', x, y, w, h, c, kind: 'line', var: uniqueVar('chart', new Set(S.screens.flatMap(sc => sc.shapes.map(t => t.var)).filter(Boolean))), data: Array.from({ length: 24 }, (_, i) => Math.round(50 + 35 * Math.sin(i / 3))),
+            lo: 0, hi: 100, auto: false, grid: 3, gc: 0x4208, border: true, dots: false, gap: 1, fc: 0x0320, cols: [0xF800, 0xFD20, 0xFFE0, 0x07E0, 0x07FF, 0x001F, 0xF81F, 0x8410], erase: 'bg', ec: S.bg };
     }
     function addShape(s) { s.name = shapeName(s.t); if (S.colorPc) s.pc = S.colorPc; S.shapes.push(s); setSel([S.shapes.length - 1]); }
     view.addEventListener('pointerdown', e => {
@@ -1191,6 +1239,7 @@
                 if (S.tool === 'rect' || S.tool === 'rrect') s = Object.assign(s, { w: 40, h: 30 });
                 else if (S.tool === 'text') { const m = fontMetrics(s.font, s.size); s.w = Math.min(120, Math.max(20, S.W - s.x)); s.h = m.block(1); }
                 else if (S.tool === 'circle') s.r = 10;
+                else if (S.tool === 'chart') Object.assign(s, { w: Math.min(120, Math.max(20, S.W - s.x)), h: 60 });
                 else if (S.tool === 'line') { s.x1 = a.x + 30; }
             }
             push(); addShape(s); preview = null;
@@ -1217,6 +1266,7 @@
         text: '<path d="M5 6V4h14v2M12 4v16M9 20h6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>',
         img: '<rect x="3.5" y="5" width="17" height="14" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="9" cy="10" r="1.8" fill="currentColor"/><path d="M4.5 18l5-5 3 3 3-4 4.5 5.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>',
         sprite: '<rect x="4" y="3.5" width="16" height="17" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M8 3.5v17M16 3.5v17M4 8h4M4 12h4M4 16h4M16 8h4M16 12h4M16 16h4" fill="none" stroke="currentColor" stroke-width="1.4"/>',
+        chart: '<path d="M4 4v16h16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M7 15l4-5 3 3 5-6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" stroke-linecap="round"/>',
         group: '<path d="M3 6h6l2 2h10v11H3z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>',
     };
     const AL = 'fill="currentColor"';
@@ -1236,7 +1286,7 @@
         ['dh', 'Равные промежутки по горизонтали (от 3 фигур)', `<rect x="2" y="5" width="3" height="10" ${AL}/><rect x="8.5" y="3" width="3" height="14" ${AL}/><rect x="15" y="6" width="3" height="8" ${AL}/>`],
         ['dv', 'Равные промежутки по вертикали (от 3 фигур)', `<rect x="5" y="2" width="10" height="3" ${AL}/><rect x="3" y="8.5" width="14" height="3" ${AL}/><rect x="6" y="15" width="8" height="3" ${AL}/>`],
     ];
-    const TOOLS = [['select', 'Выбор и перемещение', 'V'], ['rect', 'Прямоугольник', 'R'], ['rrect', 'Скруглённый прямоугольник', 'O'], ['circle', 'Круг', 'C'], ['line', 'Линия', 'L'], ['tri', 'Треугольник', 'Y'], ['pixel', 'Пиксель', 'P'], ['text', 'Текст', 'T']];
+    const TOOLS = [['select', 'Выбор и перемещение', 'V'], ['rect', 'Прямоугольник', 'R'], ['rrect', 'Скруглённый прямоугольник', 'O'], ['circle', 'Круг', 'C'], ['line', 'Линия', 'L'], ['tri', 'Треугольник', 'Y'], ['pixel', 'Пиксель', 'P'], ['text', 'Текст', 'T'], ['chart', 'График или диаграмма', 'G']];
     const HINTS = {
         select: 'Клик — выбрать (фигуру в группе — вместе с группой, двойной клик — саму фигуру). Shift+клик — добавить к выделению, рамка по пустому месту — выделить несколько. Тяни — двигать, края и центры прилипают, с Ctrl/⌘ без привязки. Стрелки — 1 px, с Shift 10. Option (Alt) — расстояния.',
         rect: 'Тяни от угла до угла. Shift — квадрат. Просто клик ставит 40×30. Ctrl/⌘ — без привязки.',
@@ -1246,6 +1296,7 @@
         tri: 'Три клика — три вершины. Esc отменяет.',
         text: 'Тяни рамку текстового блока (или просто кликни). Текст переносится по словам внутри рамки. Двойной клик по блоку — редактировать текст.',
         pixel: 'Клик ставит один пиксель.',
+        chart: 'Тяни рамку графика (или просто кликни). Вид, данные и диапазон — в панели фигуры; в скетче — массив данных, pushИмя(v) и drawИмяChart().',
     };
     const rail = document.getElementById('rail');
     rail.innerHTML = TOOLS.map(([t, n, k]) => `<button class="tool" data-tool="${t}" title="${n} (${k})" aria-label="${n}"><svg viewBox="0 0 24 24">${ICONS[t]}</svg><kbd>${k}</kbd></button>`).join('')
@@ -1366,13 +1417,14 @@
         insBody.innerHTML = `<div class="row" style="justify-content:space-between"><span><span class="chip" style="background:${toHex(s.c)}"></span><b>${esc(s.name || m.name)}</b> <span class="spec">${[(s.name || '').startsWith(m.name) ? '' : m.name, s.pc].filter(Boolean).join(' · ')}</span></span>
     ${m.canFill ? `<span class="seg" id="insFill"><button data-f="0" aria-pressed="${!s.fill}">draw</button><button data-f="1" aria-pressed="${!!s.fill}">fill</button></span>` : ''}</div>
     <div class="fields" style="margin-top:10px">${m.f.map(([k, l]) => `<label>${l}<input type="number" data-k="${k}" id="f-${k}" value="${s[k]}"></label>`).join('')}</div>
-    ${xformInspector(s)}${paintInspector(s)}${s.t === 'text' ? textInspector(s) : ''}${isPic(s) ? imgInspector(s) : ''}${s.t === 'sprite' ? spriteInspector(s) : ''}${animInspector(s)}${fxHtml([s])}
+    ${xformInspector(s)}${paintInspector(s)}${s.t === 'text' ? textInspector(s) : ''}${isPic(s) ? imgInspector(s) : ''}${s.t === 'sprite' ? spriteInspector(s) : ''}${s.t === 'chart' ? chartInspector(s) : ''}${animInspector(s)}${fxHtml([s])}
     ${alignHtml('data-al', ALIGN, 'По экрану', 'Выравнивание по экрану')}`;
         bindFields(i);
         bindXform(s); bindPaintInspector(s, i); bindAnimInspector(s); bindFx();
         if (s.t === 'text') bindTextInspector(s, i);
         if (isPic(s)) bindImgInspector(s, i);
         if (s.t === 'sprite') bindSpriteInspector(s);
+        if (s.t === 'chart') bindChartInspector(s, i);
         const f = document.getElementById('insFill');
         if (f) f.onclick = e => { const b = e.target.closest('button'); if (!b) return; push(); s.fill = b.dataset.f === '1'; S.fill = s.fill; update(); };
     }
@@ -1394,6 +1446,7 @@
         const rot = !canRot(s) ? '' : `<div class="fields xf" style="margin-top:8px"><label title="Градусы, по часовой стрелке">поворот°<input type="number" data-k="rot" id="f-rot" value="${fieldVal(s, 'rot')}"></label>`
             + `<label title="Ось поворота: её можно тянуть на холсте">ось x<input type="number" data-k="ox" id="f-ox" value="${fieldVal(s, 'ox')}"></label><label>ось y<input type="number" data-k="oy" id="f-oy" value="${fieldVal(s, 'oy')}"></label></div>`
             + (on ? `<div class="row"><button class="btn" id="rotMid" title="Ось — в середину фигуры">ось в центр</button><button class="btn" id="rotOff" title="Убрать поворот вместе с его ключами">без поворота</button>${pt ? '<span class="msg">поворачивается как точка: двигается центр</span>' : rotOk(s) && s.t !== 'line' && s.t !== 'tri' ? '<span class="msg">ручки размера скрыты — размер в полях выше</span>' : ''}</div>` : '');
+        if (s.t === 'chart') return rot;
         return rot + `<div class="row"><label class="set" title="0 — не видно, 255 — непрозрачно; смешивается с тем, что уже нарисовано под фигурой">непрозрачность <input type="range" data-k="o" id="f-or" min="0" max="255" value="${o}"></label><input type="number" data-k="o" id="f-o" min="0" max="255" value="${o}" style="width:56px" aria-label="Непрозрачность 0…255"></div>`;
     }
     function bindXform(s) {
@@ -1496,7 +1549,7 @@
     function animInspector(s) {
         const a = openAnim(); if (!a) return '';
         const ps = animProps(s);
-        if (!ps.length) return '<div class="msg anim-ins">Меняющийся текст не анимируется: его функция рисует то значение, которое ей передали.</div>';
+        if (!ps.length) return `<div class="msg anim-ins">${s.t === 'chart' ? 'График не анимируется ключами: он меняется вместе с данными в скетче.' : 'Меняющийся текст не анимируется: его функция рисует то значение, которое ей передали.'}</div>`;
         const btn = p => {
             const o = trackOf(s.id, p), st = !o ? 'no' : o.a !== a ? 'other' : o.tr.keys.some(k => k.t === AN.t) ? 'on' : 'tr';
             const tip = st === 'other' ? `Анимируется в «${o.a.name}»` : st === 'on' ? 'Убрать ключ на бегунке' : 'Поставить ключ на бегунке с текущим значением';
@@ -1542,6 +1595,55 @@
         const inv = document.getElementById('imgInv');
         if (inv) inv.onchange = () => { push(); s.inv = inv.checked; update(); };
         document.getElementById('imgRatio').onclick = () => { if (!s.nw || !s.nh) return; push(); s.h = Math.max(1, Math.round(s.w * s.nh / s.nw)); update(); };
+    }
+
+    // ---------- charts in the panel ----------
+    const chartNames = s => { const P = plan(true).shapes.get(s) || {}; const id = s.var[0].toUpperCase() + s.var.slice(1); return { arr: P.arr || s.var + 'Data', push: P.push || 'push' + id, fn: P.fn || 'draw' + id + 'Chart' }; };
+    function chartInspector(s) {
+        const N = chartNames(s), pie = s.kind === 'pie', line = s.kind === 'line' || s.kind === 'area';
+        const seg = (id, key, items) => `<span class="seg" id="${id}">${items.map(([v, l, t]) => `<button data-v="${v}"${t ? ` title="${t}"` : ''} aria-pressed="${s[key] === v}">${l}</button>`).join('')}</span>`;
+        const chk = (k, l, t) => `<label class="set"${t ? ` title="${t}"` : ''}><input type="checkbox" data-ck="${k}"${s[k] ? ' checked' : ''}> ${l}</label>`;
+        const num = (k, l, w, t) => `<label class="set"${t ? ` title="${t}"` : ''}>${l} <input type="number" data-cn="${k}" value="${k === 'n' ? s.data.length : s[k] | 0}" style="width:${w}px"></label>`;
+        const col = (k, l) => `<label class="set">${l} <input type="color" data-cc="${k}" value="${toHex(s[k])}"></label>`;
+        return `<div class="txt chart">
+    <div class="row">${seg('chKind', 'kind', CHART_KINDS.map(([v, l]) => [v, l]))}</div>
+    <div class="row"><label class="set" title="Имя в скетче: массив данных и функции графика">id <input type="text" id="chId" value="${escA(s.var)}" style="width:96px" spellcheck="false"></label><span class="spec">${N.arr}[${s.data.length}] · ${N.push}(v) · ${N.fn}()</span></div>
+    <div class="row">${num('n', 'точек', 52, 'Сколько значений хранит массив (2…120). pushИмя(v) сдвигает их влево и добавляет новое справа')}<span class="msg">${pie ? 'каждое значение — доля круга' : 'пример данных для превью — в скетче их заменит твой код'}</span></div>
+    <textarea id="chData" spellcheck="false" rows="2" aria-label="Пример данных: целые числа через запятую">${s.data.join(', ')}</textarea>
+    ${pie ? `<div class="row chart-cols"><span class="set">цвета долей</span>${s.cols.map((c, k) => `<input type="color" data-pc="${k}" value="${toHex(c)}" aria-label="Цвет доли ${k + 1}">`).join('')}${s.cols.length < 8 ? '<button class="btn" id="chColAdd" title="Ещё цвет">+</button>' : ''}${s.cols.length > 1 ? '<button class="btn" id="chColDel" title="Убрать последний цвет">−</button>' : ''}</div><div class="msg">Основной цвет фигуры не используется: доли берут цвета по кругу.</div>`
+                : `<div class="row">${chk('auto', 'диапазон по данным', 'Минимум и максимум считаются на плате по текущим данным')}${s.auto ? '' : num('lo', 'от', 60) + num('hi', 'до', 60)}</div>
+    <div class="row">${num('grid', 'линий сетки', 44)}${col('gc', 'цвет сетки')}${chk('border', 'рамка')}</div>
+    <div class="row">${line ? chk('dots', 'точки') : num('gap', 'зазор', 44, 'Промежуток между столбцами, px')}${s.kind === 'area' ? col('fc', 'заливка') : ''}<span class="msg">${line ? 'линия' : 'столбцы'} — основным цветом</span></div>`}
+    <div class="row"><span class="set">Стирать</span>${seg('chErase', 'erase', [['bg', 'фоном экрана', 'Перед рисованием залить рамку фоном экрана'], ['color', 'своим цветом', 'Залить рамку своим цветом'], ['none', 'не стирать', 'Рисовать поверх: годится, если экран и так перерисовывается целиком']])}${s.erase === 'color' ? `<input type="color" data-cc="ec" value="${toHex(s.ec)}" aria-label="Цвет фона графика">` : ''}</div>
+  </div>`;
+    }
+    function bindChartInspector(s, i) {
+        const box = insBody.querySelector('.chart'); if (!box) return;
+        const seg = (id, key) => { const el = document.getElementById(id); if (el) el.onclick = e => { const b = e.target.closest('button'); if (!b || s[key] === b.dataset.v) return; push(); s[key] = b.dataset.v; if (key === 'erase' && s.ec == null) s.ec = S.bg; update(); }; };
+        seg('chKind', 'kind'); seg('chErase', 'erase');
+        box.addEventListener('change', e => {
+            const t = e.target;
+            if (t.dataset.ck) { push(); s[t.dataset.ck] = t.checked; update(); }
+            if (t.dataset.cn) {
+                const v = Math.round(+t.value); if (t.value === '' || isNaN(v)) { update(); return; } push();
+                if (t.dataset.cn === 'n') { const n = Math.max(2, Math.min(120, v)); s.data = s.data.length >= n ? s.data.slice(s.data.length - n) : [...Array(n - s.data.length).fill(s.data[0] | 0), ...s.data]; }
+                else if (t.dataset.cn === 'grid') s.grid = Math.max(0, Math.min(20, v));
+                else if (t.dataset.cn === 'gap') s.gap = Math.max(0, Math.min(50, v));
+                else s[t.dataset.cn] = Math.max(-32768, Math.min(32767, v));
+                update();
+            }
+            if (t.id === 'chId') { const v = lead(t.value.trim().replace(/[^A-Za-z0-9_]/g, '_')); if (v && v !== s.var) { push(); s.var = v; } update(); }
+            if (t.id === 'chData') { const vals = (t.value.match(/-?\d+/g) || []).map(v => Math.max(-32768, Math.min(32767, +v))).slice(0, 120); if (vals.length >= 2) { push(); s.data = vals; } update(); }
+        });
+        box.addEventListener('input', e => {
+            const t = e.target;
+            if (t.dataset.cc) { push('chc' + i + t.dataset.cc); s[t.dataset.cc] = to565(t.value); update(true); }
+            if (t.dataset.pc) { push('chp' + i + t.dataset.pc); s.cols[+t.dataset.pc] = to565(t.value); update(true); }
+        });
+        box.addEventListener('click', e => {
+            if (e.target.closest('#chColAdd')) { push(); s.cols.push(SWATCHES[(s.cols.length + 4) % SWATCHES.length]); update(); }
+            if (e.target.closest('#chColDel')) { push(); s.cols.pop(); update(); }
+        });
     }
 
     // ---------- sprites: frames of pictures or of shapes; the frame number is the animated property f ----------
@@ -1876,13 +1978,15 @@
     function plan(anim) {
         const used = new Set(['W', 'H', 'canvas', 'lcd', 'present', 'setup', 'loop', 'lcbNow', 'goTo', 'lcbTick', 'Screen', ...S.palette.map(p => p.n)]);
         const take = (base, sep = '_') => { let n = base, k = 2; while (used.has(n)) n = base + sep + k++; used.add(n); return n; };
-        const P = { fns: S.screens.map(sc => take('draw' + pascalId(sc.name), '')), shapes: new Map(), vis: [], mgr: !!anim && S.screens.length > 1 };
+        const P = { fns: S.screens.map(sc => take('draw' + pascalId(sc.name), '')), shapes: new Map(), vis: [], mgr: !!anim && S.screens.length > 1 && S.mgr !== false };
         P.scr = P.mgr ? S.screens.map(sc => take('SCR_' + upperId(sc.name))) : [];
         S.screens.forEach((sc, k) => withScreen(k, () => { // frames of shapes are drawn on their own screen's background
             const vis = S.shapes.filter((_, i) => !hiddenAt(i)); P.vis.push(vis);
             for (const s of vis) {
                 const e = {};
-                if (S.coordConsts && customName(s)) e.pre = take(upperId(s.name));
+                if (S.coordConsts && customName(s) && s.t !== 'chart') e.pre = take(upperId(s.name));
+                // a chart: its data array, push<Id>(v) and draw<Id>Chart()
+                if (s.t === 'chart') { const id = s.var[0].toUpperCase() + s.var.slice(1); e.arr = take(s.var + 'Data'); e.push = take('push' + id, ''); e.fn = take('draw' + id + 'Chart', ''); }
                 if (s.t === 'img') { e.arr = take(snakeId(s.name)); const d = imgData(s); if (d && d.mask && s.mode !== 'icon') e.mask = take(e.arr + '_mask'); }
                 // a sprite: one array per frame (sprite_1, sprite_2, …) and, in colour with holes, a mask for each
                 if (s.t === 'sprite') { e.arr = take(snakeId(s.name)); e.frames = s.frames.map((_, n) => take(`${e.arr}_${n + 1}`)); if (spriteMasked(s)) e.masks = e.frames.map(n => take(n + '_mask')); }
@@ -2006,6 +2110,7 @@
     }
     function shapeCode(s, e, st) {
         // the function sets font, size and colour itself, so the next static text must set them again
+        if (s.t === 'chart') return [`${e.fn}();`];
         if (s.t === 'text' && s.var) { st.font = st.size = undefined; st.color = null; return [e.val ? `${e.fn}(${e.val}.c_str());` : `${e.fn}("${cstr(varText(s))}");`]; }
         const lines = s.t === 'text' ? textCode(s, st, e) : isPic(s) ? picCode(s, e) : rotOn(s, e) ? rotCode(s, e) : usesLcb(s, e) ? lcbWrap(s, e, P => [lcbCall(s, e, P)]) : [codeLine(s, e)];
         // see-through: lcbOpacity() for the shape's pixels, then back to opaque
@@ -2541,6 +2646,40 @@ inline uint32_t lcbTime(const LcbAnim& a) {
         return out;
     }
 
+    // ---------- charts in the sketch (C++ twin of drawChart above) ----------
+    function chartLines(s, e, bg, mgr) {
+        const n = s.data.length, d = e.arr, c = colStr(s), pie = s.kind === 'pie', G = s.grid | 0, gc = fmt565(s.gc);
+        const L = [`// график «${s.var}»${customName(s) ? ' — ' + s.name : ''}: ${CHART_KINDS.find(k => k[0] === s.kind)[1]}, ${n} ${n % 10 === 1 && n % 100 !== 11 ? 'точка' : n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 10 || n % 100 >= 20) ? 'точки' : 'точек'}${pie ? '' : s.auto ? ', диапазон по данным' : `, ${s.lo | 0}…${s.hi | 0}`}`,
+            `int16_t ${d}[${n}] = { ${s.data.join(', ')} };   // данные: меняй их или добавляй через ${e.push}(v)`,
+            `// новое значение справа, старые сдвигаются влево${mgr ? ' (экран перерисуется в lcbTick)' : `; потом ${e.fn}(); present();`}`,
+            `void ${e.push}(int16_t v) {`, `  memmove(${d}, ${d} + 1, sizeof(${d}) - sizeof(${d}[0]));`, `  ${d}[${n - 1}] = v;`, ...(mgr ? ['  lcbDirty = true;'] : []), '}',
+            `void ${e.fn}() {`, `  const int16_t x = ${s.x}, y = ${s.y}, w = ${s.w}, h = ${s.h}, n = ${n};`,
+            ...(s.erase !== 'none' ? [`  canvas.fillRect(x, y, w, h, ${s.erase === 'color' ? fmt565(s.ec) : bg});  // стереть область`] : [])];
+        if (pie) L.push(`  static const uint16_t cols[] = { ${s.cols.map(fmt565).join(', ')} };`,
+            '  int32_t total = 0;', `  for (int i = 0; i < n; i++) if (${d}[i] > 0) total += ${d}[i];`, '  if (!total) return;',
+            '  const int16_t cx = x + (w - 1) / 2, cy = y + (h - 1) / 2, r = (w < h ? w : h) / 2 - 1;', '  int32_t cum = 0;',
+            '  for (int i = 0; i < n; i++) {', `    int32_t a = cum * 360 / total; cum += ${d}[i] > 0 ? ${d}[i] : 0; int32_t a1 = cum * 360 / total;`,
+            '    while (a < a1) {   // доля — веер треугольников по 5°, углы от верха по часовой', '      int32_t b = a + 5 < a1 ? a + 5 : a1;',
+            `      canvas.fillTriangle(cx, cy, cx + ((r * lcbSin(a) + 8192) >> 14), cy - ((r * lcbSin(a + 90) + 8192) >> 14), cx + ((r * lcbSin(b) + 8192) >> 14), cy - ((r * lcbSin(b + 90) + 8192) >> 14), cols[i % ${s.cols.length}]);`,
+            '      a = b;', '    }', '  }');
+        else {
+            L.push(...(s.auto ? [`  int32_t lo = ${d}[0], hi = ${d}[0];`, `  for (int i = 1; i < n; i++) { if (${d}[i] < lo) lo = ${d}[i]; if (${d}[i] > hi) hi = ${d}[i]; }`] : [`  int32_t lo = ${s.lo | 0}, hi = ${s.hi | 0};`]),
+                '  if (hi <= lo) hi = lo + 1;', ...(G ? [`  for (int g = 1; g <= ${G}; g++) canvas.drawFastHLine(x, y + (h - 1) * g / ${G + 1}, w, ${gc});`] : []),
+                ...(s.border ? [`  canvas.drawRect(x, y, w, h, ${gc});`] : []), '  auto V = [&](int32_t v) { return v < lo ? lo : v > hi ? hi : v; };');
+            if (s.kind === 'bar') L.push('  for (int i = 0; i < n; i++) {', `    int16_t bx = x + i * w / n, bw = x + (i + 1) * w / n - bx - ${s.gap | 0}, bh = (V(${d}[i]) - lo) * h / (hi - lo);`,
+                '    if (bw < 1) bw = 1;', `    if (bh > 0) canvas.fillRect(bx, y + h - bh, bw, bh, ${c});`, '  }');
+            else {
+                L.push('  auto X = [&](int i) { return (int16_t)(x + i * (w - 1) / (n - 1)); };', '  auto Y = [&](int32_t v) { return (int16_t)(y + h - 1 - (V(v) - lo) * (h - 1) / (hi - lo)); };');
+                if (s.kind === 'area') L.push('  for (int i = 1; i < n; i++) {   // заливка под линией', `    canvas.fillTriangle(X(i - 1), Y(${d}[i - 1]), X(i), Y(${d}[i]), X(i), y + h - 1, ${fmt565(s.fc)});`,
+                    `    canvas.fillTriangle(X(i - 1), Y(${d}[i - 1]), X(i), y + h - 1, X(i - 1), y + h - 1, ${fmt565(s.fc)});`, '  }');
+                L.push(`  for (int i = 1; i < n; i++) canvas.drawLine(X(i - 1), Y(${d}[i - 1]), X(i), Y(${d}[i]), ${c});`);
+                if (s.dots) L.push(`  for (int i = 0; i < n; i++) canvas.fillCircle(X(i), Y(${d}[i]), 2, ${c});`);
+            }
+        }
+        L.push('}');
+        return L;
+    }
+
     // ---------- screens and transitions in the sketch (C++ twin of transPixels below) ----------
     const TRANS = [['none', 'мгновенно', 'LCB_T_NONE'], ['slide-left', 'сдвиг влево', 'LCB_T_SLIDE_LEFT'], ['slide-right', 'сдвиг вправо', 'LCB_T_SLIDE_RIGHT'], ['slide-up', 'сдвиг вверх', 'LCB_T_SLIDE_UP'], ['slide-down', 'сдвиг вниз', 'LCB_T_SLIDE_DOWN'],
         ['wipe-left', 'шторка влево', 'LCB_T_WIPE_LEFT'], ['wipe-right', 'шторка вправо', 'LCB_T_WIPE_RIGHT'], ['wipe-up', 'шторка вверх', 'LCB_T_WIPE_UP'], ['wipe-down', 'шторка вниз', 'LCB_T_WIPE_DOWN'], ['fade', 'затухание через цвет', 'LCB_T_FADE']];
@@ -2553,7 +2692,7 @@ inline uint32_t lcbTime(const LcbAnim& a) {
     function mgrTypes(P) {
         return ['// ---------- экраны и переходы: типы ----------', `enum : uint8_t { ${TRANS.map(x => x[2]).join(', ')} };`,
             'struct LcbTrans { uint8_t type, ease; uint32_t dur; uint16_t color; };   // переход: вид, плавность, длительность (мс), цвет затухания',
-            `enum Screen : uint8_t { ${P.scr.join(', ')} };`];
+            `enum Screen : uint8_t { ${P.scr.join(', ')} };`, 'bool lcbDirty = true;   // текущий экран надо перерисовать в lcbTick'];
     }
     function mgrLines(P) {
         return `// ---------- LCD Canvas Builder: экраны и переходы ----------
@@ -2570,7 +2709,6 @@ ${S.screens.map((sc, k) => { const tr = trOf(sc); return `  { ${TRANS.find(x => 
 Screen lcbScr = ${P.scr[0]}, lcbFrom = ${P.scr[0]};   // текущий экран и тот, с которого идёт переход
 LcbTrans lcbTr = { LCB_T_NONE, LCB_E_INOUT, 0, 0 };
 uint32_t lcbTrT0 = 0;
-bool lcbDirty = true;           // экран надо перерисовать
 uint16_t* lcbPrev = nullptr;    // кадр, с которого начался сдвиг или шторка
 
 // перерисовать текущий экран в следующем lcbTick (например, после нового значения меняющегося текста)
@@ -2662,6 +2800,7 @@ void lcbTick(uint32_t now) {
             const cur = P.vis[S.cur], notes = [], E = s => P.shapes.get(s);
             if (cur.some(isPic)) notes.push(L(`// массивы картинок — в режиме «весь скетч»${header ? ' (images.h)' : ''}`));
             if (cur.some(s => s.t === 'text' && s.var)) notes.push(L('// функции меняющегося текста — в режиме «весь скетч»'));
+            if (cur.some(s => s.t === 'chart')) notes.push(L('// данные и функции графиков — в режиме «весь скетч»'));
             if (cur.some(s => usesLcb(s, E(s)))) notes.push(L(`// функции lcb… (градиенты и сглаживание${cur.some(s => opaOn(s, E(s)) || scrolls(s)) ? ', непрозрачность, бегущая строка' : ''}) — в режиме «весь скетч»`));
             if (cur.some(s => rotOn(s, E(s)))) notes.push(L('// поворот: LcbPt и lcbRot… — в режиме «весь скетч»'));
             if (S.screens[S.cur].anims.some(a => a.tracks.length)) notes.push(L('// анимации — в режиме «весь скетч»; здесь — кадр, на котором стоит бегунок'));
@@ -2669,7 +2808,8 @@ void lcbTick(uint32_t now) {
             return pre.length ? [...pre, L(''), ...body] : body;
         }
         const fonts = [...new Set(all.filter(o => o.s.t === 'text' && o.s.font).map(o => o.s.font))], consts = all.flatMap(o => constLines([o.s], P)).map(L);
-        const paint = all.some(o => usesLcb(o.s, o.e)), rot = all.some(o => rotOn(o.s, o.e)), anim = P.mgr || P.ticks.some(Boolean), lib = t => ({ t, i: -1, lib: true });
+        const charts = all.filter(o => o.s.t === 'chart');
+        const paint = all.some(o => usesLcb(o.s, o.e)), rot = all.some(o => rotOn(o.s, o.e)) || charts.some(o => o.s.kind === 'pie'), anim = P.mgr || P.ticks.some(Boolean), lib = t => ({ t, i: -1, lib: true });
         const out = [
             L('#include <Waveshare_LCD147.h>'), L('#include <Adafruit_GFX.h>'), ...fonts.map(f => L(FONT_DATA[f] && FONT_DATA[f].custom ? `#include "${f}.h"  // шрифт проекта, файл — в разделе «Шрифты»` : `#include <Fonts/${f}.h>`)), ...(header ? [L('#include "images.h"')] : []), L(''),
             L(`constexpr int W = ${S.W};   // ширина экрана`), L(`constexpr int H = ${S.H};   // высота экрана`), L(''),
@@ -2685,6 +2825,7 @@ void lcbTick(uint32_t now) {
             ...(anim ? [...lcbAnimLib().map(lib), L('')] : []),
             L('// Показать холст на экране'), L('void present() {'), L('  lcd->drawImage(0, 0, W, H, canvas.getBuffer());'), L('}'), L(''),
             ...vars.flatMap(o => [...(o.e.val ? [L(`String ${o.e.val} = "${cstr(varText(o.s))}";  // значение «${o.s.var}»: ${P.mgr ? 'экран перерисовывается целиком, когда его показывают' : 'экран с анимацией перерисовывается целиком каждый кадр'}`)] : []), ...varFnLines(o.s, o.e, bgExpr(S.screens[o.k])).map(L), L('')]),
+            ...charts.flatMap(o => [...chartLines(o.s, o.e, bgExpr(S.screens[o.k]), P.mgr).map(L), L('')]),
             ...S.screens.flatMap((sc, k) => P.anims[k].length ? animBlockLines(sc, P.anims[k]).map(L) : []),
         ];
         // with several screens a screen can't rely on text settings left by another one; an animated screen can't rely on the previous frame
@@ -2709,12 +2850,15 @@ void lcbTick(uint32_t now) {
             if (A.a.mode === 'once') out.push(L(`  // ${A.fn}();  // запустить «${A.a.name}»`));
             if (A.a.mode === 'value') out.push(L(`  // ${A.fn}(${Math.round((A.a.lo + A.a.hi) / 2)});  // «${A.a.name}»: значение ${A.a.lo}…${A.a.hi}`));
         }
+        if (charts.length) { const o = charts[0]; out.push(L(`  // ${o.e.push}(analogRead(A0) / 40);  // новое значение графика «${o.s.var}»`)); if (!P.mgr) out.push(L(`  // ${o.e.fn}(); present();`)); }
         if (vars.length) {
             const o = vars[0];
             if (o.e.val && P.mgr) out.push(L('  // новое значение меняющегося текста (lcbRedraw — чтобы экран без анимаций перерисовался):'), L(`  // ${o.e.val} = "${cstr(varText(o.s))}"; lcbRedraw();`));
             else if (o.e.val) out.push(L('  // новое значение меняющегося текста (нарисуется со следующим кадром):'), L(`  // ${o.e.val} = "${cstr(varText(o.s))}";`));
             else out.push(L('  // пример обновления меняющегося текста:'), L(`  // ${o.e.fn}("${cstr(varText(o.s))}");`), L('  // present();'));
         }
+        // the sketch allocates nothing per frame: the free heap printed here must stay the same
+        if (P.mgr || P.ticks.some(Boolean)) out.push(L('  // Serial.printf("свободно: %u байт\\n", ESP.getFreeHeap());  // проверка памяти: число не должно уменьшаться'));
         out.push(L('}'));
         return out;
     }
@@ -2734,10 +2878,12 @@ void lcbTick(uint32_t now) {
         document.getElementById('modeImg').hidden = !hasHeaderMode();
         document.querySelectorAll('#codeMode button').forEach(b => b.setAttribute('aria-pressed', b.dataset.m === S.codeMode));
         document.getElementById('optConsts').checked = S.coordConsts; document.getElementById('optImgH').checked = S.imgHeader;
+        document.getElementById('optMgrL').hidden = S.screens.length < 2; document.getElementById('optMgr').checked = S.mgr !== false;
     }
     codeEl.addEventListener('click', e => { const d = e.target.closest('[data-i]'); if (!d) return; if (+d.dataset.k !== S.cur) { S.cur = +d.dataset.k; triPts = null; preview = null; } setSel([+d.dataset.i]); S.tool = 'select'; update(); });
     document.getElementById('codeMode').addEventListener('click', e => { const b = e.target.closest('button'); if (b) { S.codeMode = b.dataset.m; update(); } });
     document.getElementById('optConsts').addEventListener('change', e => { S.coordConsts = e.target.checked; update(); });
+    document.getElementById('optMgr').addEventListener('change', e => { S.mgr = e.target.checked; update(); });
     document.getElementById('optImgH').addEventListener('change', e => { S.imgHeader = e.target.checked; if (!S.imgHeader && S.codeMode === 'images') S.codeMode = 'full'; update(); });
     const copyMsg = document.getElementById('copyMsg');
     document.getElementById('copyBtn').addEventListener('click', () => {
@@ -2851,7 +2997,10 @@ void lcbTick(uint32_t now) {
         const ctx = { pal, vars, varFns: {}, skipped: 0, imgSkipped: 0, anim, pcOf: a => a != null && pal[a.trim()] != null ? a.trim() : '' };
         const fns = splitFunctions(src);
         for (const f of fns) if (/^const\s+char\s*\*\s*\w+$/.test(f.params)) { const v = parseVarFn(f, ctx); if (v) ctx.varFns[f.name] = v; }
-        const scr = fns.filter(f => !f.params && !['setup', 'loop', 'present'].includes(f.name) && /canvas\s*\./.test(f.body));
+        // a chart function (drawИмяChart, starts with its box) is not a screen; its calls are counted for the warning
+        const isChart = f => /^draw\w+Chart$/.test(f.name) && /^\s*const\s+int16_t\s+x\s*=/.test(f.body);
+        ctx.chartSkipped = (src.match(/\bdraw\w+Chart\s*\(\s*\)\s*;/g) || []).length;
+        const scr = fns.filter(f => !f.params && !['setup', 'loop', 'present'].includes(f.name) && !isChart(f) && /canvas\s*\./.test(f.body));
         if (scr.length) {
             const screens = scr.map(f => ({ name: names[f.name] || f.name.replace(/^draw(?=\w)/, ''), ...parseBody(f.body, ctx) }));
             // default transitions of the screen manager, in the order of the screens
@@ -2863,7 +3012,7 @@ void lcbTick(uint32_t now) {
             return { ...ctx, multi: true, screens };
         }
         // no screen functions (a snippet or the old one-screen sketch): everything outside changing-text functions is one screen
-        let rest = src; for (const f of fns.filter(f => ctx.varFns[f.name]).reverse()) rest = rest.slice(0, f.start) + rest.slice(f.end);
+        let rest = src; for (const f of fns.filter(f => ctx.varFns[f.name] || isChart(f)).reverse()) rest = rest.slice(0, f.start) + rest.slice(f.end);
         const screens = [parseBody(rest, ctx)]; return { ...ctx, multi: false, screens }; // counters are read after parsing
     }
     function parseBody(src, ctx) {
@@ -3002,7 +3151,7 @@ void lcbTick(uint32_t now) {
             if (sc.bg != null) { S.bg = sc.bg; S.bgPc = sc.bgPc; }
         }
         S.screens.forEach((_, k) => withScreen(k, () => { ensureNames(); normalize(); }));
-        importMsg.textContent = `Загружено фигур: ${n}${r.multi ? `, экранов: ${r.screens.length}` : ''}${np ? `, цветов палитры: ${np}` : ''}${r.skipped ? `, пропущено: ${r.skipped} (не разобрал аргументы)` : ''}${r.imgSkipped ? `. Картинки не импортируются — пропущено вызовов: ${r.imgSkipped}` : ''}${r.anim ? '. Анимации не импортируются — загружен кадр на 0 мс' : ''}.`;
+        importMsg.textContent = `Загружено фигур: ${n}${r.multi ? `, экранов: ${r.screens.length}` : ''}${np ? `, цветов палитры: ${np}` : ''}${r.skipped ? `, пропущено: ${r.skipped} (не разобрал аргументы)` : ''}${r.imgSkipped ? `. Картинки не импортируются — пропущено вызовов: ${r.imgSkipped}` : ''}${r.anim ? '. Анимации не импортируются — загружен кадр на 0 мс' : ''}${r.chartSkipped ? `. Графики не импортируются — пропущено: ${r.chartSkipped}` : ''}.`;
         syncSettings(); update();
     }
     const uniqueName = (base, taken) => { let n = base, k = 2; while (taken.includes(n)) n = base + ' ' + k++; return n; };
@@ -3353,23 +3502,30 @@ void lcbTick(uint32_t now) {
     // the bar under the tabs: the transition onto the current screen, and its preview from another screen (canvas and board)
     const trBar = document.getElementById('trBar'); let trHtml = '', transView = null;
     const TV = { from: -1, e: 0, on: false, raf: 0, prev: null };
+    // two parts: «what goTo(SCR_…) does» on the left (the default transition onto the current screen) and «try it» on the right
     function renderTrBar() {
         trBar.hidden = S.screens.length < 2; if (trBar.hidden) { trHtml = ''; return; }
         if (trBar.contains(document.activeElement) && document.activeElement.matches('input:not([type=range]),select')) return; // don't rebuild under typing
-        const sc = S.screens[S.cur], tr = trOf(sc), on = tr.type !== 'none';
+        const sc = S.screens[S.cur], tr = trOf(sc), on = tr.type !== 'none', scr = plan(true).scr[S.cur] || 'SCR_' + upperId(sc.name);
         if (TV.from === S.cur || !S.screens[TV.from]) TV.from = S.cur ? S.cur - 1 : 1;
-        const h = `<span class="set">Переход на «${esc(sc.name)}»</span><select id="trType" aria-label="Переход на этот экран">${TRANS.map(([v, l]) => `<option value="${v}"${v === tr.type ? ' selected' : ''}>${l}</option>`).join('')}</select>`
-            + (on ? `<label class="set"><input type="number" id="trDur" min="1" max="60000" value="${tr.dur}" style="width:64px" aria-label="Длительность перехода, мс"> мс</label><select id="trEase" aria-label="Плавность перехода">${EASES.filter(x => x[0] !== 'step').map(([v, l]) => `<option value="${v}"${v === tr.ease ? ' selected' : ''}>${l}</option>`).join('')}</select>` : '')
-            + (tr.type === 'fade' ? `<input type="color" id="trC" value="${toHex(tr.c)}" aria-label="Цвет затухания">${S.palette.length ? `<select id="trPc" aria-label="Цвет затухания из палитры"><option value="">${fmt565(tr.c)}</option>${S.palette.map(p => `<option${p.n === tr.pc ? ' selected' : ''}>${p.n}</option>`).join('')}</select>` : ''}` : '')
-            + `<span class="grow"></span><label class="set">проиграть из <select id="trFrom">${S.screens.map((x, k) => k === S.cur ? '' : `<option value="${k}"${k === TV.from ? ' selected' : ''}>${esc(x.name)}</option>`).join('')}</select></label>`
-            + `<button class="btn" id="trPlay" title="Проиграть переход на холсте (и на плате, если подключена)" aria-label="Проиграть переход"></button>`
-            + (on ? `<input type="range" id="trT" min="0" max="${tr.dur}" value="0" aria-label="Момент перехода, мс">` : '') + '<span class="spec" id="trTime"></span>';
+        let h;
+        if (S.mgr === false) h = `<span class="msg">Переходов нет: экраны переключает твой код (в «Коде» выключено «экраны через goTo()»).</span><button class="btn" id="trMgrOn">Включить goTo() и переходы</button>`;
+        else {
+            h = `<span class="set" title="Так экран появляется, когда скетч вызывает ${scr === 'SCR_' ? 'goTo(…)' : `goTo(${scr})`}. «нет» — сразу, без анимации">Когда скетч вызывает <code>goTo(${esc(scr)})</code>, «${esc(sc.name)}» появляется:</span>`
+                + `<select id="trType" aria-label="Переход на этот экран">${TRANS.map(([v, l]) => `<option value="${v}"${v === tr.type ? ' selected' : ''}>${v === 'none' ? 'сразу, без перехода' : l}</option>`).join('')}</select>`
+                + (on ? `<label class="set">за <input type="number" id="trDur" min="1" max="60000" value="${tr.dur}" style="width:64px" aria-label="Длительность перехода, мс"> мс</label><select id="trEase" aria-label="Плавность перехода">${EASES.filter(x => x[0] !== 'step').map(([v, l]) => `<option value="${v}"${v === tr.ease ? ' selected' : ''}>${l}</option>`).join('')}</select>` : '')
+                + (tr.type === 'fade' ? `<label class="set">через цвет <input type="color" id="trC" value="${toHex(tr.c)}" aria-label="Цвет затухания"></label>${S.palette.length ? `<select id="trPc" aria-label="Цвет затухания из палитры"><option value="">${fmt565(tr.c)}</option>${S.palette.map(p => `<option${p.n === tr.pc ? ' selected' : ''}>${p.n}</option>`).join('')}</select>` : ''}` : '');
+            h += on ? `<span class="grow"></span><span class="trtry"><span class="set">Проверить:</span><label class="set">с экрана <select id="trFrom">${S.screens.map((x, k) => k === S.cur ? '' : `<option value="${k}"${k === TV.from ? ' selected' : ''}>${esc(x.name)}</option>`).join('')}</select></label>`
+                + `<button class="btn primary" id="trPlay" title="Проиграть переход на холсте (и на плате, если подключена)"></button>`
+                + `<input type="range" id="trT" min="0" max="${tr.dur}" value="0" aria-label="Момент перехода, мс" title="Тяни — любой момент перехода"><span class="spec" id="trTime"></span></span>`
+                : '<span class="msg">Выбери переход — тут же можно будет его проиграть.</span>';
+        }
         if (h !== trHtml) trBar.innerHTML = trHtml = h;
         syncTrBar();
     }
     function syncTrBar() {
         const tr = trOf(S.screens[S.cur]), pl = document.getElementById('trPlay'), t = document.getElementById('trT'), tm = document.getElementById('trTime'); if (!pl) return;
-        pl.textContent = TV.raf ? '⏸' : '▶';
+        pl.textContent = TV.raf ? '⏸ пауза' : '▶ проиграть';
         if (t && document.activeElement !== t) t.value = TV.on ? Math.min(TV.e, tr.dur) : 0;
         tm.textContent = TV.on ? (tr.type === 'none' ? 'мгновенно' : `${Math.min(TV.e, tr.dur)} / ${tr.dur} мс`) : '';
     }
@@ -3400,7 +3556,7 @@ void lcbTick(uint32_t now) {
         if (e.target.id === 'trT') { cancelAnimationFrame(TV.raf); TV.raf = 0; showTrans(+e.target.value); }
         if (e.target.id === 'trC') { const sc = S.screens[S.cur], tr = trOf(sc); push('trc' + S.cur); tr.c = to565(e.target.value); delete tr.pc; sc.tr = tr; update(true); }
     });
-    trBar.addEventListener('click', e => { if (e.target.closest('#trPlay')) playTrans(); });
+    trBar.addEventListener('click', e => { if (e.target.closest('#trPlay')) playTrans(); if (e.target.closest('#trMgrOn')) { S.mgr = true; update(); } });
 
     // ---------- adding pictures: file button / I, drag and drop onto the stage, paste ----------
     const fileIn = document.getElementById('imgFile'), stageMsg = document.getElementById('stageMsg');
@@ -3901,7 +4057,7 @@ void loop() {
         if (mod && !e.altKey && !textSel && (e.code === 'KeyC' || e.code === 'KeyX') && copySel(e.code === 'KeyX')) { sysCopy = true; setTimeout(() => { sysCopy = false; }, 0); return; }
         if (mod && !e.altKey && e.code === 'KeyV') { if (paste()) { justPasted = true; setTimeout(() => { justPasted = false; }, 0); } return; }
         if (mod) return;
-        const map = { v: 'select', r: 'rect', o: 'rrect', c: 'circle', l: 'line', y: 'tri', p: 'pixel', t: 'text' };
+        const map = { v: 'select', r: 'rect', o: 'rrect', c: 'circle', l: 'line', y: 'tri', p: 'pixel', t: 'text', g: 'chart' };
         if (map[k.toLowerCase()]) { setTool(map[k.toLowerCase()]); return; }
         if (k.toLowerCase() === 'f') { toggleFill(); return; }
         if (e.code === 'KeyI') { spriteFiles = null; fileIn.click(); return; }
