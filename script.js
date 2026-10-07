@@ -4,16 +4,20 @@
     // shapes: flat list in draw order; shape.g = id of its group; groups: {id, name, parent, collapsed, hidden, locked}, members of a group are kept contiguous
     // palette (shared by all screens): [{n: 'C_BG', c}]; shape.pc / shape.epc / screen.bgPc / S.colorPc = palette name the color comes from (the number is kept in sync)
     // assets: {id: dataURL} of uploaded pictures, shape.src points here; not part of undo snapshots, so history stays small
+    // shape.id: stable within its screen (animation tracks point at it); screen.anims: [{name, mode, dur, lo, hi, follow, tracks: [{id, p, keys: [{t, v, e, pc}]}]}]
     const START = [];
-    const blankScreen = name => ({ name, shapes: [], groups: [], bg: 0x0000, bgPc: '' });
-    const S = { W: 172, H: 320, screens: [Object.assign(blankScreen('Main'), { shapes: START })], cur: 0, palette: [], assets: {}, nextG: 1, sel: [], tool: 'select', fill: false, color: 0xFFFF, colorPc: '', radius: 8, zoom: 'auto', grid: true, codeMode: 'snippet', textFont: '', textSize: 2, coordConsts: false, imgHeader: false, fonts: [] };
+    const blankScreen = name => ({ name, shapes: [], groups: [], bg: 0x0000, bgPc: '', anims: [] });
+    const S = { W: 172, H: 320, screens: [Object.assign(blankScreen('Main'), { shapes: START })], cur: 0, palette: [], assets: {}, nextG: 1, nextId: 1, sel: [], tool: 'select', fill: false, color: 0xFFFF, colorPc: '', radius: 8, zoom: 'auto', grid: true, codeMode: 'snippet', textFont: '', textSize: 2, coordConsts: false, imgHeader: false, fonts: [], tlFolded: false };
     for (const k of ['shapes', 'groups', 'bg', 'bgPc']) Object.defineProperty(S, k, { get: () => S.screens[S.cur][k], set: v => { S.screens[S.cur][k] = v; }, enumerable: false });
-    const KEY = 'lcd-canvas-builder-v3', OLD_KEYS = ['lcd-canvas-builder-v2', 'lcd-canvas-builder-v1'];
+    const KEY = 'lcd-canvas-builder-v4', OLD_KEYS = ['lcd-canvas-builder-v3', 'lcd-canvas-builder-v2', 'lcd-canvas-builder-v1'];
     try {
         let d = JSON.parse(localStorage.getItem(KEY) || 'null');
-        if (!d) for (const k of OLD_KEYS) { const o = JSON.parse(localStorage.getItem(k) || 'null'); if (o && Array.isArray(o.shapes)) { d = migrate(o); break; } }
+        if (!d) for (const k of OLD_KEYS) { const o = JSON.parse(localStorage.getItem(k) || 'null'); if (o && Array.isArray(o.screens)) { d = o; break; } if (o && Array.isArray(o.shapes)) { d = migrate(o); break; } }
         if (d && Array.isArray(d.screens) && d.screens.length) { delete d.sel; Object.assign(S, d); S.cur = Math.min(Math.max(0, S.cur | 0), S.screens.length - 1); }
     } catch (e) { }
+    // v3 → v4: screens get an (empty) list of animations; shapes get ids from ensureIds() at start-up; the v3 key is left untouched
+    for (const sc of S.screens) if (!Array.isArray(sc.anims)) sc.anims = [];
+    if (!(S.nextId > 0)) S.nextId = 1;
     // v1 (no groups, palette, names) and v2 (one screen) → v3: everything becomes the screen «Main»; names are filled in by ensureNames() at start-up; old keys are left untouched
     function migrate(d) {
         const scr = { name: 'Main', shapes: d.shapes, groups: d.groups || [], bg: d.bg || 0, bgPc: d.bgPc || '' };
@@ -34,7 +38,7 @@
 
     // history
     let hist = [], future = [], lastPushKey = '', lastPushT = 0;
-    function snapshot() { return JSON.stringify({ screens: S.screens, cur: S.cur, palette: S.palette, nextG: S.nextG, W: S.W, H: S.H }); }
+    function snapshot() { return JSON.stringify({ screens: S.screens, cur: S.cur, palette: S.palette, nextG: S.nextG, nextId: S.nextId, W: S.W, H: S.H }); }
     function push(key, snap) { const now = Date.now(); if (key && key === lastPushKey && now - lastPushT < 800) { lastPushT = now; return; } lastPushKey = key || ''; lastPushT = now; hist.push(snap || snapshot()); if (hist.length > 200) hist.shift(); future = []; }
     function restore(js) { const d = JSON.parse(js), cur = S.cur; Object.assign(S, d); if (S.cur !== cur) S.sel = []; S.sel = S.sel.filter(i => i < S.shapes.length); }
     function undo() { if (!hist.length) return; future.push(snapshot()); restore(hist.pop()); lastPushKey = ''; syncSettings(); update(); }
@@ -499,6 +503,137 @@
         for (const i of idx) { const [x, y, w, h] = bbox(S.shapes[i]); L = Math.min(L, x); T = Math.min(T, y); R = Math.max(R, x + w); B = Math.max(B, y + h); }
         return L === Infinity ? null : [L, T, R - L, B - T];
     }
+    // shape ids are unique within a screen (a duplicated screen keeps them, so its animations stay valid); gradient stops get ids within their shape
+    function ensureIds() {
+        for (const sc of S.screens) {
+            const seen = new Set();
+            for (const s of sc.shapes) {
+                if (!(s.id > 0) || seen.has(s.id)) s.id = S.nextId++; seen.add(s.id); if (s.id >= S.nextId) S.nextId = s.id + 1;
+                if (s.grad && s.grad.stops) { // existing ids first: a new stop must not take the id (and the track) of one further on
+                    const ids = new Set(), fresh = []; let n = 0;
+                    for (const st of s.grad.stops) { if (st.id >= 0 && !ids.has(st.id)) ids.add(st.id); else fresh.push(st); }
+                    for (const st of fresh) { while (ids.has(n)) n++; st.id = n; ids.add(n); }
+                }
+            }
+        }
+    }
+
+    // ---------- animation: keyframes (the same integer maths as the generated lcbKey / lcbKeyC / lcbTime) ----------
+    // a track animates one property of one shape: coordinates, colour c, gradient colour g<stop id>, visibility vis, text (static text only);
+    // between two keys the value goes from the left key to the right one with the left key's easing, progress p = 0…1024
+    const EASES = [['linear', 'линейно', 'LCB_E_LINEAR'], ['in', 'разгон', 'LCB_E_IN'], ['out', 'торможение', 'LCB_E_OUT'], ['inout', 'плавно', 'LCB_E_INOUT'], ['step', 'скачком', 'LCB_E_STEP']];
+    const MODES = [['loop', 'цикл', 'LCB_LOOP'], ['pingpong', 'туда-обратно', 'LCB_PINGPONG'], ['once', 'один раз', 'LCB_ONCE'], ['value', 'по значению', 'LCB_VALUE']];
+    function ease(e, p) {
+        switch (e) {
+            case 'in': return p * p >> 10;
+            case 'out': return 1024 - ((1024 - p) * (1024 - p) >> 10);
+            case 'inout': return p < 512 ? p * p >> 9 : 1024 - ((1024 - p) * (1024 - p) >> 9);
+            case 'step': return 0;
+            default: return p;
+        }
+    }
+    const STEP_P = p => p === 'vis' || p === 'text';
+    const COLOR_P = p => p === 'c' || /^g\d+$/.test(p);
+    const ANIM_F = { rect: ['x', 'y', 'w', 'h'], rrect: ['x', 'y', 'w', 'h', 'r'], circle: ['x', 'y', 'r'], line: ['x0', 'y0', 'x1', 'y1'], tri: ['x0', 'y0', 'x1', 'y1', 'x2', 'y2'], pixel: ['x', 'y'], text: ['x', 'y'], img: ['x', 'y'] };
+    // a changing text isn't animated (its function draws whatever value it gets); text wraps inside its box and a picture's array has a fixed size, so their w/h stay
+    function animProps(s) {
+        if (s.t === 'text' && s.var) return [];
+        const out = [...ANIM_F[s.t]];
+        if (gradOk(s)) for (const st of s.grad.stops) out.push('g' + st.id); else if (s.t !== 'img' || s.mode === 'icon') out.push('c');
+        if (s.t === 'text') out.push('text');
+        out.push('vis'); return out;
+    }
+    function propName(s, p) {
+        if (p === 'c') return 'цвет'; if (p === 'vis') return 'видимость'; if (p === 'text') return 'текст';
+        if (COLOR_P(p)) { const k = s.grad ? s.grad.stops.findIndex(st => 'g' + st.id === p) : -1; return 'градиент ' + (k + 1); }
+        const f = META[s.t].f.find(f => f[0] === p); return f ? f[1] : p;
+    }
+    const stopOf = (s, p) => s.grad && s.grad.stops.find(st => 'g' + st.id === p);
+    // [value, palette name] of a property as the shape has it now
+    function getP(s, p) {
+        if (p === 'vis') return [s.vis === 0 ? 0 : 1, ''];
+        if (p === 'text') return [s.text || '', ''];
+        if (COLOR_P(p)) { const o = p === 'c' ? s : stopOf(s, p); return o ? [o.c, o.pc || ''] : null; }
+        return [s[p], ''];
+    }
+    function setP(s, p, v, pc) {
+        if (p === 'vis') { if (v) delete s.vis; else s.vis = 0; return; }
+        if (COLOR_P(p)) { const o = p === 'c' ? s : stopOf(s, p); if (!o) return; o.c = v; if (pc) o.pc = pc; else delete o.pc; return; }
+        s[p] = v;
+    }
+    const mix565 = (a, b, e) => { const ch = (sh, m) => { const x = (a >> sh) & m, y = (b >> sh) & m; return x + Math.trunc((y - x) * e / 1024); }; return ch(11, 31) << 11 | ch(5, 63) << 5 | ch(0, 31); };
+    // value of a track at t ms → [value, palette name]; a palette name holds only where the value is exactly a key's
+    function evalTrack(tr, t) {
+        const k = tr.keys; if (t <= k[0].t) return [k[0].v, k[0].pc || ''];
+        for (let i = 0; i + 1 < k.length; i++) {
+            if (t >= k[i + 1].t) continue;
+            const a = k[i], b = k[i + 1], e = STEP_P(tr.p) ? 0 : ease(a.e, Math.trunc((t - a.t) * 1024 / (b.t - a.t)));
+            if (!e || (a.v === b.v && (a.pc || '') === (b.pc || ''))) return [a.v, a.pc || ''];
+            return [COLOR_P(tr.p) ? mix565(a.v, b.v, e) : a.v + Math.trunc((b.v - a.v) * e / 1024), ''];
+        }
+        const z = k[k.length - 1]; return [z.v, z.pc || ''];
+    }
+    // value mode: the value (clamped to lo…hi) picks the moment on the timeline
+    const valueT = (a, v) => Math.trunc((Math.min(a.hi, Math.max(a.lo, v)) - a.lo) * a.dur / (a.hi - a.lo));
+    const tValue = (a, t) => a.lo + Math.round(t * (a.hi - a.lo) / a.dur);
+    // what lcbValue() shows while it follows a new value: from → to in follow ms, decelerating
+    const followV = (a, f, now) => { const dt = Math.max(0, now - f.t0); return a.follow && dt < a.follow ? f.from + Math.trunc((f.to - f.from) * ease('out', Math.trunc(dt * 1024 / a.follow)) / 1024) : f.to; };
+
+    // the editor shows one frame: the open animation at the playhead, every other one at its start (0 ms);
+    // that frame is written into the shapes, so editing tools work as usual and a changed animated property becomes a key
+    const AN = { scr: -1, k: 0, t: 0, rec: false, play: null, sel: [], focus: false, clip: null, fold: new Set(), follow: null };
+    const anims = () => S.screens[S.cur].anims;
+    const openAnim = () => anims()[AN.k] || null;
+    const animTime = a => a === openAnim() ? AN.t : 0;
+    function trackOf(id, p) { for (const a of anims()) { const tr = a.tracks.find(tr => tr.id === id && tr.p === p); if (tr) return { a, tr }; } return null; }
+    const newKey = (tr, t, v, pc, e) => Object.assign({ t, v, e: STEP_P(tr.p) ? 'step' : e || 'inout' }, pc ? { pc } : {});
+    // a key at exactly t gets the value; otherwise a new key, with the easing of the key before it
+    function setKey(tr, t, v, pc) {
+        let i = tr.keys.findIndex(k => k.t >= t); if (i < 0) i = tr.keys.length;
+        let k = tr.keys[i];
+        if (!k || k.t !== t) { const prev = tr.keys[i - 1]; k = newKey(tr, t, v, pc, prev && prev.e); tr.keys.splice(i, 0, k); }
+        k.v = v; if (pc) k.pc = pc; else delete k.pc;
+        return k;
+    }
+    // a new track in the open animation: from what the shape had at 0 ms to the new value at the playhead
+    function addTrack(s, p, was, now) {
+        const a = openAnim(), tr = { id: s.id, p, keys: [] };
+        tr.keys.push(newKey(tr, 0, ...(AN.t ? was : now)));
+        if (AN.t) tr.keys.push(newKey(tr, AN.t, ...now));
+        a.tracks.push(tr); return tr;
+    }
+    let animBase = new Map();
+    function animApply() {
+        const sc = S.screens[S.cur], byId = new Map(sc.shapes.map(s => [s.id, s]));
+        for (const s of sc.shapes) delete s.vis;
+        for (const a of sc.anims) { const t = animTime(a); for (const tr of a.tracks) { const s = byId.get(tr.id); if (s) setP(s, tr.p, ...evalTrack(tr, t)); } }
+        animBase = new Map(sc.shapes.map(s => [s, Object.fromEntries(animProps(s).map(p => [p, getP(s, p)]))]));
+    }
+    // compare the shapes with the frame they showed: an animated property → its key at the time it is shown; recording → a new track
+    function animDetect() {
+        const a0 = openAnim();
+        for (const s of S.shapes) {
+            const b = animBase.get(s); if (!b) continue;
+            for (const p of animProps(s)) {
+                const was = b[p], now = getP(s, p); if (!was || !now || (was[0] === now[0] && was[1] === now[1])) continue;
+                const own = trackOf(s.id, p);
+                if (own) { setKey(own.tr, animTime(own.a), ...now); if (own.a !== a0) flash(`«${propName(s, p)}» у «${s.name}» анимируется в «${own.a.name}» — изменён его ключ на 0 мс.`); }
+                else if (a0 && AN.rec && was[0] !== now[0]) addTrack(s, p, was, now); // only a palette link changed: not a reason for a track
+                else if (p === 'vis') flash('Видимость задаётся ключами: включи запись ● на таймлайне.');
+            }
+        }
+    }
+    // tracks of deleted shapes or of properties a shape no longer has go away; one property belongs to one animation
+    function animClean() {
+        for (const sc of S.screens) {
+            const byId = new Map(sc.shapes.map(s => [s.id, s])), seen = new Set();
+            for (const a of sc.anims) a.tracks = a.tracks.filter(tr => {
+                const s = byId.get(tr.id), key = tr.id + ':' + tr.p;
+                if (!s || !tr.keys.length || seen.has(key) || !animProps(s).includes(tr.p)) return false;
+                seen.add(key); return true;
+            });
+        }
+    }
 
     // ---------- palette ----------
     const palEntry = n => S.palette.find(p => p.n === n);
@@ -513,7 +648,11 @@
     // colors that point at the palette follow it; a deleted entry leaves the last value as a literal
     function syncPalette() {
         const fix = (o, k, pk) => { if (!o[pk]) return; const p = palEntry(o[pk]); if (p) o[k] = p.c; else delete o[pk]; };
-        for (const sc of S.screens) { for (const s of sc.shapes) { fix(s, 'c', 'pc'); fix(s, 'ec', 'epc'); if (s.grad) for (const st of s.grad.stops) fix(st, 'c', 'pc'); } if (sc.bgPc) { const p = palEntry(sc.bgPc); if (p) sc.bg = p.c; else sc.bgPc = ''; } }
+        for (const sc of S.screens) {
+            for (const s of sc.shapes) { fix(s, 'c', 'pc'); fix(s, 'ec', 'epc'); if (s.grad) for (const st of s.grad.stops) fix(st, 'c', 'pc'); }
+            for (const a of sc.anims) for (const tr of a.tracks) if (COLOR_P(tr.p)) for (const k of tr.keys) fix(k, 'v', 'pc');
+            if (sc.bgPc) { const p = palEntry(sc.bgPc); if (p) sc.bg = p.c; else sc.bgPc = ''; }
+        }
         if (S.colorPc) { const p = palEntry(S.colorPc); if (p) S.color = p.c; else S.colorPc = ''; }
     }
 
@@ -614,17 +753,24 @@
         normalize(); return true;
     }
     function delSel() { const idx = new Set(S.sel); S.shapes = S.shapes.filter((_, i) => !idx.has(i)); S.sel = []; normalize(); }
-    // the selection as a self-contained piece {shapes, groups}: only groups that are selected as a whole come along
+    // the selection as a self-contained piece {shapes, groups, tracks}: only groups that are selected as a whole come along; tracks keep the animation's name
     function clipSel() {
         const idx = new Set(S.sel), full = new Set(S.groups.filter(g => groupMembers(g.id).every(i => idx.has(i))).map(g => g.id));
         const shapes = selShapes().map(s => { const c = JSON.parse(JSON.stringify(s)); if (!full.has(c.g)) delete c.g; return c; });
         const groups = S.groups.filter(g => full.has(g.id)).map(g => ({ ...g, parent: full.has(g.parent) ? g.parent : null }));
-        return { shapes, groups };
+        const ids = new Set(shapes.map(s => s.id)), tracks = anims().flatMap(a => a.tracks.filter(tr => ids.has(tr.id)).map(tr => ({ anim: a.name, ...JSON.parse(JSON.stringify(tr)) })));
+        return { shapes, groups, tracks };
     }
+    // the copies get new ids; their tracks go into the animations of the same name on this screen, shifted with the shapes
     function insertPiece(piece, off, at, parent) {
-        const map = new Map(piece.groups.map(g => [g.id, S.nextG++]));
+        const map = new Map(piece.groups.map(g => [g.id, S.nextG++])), ids = new Map();
         S.groups.push(...piece.groups.map(g => ({ ...g, id: map.get(g.id), parent: g.parent != null ? map.get(g.parent) : parent })));
-        const shapes = piece.shapes.map(s => { const c = JSON.parse(JSON.stringify(s)); if (c.g != null) c.g = map.get(c.g); else if (parent != null) c.g = parent; moveShape(c, off, off); return c; });
+        const shapes = piece.shapes.map(s => { const c = JSON.parse(JSON.stringify(s)); if (c.g != null) c.g = map.get(c.g); else if (parent != null) c.g = parent; moveShape(c, off, off); ids.set(c.id, S.nextId); c.id = S.nextId++; return c; });
+        for (const tr of piece.tracks || []) {
+            const a = anims().find(a => a.name === tr.anim); if (!a || !ids.has(tr.id)) continue;
+            const shift = /^x\d?$/.test(tr.p) || /^y\d?$/.test(tr.p) ? off : 0;
+            a.tracks.push({ id: ids.get(tr.id), p: tr.p, keys: tr.keys.map(k => ({ ...k, v: k.v + (shift && typeof k.v === 'number' ? shift : 0) })) });
+        }
         S.shapes.splice(at, 0, ...shapes); setSelObjs(shapes); normalize();
     }
     function dupSel() { if (!S.sel.length) return; push(); insertPiece(clipSel(), 5, Math.max(...S.sel) + 1, commonParent(selNodes())); update(); }
@@ -694,7 +840,7 @@
         const W = S.W, H = S.H;
         if (!img || img.width !== W || img.height !== H) { off.width = W; off.height = H; img = offx.createImageData(W, H); u32 = new Uint32Array(img.data.buffer); idb = new Int32Array(W * H); }
         u32.fill(toU32(S.bg)); idb.fill(-1);
-        S.shapes.forEach((s, i) => { if (!hiddenAt(i)) raster(s, lockedAt(i) ? -3 : i); });
+        S.shapes.forEach((s, i) => { if (!hiddenAt(i) && s.vis !== 0) raster(s, lockedAt(i) ? -3 : i); }); // vis 0: switched off by an animation key at this moment
         if (preview) raster(preview, -2);
         emptyHint.hidden = S.shapes.length > 0 || !!preview || !!triPts;
         offx.putImageData(img, 0, 0);
@@ -804,7 +950,7 @@
     // locked shapes don't write the ID buffer, so clicks go through them
     function pick(x, y) {
         let box = -1;
-        for (let i = S.shapes.length - 1; i >= 0; i--) { const s = S.shapes[i]; if ((s.t !== 'text' && s.t !== 'img') || hiddenAt(i) || lockedAt(i)) continue; const [bx, by, bw, bh] = bbox(s); if (x >= bx && y >= by && x < bx + bw && y < by + bh) { box = i; break; } }
+        for (let i = S.shapes.length - 1; i >= 0; i--) { const s = S.shapes[i]; if ((s.t !== 'text' && s.t !== 'img') || hiddenAt(i) || lockedAt(i) || s.vis === 0) continue; const [bx, by, bw, bh] = bbox(s); if (x >= bx && y >= by && x < bx + bw && y < by + bh) { box = i; break; } }
         for (let rad = 0; rad <= 3; rad++) {
             let best = -1;
             for (let dy = -rad; dy <= rad; dy++)for (let dx = -rad; dx <= rad; dx++) { const X = x + dx, Y = y + dy; if (X < 0 || Y < 0 || X >= S.W || Y >= S.H) continue; const v = idb[Y * S.W + X]; if (v > best) best = v; }
@@ -1022,7 +1168,7 @@
             const v = e.target.value.trim(), warn = document.getElementById('palWarn');
             if (v === p.n) return;
             if (!validName(v, p)) { warn.textContent = 'Имя — идентификатор C++ (латиница, цифры, _), не W/H/имя цвета и без повторов.'; e.target.value = p.n; return; }
-            push(); for (const sc of S.screens) { for (const s of sc.shapes) { if (s.pc === p.n) s.pc = v; if (s.epc === p.n) s.epc = v; if (s.grad) for (const st of s.grad.stops) if (st.pc === p.n) st.pc = v; } if (sc.bgPc === p.n) sc.bgPc = v; } if (S.colorPc === p.n) S.colorPc = v; p.n = v; warn.textContent = ''; update();
+            push(); for (const sc of S.screens) { for (const s of sc.shapes) { if (s.pc === p.n) s.pc = v; if (s.epc === p.n) s.epc = v; if (s.grad) for (const st of s.grad.stops) if (st.pc === p.n) st.pc = v; } for (const a of sc.anims) for (const tr of a.tracks) for (const k of tr.keys) if (k.pc === p.n) k.pc = v; if (sc.bgPc === p.n) sc.bgPc = v; } if (S.colorPc === p.n) S.colorPc = v; p.n = v; warn.textContent = ''; animBase = new Map(); update();
         }
     });
     palEl.addEventListener('focusout', () => setTimeout(() => { renderPalette(); renderBgPc(); }, 0));
@@ -1078,12 +1224,12 @@
         insBody.innerHTML = `<div class="row" style="justify-content:space-between"><span><span class="chip" style="background:${toHex(s.c)}"></span><b>${esc(s.name || m.name)}</b> <span class="spec">${[(s.name || '').startsWith(m.name) ? '' : m.name, s.pc].filter(Boolean).join(' · ')}</span></span>
     ${m.canFill ? `<span class="seg" id="insFill"><button data-f="0" aria-pressed="${!s.fill}">draw</button><button data-f="1" aria-pressed="${!!s.fill}">fill</button></span>` : ''}</div>
     <div class="fields" style="margin-top:10px">${m.f.map(([k, l]) => `<label>${l}<input type="number" data-k="${k}" id="f-${k}" value="${s[k]}"></label>`).join('')}</div>
-    ${paintInspector(s)}${s.t === 'text' ? textInspector(s) : ''}${s.t === 'img' ? imgInspector(s) : ''}
+    ${paintInspector(s)}${s.t === 'text' ? textInspector(s) : ''}${s.t === 'img' ? imgInspector(s) : ''}${animInspector(s)}
     ${alignHtml('data-al', ALIGN, 'По экрану', 'Выравнивание по экрану')}`;
         insBody.querySelectorAll('input[data-k]').forEach(inp => inp.addEventListener('input', () => {
             if (inp.value === '' || isNaN(+inp.value)) return; push('f' + i + inp.dataset.k); S.shapes[i][inp.dataset.k] = Math.trunc(+inp.value); update(true);
         }));
-        bindPaintInspector(s, i);
+        bindPaintInspector(s, i); bindAnimInspector(s);
         if (s.t === 'text') bindTextInspector(s, i);
         if (s.t === 'img') bindImgInspector(s, i);
         const f = document.getElementById('insFill');
@@ -1176,6 +1322,38 @@
             if (e.target.closest('#pRev')) { push(); g.stops = g.stops.map(st => ({ ...st, p: 100 - st.p })).reverse(); update(); }
         });
         const di = document.getElementById('pDither'); if (di) di.onchange = () => { push(); g.dither = di.checked; update(); };
+    }
+    // keys of the open animation: ◆ — a key at the playhead (click removes it), ◇ — animated, no key here (click adds one), plain — not animated yet
+    function animInspector(s) {
+        const a = openAnim(); if (!a) return '';
+        const ps = animProps(s);
+        if (!ps.length) return '<div class="msg anim-ins">Меняющийся текст не анимируется: его функция рисует то значение, которое ей передали.</div>';
+        const btn = p => {
+            const o = trackOf(s.id, p), st = !o ? 'no' : o.a !== a ? 'other' : o.tr.keys.some(k => k.t === AN.t) ? 'on' : 'tr';
+            const tip = st === 'other' ? `Анимируется в «${o.a.name}»` : st === 'on' ? 'Убрать ключ на бегунке' : 'Поставить ключ на бегунке с текущим значением';
+            return `<button class="kb" data-p="${p}" data-st="${st}" title="${escA(tip)}"${st === 'other' ? ' disabled' : ''}><span class="kd" aria-hidden="true"></span>${esc(propName(s, p))}</button>`;
+        };
+        return `<div class="anim-ins"><div class="row"><span class="set">Ключи «${esc(a.name)}» на ${a.mode === 'value' ? 'значении ' + tValue(a, AN.t) : AN.t + ' мс'}</span>
+      <label class="set" title="Видимость на этом моменте — ставит ключ видимости"><input type="checkbox" id="insVis"${s.vis === 0 ? '' : ' checked'}> видна</label></div>
+      <div class="row kbs">${ps.filter(p => p !== 'vis').map(btn).join('')}</div></div>`;
+    }
+    function bindAnimInspector(s) {
+        const box = insBody.querySelector('.anim-ins'), a = openAnim(); if (!box || !a) return;
+        box.addEventListener('click', e => {
+            const b = e.target.closest('.kb'); if (!b || b.disabled) return; const p = b.dataset.p, o = trackOf(s.id, p);
+            push();
+            if (b.dataset.st === 'on') { o.tr.keys = o.tr.keys.filter(k => k.t !== AN.t); AN.sel = []; }
+            else if (o) setKey(o.tr, AN.t, ...getP(s, p));
+            else { const tr = { id: s.id, p, keys: [] }; tr.keys.push(newKey(tr, AN.t, ...getP(s, p))); a.tracks.push(tr); }
+            update();
+        });
+        const vis = document.getElementById('insVis');
+        if (vis) vis.onchange = () => {
+            const o = trackOf(s.id, 'vis'); if (o && o.a !== a) { flash(`Видимость «${s.name}» анимируется в «${o.a.name}».`); vis.checked = s.vis !== 0; return; }
+            push(); const v = vis.checked ? 1 : 0;
+            if (o) setKey(o.tr, AN.t, v, ''); else addTrack(s, 'vis', [1, ''], [v, '']);
+            update();
+        };
     }
     function imgInspector(s) {
         const seg = (id, key, items) => `<span class="seg" id="${id}">${items.map(([v, l, t]) => `<button data-v="${v}" title="${t}" aria-pressed="${s[key] === v}">${l}</button>`).join('')}</span>`;
@@ -1364,8 +1542,9 @@
     const bgExpr = sc => sc.bgPc && palEntry(sc.bgPc) ? sc.bgPc : fmt565(sc.bg);
 
     // every C++ name of the sketch, allocated in one pass so they stay unique: screen functions, constant prefixes, arrays, changing-text functions
-    function plan() {
-        const used = new Set(['W', 'H', 'canvas', 'lcd', 'present', 'setup', 'loop', ...S.palette.map(p => p.n)]);
+    // anim: the whole sketch — animated properties become lcbKey(…) of their key arrays; without it every value is the shown frame
+    function plan(anim) {
+        const used = new Set(['W', 'H', 'canvas', 'lcd', 'present', 'setup', 'loop', 'lcbNow', ...S.palette.map(p => p.n)]);
         const take = (base, sep = '_') => { let n = base, k = 2; while (used.has(n)) n = base + sep + k++; used.add(n); return n; };
         const P = { fns: S.screens.map(sc => take('draw' + pascalId(sc.name), '')), shapes: new Map(), vis: [] };
         S.screens.forEach((sc, k) => {
@@ -1378,13 +1557,35 @@
                 P.shapes.set(s, e);
             }
         });
+        // animations: anim<Name> state, start<Name>() / set<Name>(v), t<Name> local time, tick<Screen>(now), <anim>_<shape>_<prop> key arrays
+        P.anim = !!anim; P.anims = S.screens.map(() => []); P.ticks = S.screens.map(() => '');
+        if (anim) S.screens.forEach((sc, k) => {
+            if (!sc.anims.length) return;
+            const vis = new Map(P.vis[k].map(s => [s.id, s]));
+            P.ticks[k] = take('tick' + pascalId(sc.name), '');
+            for (const a of sc.anims) {
+                const N = pascalId(a.name), A = { a, v: take('anim' + N, ''), fn: a.mode === 'once' ? take('start' + N, '') : a.mode === 'value' ? take('set' + N, '') : '', tv: take('t' + N, ''), tracks: [] };
+                for (const tr of a.tracks) {
+                    const s = vis.get(tr.id), e = s && P.shapes.get(s); if (!e) continue; // hidden shapes are not in the sketch
+                    const T = { arr: take(`${snakeId(a.name)}_${snakeId(s.name)}_${tr.p === 'c' || tr.p[0] !== 'g' ? tr.p : 'g' + (s.grad.stops.findIndex(st => 'g' + st.id === tr.p) + 1)}`), tv: A.tv, tr, s };
+                    (e.anim = e.anim || {})[tr.p] = T; A.tracks.push(T);
+                }
+                P.anims[k].push(A);
+            }
+            // a changing text on an animated screen keeps its value: every frame redraws the whole screen
+            for (const s of P.vis[k]) if (s.t === 'text' && s.var) P.shapes.get(s).val = take(s.var + 'Value');
+        });
         return P;
     }
     // a coordinate: the number, or NAME_X when the element has constants
-    const V = (s, e, k) => e && e.pre ? `${e.pre}_${k.toUpperCase()}` : String(s[k]);
+    const V = (s, e, k) => e && e.anim && e.anim[k] ? `lcbKey(${e.anim[k].arr}, ${e.anim[k].tv})` : e && e.pre ? `${e.pre}_${k.toUpperCase()}` : String(s[k]);
+    // the colour: a palette name, a literal, or the colour key array of the animation
+    const colE = (s, e, p = 'c') => e && e.anim && e.anim[p] ? `lcbKeyC(${e.anim[p].arr}, ${e.anim[p].tv})` : colStr(s);
+    // a position derived from x / y (text lines): relative to the coordinate when that is a name or an animated value
+    const at = (s, e, k, v) => e && (e.pre || (e.anim && e.anim[k])) ? plus(V(s, e, k), v - s[k]) : v;
     const plus = (base, d) => d ? `${base} ${d < 0 ? '-' : '+'} ${Math.abs(d)}` : base;
     function codeLine(s, e) {
-        const c = colStr(s), p = s.fill ? 'fill' : 'draw', v = k => V(s, e, k);
+        const c = colE(s, e), p = s.fill ? 'fill' : 'draw', v = k => V(s, e, k);
         switch (s.t) {
             case 'rect': return `canvas.${p}Rect(${v('x')}, ${v('y')}, ${v('w')}, ${v('h')}, ${c});`;
             case 'rrect': return `canvas.${p}RoundRect(${v('x')}, ${v('y')}, ${v('w')}, ${v('h')}, ${v('r')}, ${c});`;
@@ -1396,31 +1597,27 @@
                 : `canvas.drawRGBBitmap(${v('x')}, ${v('y')}, ${e.arr}, ${e.mask ? e.mask + ', ' : ''}${v('w')}, ${v('h')});`;
         }
     }
+    // an animated text: every key's text is laid out by the editor, a switch picks the one of the moment
     function textCode(s, st, e) {
+        const tt = e && e.anim && e.anim.text, texts = tt ? tt.tr.keys.map(k => k.v) : [s.text || ''];
+        const lit = t => { const q = `"${cstr(t)}"`; return FONT_DATA[s.font] && FONT_DATA[s.font].cp && /[^\x00-\x7F]/.test(t) ? `cp1251(${q})` : q; };
+        const cases = line => texts.map(t => layoutText({ ...s, text: t }).flatMap(l => line(at(s, e, 'x', l.cx), at(s, e, 'y', l.cy), lit(l.t))));
+        const pick = cs => tt ? [`switch (lcbKey(${tt.arr}, ${tt.tv})) {`, ...cs.flatMap((c, k) => [`  case ${k}:  // «${texts[k].replace(/\n/g, ' ')}»`, ...c.map(l => '    ' + l), '    break;']), '}'] : cs[0];
         if (usesLcb(s)) { // gradient / smooth text: drawn by lcbText, the canvas text settings are left alone
-            const lines = layoutText(s); if (!lines.length) return [];
-            return lcbWrap(s, P => lines.map(l => {
-                const lit = `"${cstr(l.t)}"`, cp = FONT_DATA[s.font] && FONT_DATA[s.font].cp && /[^\x00-\x7F]/.test(l.t);
-                const cx = e && e.pre ? plus(V(s, e, 'x'), l.cx - s.x) : l.cx, cy = e && e.pre ? plus(V(s, e, 'y'), l.cy - s.y) : l.cy;
-                return lcbTextCall(s, e, P, cx, cy, cp ? `cp1251(${lit})` : lit);
-            }));
+            if (cases(() => ['']).every(c => !c.length)) return [];
+            return lcbWrap(s, e, P => pick(cases((cx, cy, q) => [lcbTextCall(s, e, P, cx, cy, q)])));
         }
-        const out = [], col = colStr(s);
+        const out = [], col = colE(s, e);
         if (!st.wrap) { out.push('canvas.setTextWrap(false);  // переносы уже посчитаны редактором'); st.wrap = true; }
         if (st.font !== s.font) { out.push(s.font ? `canvas.setFont(&${s.font});` : 'canvas.setFont();  // встроенный 5×7'); st.font = s.font; }
         if (st.size !== s.size) { out.push(`canvas.setTextSize(${s.size});`); st.size = s.size; }
         if (st.color !== col) { out.push(`canvas.setTextColor(${col});`); st.color = col; }
-        for (const l of layoutText(s)) {
-            const cx = e && e.pre ? plus(V(s, e, 'x'), l.cx - s.x) : l.cx, cy = e && e.pre ? plus(V(s, e, 'y'), l.cy - s.y) : l.cy;
-            const lit = `"${cstr(l.t)}"`, cp = FONT_DATA[s.font] && FONT_DATA[s.font].cp && /[^\x00-\x7F]/.test(l.t);
-            out.push(`canvas.setCursor(${cx}, ${cy});`); out.push(`canvas.print(${cp ? `cp1251(${lit})` : lit});`);
-        }
-        return out;
+        return [...out, ...pick(cases((cx, cy, q) => [`canvas.setCursor(${cx}, ${cy});`, `canvas.print(${q});`]))];
     }
     function shapeCode(s, e, st) {
         // the function sets font, size and colour itself, so the next static text must set them again
-        if (s.t === 'text' && s.var) { st.font = st.size = undefined; st.color = null; return [`${e.fn}("${cstr(varText(s))}");`]; }
-        return s.t === 'text' ? textCode(s, st, e) : usesLcb(s) ? lcbWrap(s, P => [lcbCall(s, e, P)]) : [codeLine(s, e)];
+        if (s.t === 'text' && s.var) { st.font = st.size = undefined; st.color = null; return [e.val ? `${e.fn}(${e.val}.c_str());` : `${e.fn}("${cstr(varText(s))}");`]; }
+        return s.t === 'text' ? textCode(s, st, e) : usesLcb(s) ? lcbWrap(s, e, P => [lcbCall(s, e, P)]) : [codeLine(s, e)];
     }
     // drawing lines of screen k in draw order; named elements and groups get a «// name» comment; i/k point back at the shape
     function screenLines(k, P, unknown) {
@@ -1429,15 +1626,18 @@
             (function walk(n) {
                 for (const c of n.kids) {
                     if (c.i == null) { if (nodeIdx(c).every(hiddenAt)) continue; if (customGroup(c.g)) out.push({ t: '// ' + c.g.name, i: -1, k }); walk(c); continue; }
-                    const s = S.shapes[c.i]; if (hiddenAt(c.i)) continue;
+                    const s = S.shapes[c.i], e = P.shapes.get(s); if (hiddenAt(c.i) || (!P.anim && s.vis === 0)) continue; // vis 0: off in the shown frame
                     if (customName(s)) out.push({ t: '// ' + s.name, i: c.i, k });
-                    for (const t of shapeCode(s, P.shapes.get(s), st)) out.push({ t, i: c.i, k });
+                    let lines = shapeCode(s, e, st); const vt = e && e.anim && e.anim.vis;
+                    // shown only while its visibility key says so; text settings made inside may not have happened
+                    if (vt) { lines = [`if (lcbKey(${vt.arr}, ${vt.tv})) {`, ...lines.map(l => '  ' + l), '}']; Object.assign(st, { font: undefined, size: undefined, color: null, wrap: false }); }
+                    for (const t of lines) out.push({ t, i: c.i, k });
                 }
             })(buildTree());
             return out;
         });
     }
-    const constLines = (vis, P) => vis.flatMap(s => { const e = P.shapes.get(s); return e.pre ? FIELDS[s.t].map(f => `constexpr int ${e.pre}_${f.toUpperCase()} = ${s[f]};`) : []; });
+    const constLines = (vis, P) => vis.flatMap(s => { const e = P.shapes.get(s); return e.pre ? FIELDS[s.t].filter(f => !(e.anim && e.anim[f])).map(f => `constexpr int ${e.pre}_${f.toUpperCase()} = ${s[f]};`) : []; });
     // PROGMEM arrays of a picture; data rows are marked so the panel can fold them
     const arrCache = new Map();
     function imgArrayLines(s, e) {
@@ -1465,7 +1665,7 @@
             s.font ? `  canvas.setFont(&${s.font});` : '  canvas.setFont();  // встроенный 5×7', `  canvas.setTextSize(${s.size});`, ...(lcb ? [] : [`  canvas.setTextColor(${colStr(s)});`]), '  canvas.setTextWrap(false);',
             ...(FONT_DATA[s.font] && FONT_DATA[s.font].cp ? ['  value = cp1251(value);  // UTF-8 → CP1251 для шрифта с кириллицей'] : []),
             '  // выравнивание считается на плате через getTextBounds', '  int16_t bx, by; uint16_t bw, bh;', '  canvas.getTextBounds(value, 0, 0, &bx, &by, &bw, &bh);',
-            ...(lcb ? [...(gradOk(s) ? [`  const LcbPaint p = ${paintLit(s)};`] : []), '  ' + lcbTextCall(s, e, gradOk(s) ? 'p' : `lcbSolid(${colStr(s)})`, cx, cy, 'value')]
+            ...(lcb ? [...(gradOk(s) ? [`  const LcbPaint p = ${paintLit(s, e)};`] : []), '  ' + lcbTextCall(s, e, gradOk(s) ? 'p' : `lcbSolid(${colStr(s)})`, cx, cy, 'value')]
                 : [`  canvas.setCursor(${cx}, ${cy});`, '  canvas.print(value);']), '}'];
     }
     // ---------- lcb…: gradients and anti-aliasing in the sketch (C++ twin of paintColor / px / aa… above) ----------
@@ -1735,8 +1935,9 @@ inline void lcbText(int16_t x, int16_t y, const char* s, const GFXfont* f, uint8
             '    }', '  }', '}'];
     }
     // gradient as a C++ initialiser; colours keep palette names
-    function paintLit(s) {
-        const P = makePaint(s), col = k => P.pc[k] && palEntry(P.pc[k]) ? P.pc[k] : fmt565(P.c[k]), pad = (a, z) => [...a, ...Array(4 - a.length).fill(z)];
+    function paintLit(s, e) {
+        const P = makePaint(s), st = [...s.grad.stops].sort((a, b) => a.p - b.p).slice(0, 4), pad = (a, z) => [...a, ...Array(4 - a.length).fill(z)]; // same order as makePaint
+        const col = k => e && e.anim && e.anim['g' + st[k].id] ? colE(s, e, 'g' + st[k].id) : P.pc[k] && palEntry(P.pc[k]) ? P.pc[k] : fmt565(P.c[k]);
         return `{ ${P.type === 2 ? 'LCB_RADIAL' : 'LCB_LINEAR'}, ${P.dx}, ${P.dy}, ${P.n}, { ${pad(P.c.map((_, k) => col(k)), '0').join(', ')} }, { ${pad(P.p, 0).join(', ')} }, ${P.dither} }`;
     }
     function lcbCall(s, e, P) {
@@ -1751,7 +1952,7 @@ inline void lcbText(int16_t x, int16_t y, const char* s, const GFXfont* f, uint8
         }
     }
     // one call, or a block with the gradient as a local constant
-    const lcbWrap = (s, body) => gradOk(s) ? [`{ const LcbPaint p = ${paintLit(s)};`, ...body('p').map((l, k, a) => '  ' + l + (k === a.length - 1 ? ' }' : ''))] : body(`lcbSolid(${colStr(s)})`);
+    const lcbWrap = (s, e, body) => gradOk(s) ? [`{ const LcbPaint p = ${paintLit(s, e)};`, ...body('p').map((l, k, a) => '  ' + l + (k === a.length - 1 ? ' }' : ''))] : body(`lcbSolid(${colE(s, e)})`);
     // a text line through lcbText / lcbTextGlcd; the box is the text block
     function lcbTextCall(s, e, P, cx, cy, lit) {
         const v = k => V(s, e, k), F = FONT_DATA[s.font], box = `${v('x')}, ${v('y')}, ${v('w')}, ${v('h')}`;
@@ -1759,7 +1960,111 @@ inline void lcbText(int16_t x, int16_t y, const char* s, const GFXfont* f, uint8
         return `lcbText(${cx}, ${cy}, ${lit}, &${s.font}, ${s.size}, ${P}, ${box}${aaOk(s) ? `, &${s.font}AA` : ''});`;
     }
 
-    function buildLines(P = plan()) {
+    // ---------- animations in the sketch (C++ twin of ease / evalTrack / followV above) ----------
+    // the types go above every function of the sketch: the Arduino IDE puts its generated prototypes before the first function
+    function lcbAnimTypes() {
+        return `// ---------- LCD Canvas Builder: анимации ----------
+// Ключевые кадры: между двумя ключами значение идёт от левого к правому с плавностью левого ключа.
+// Время — в мс, прогресс — целое 0…1024, поэтому плата считает те же значения, что и превью редактора.
+enum : uint8_t { LCB_E_LINEAR, LCB_E_IN, LCB_E_OUT, LCB_E_INOUT, LCB_E_STEP };
+enum : uint8_t { LCB_LOOP, LCB_PINGPONG, LCB_ONCE, LCB_VALUE };
+struct LcbKey { uint32_t t; int16_t v; uint8_t e; };     // время (мс), значение, плавность до следующего ключа
+struct LcbKeyC { uint32_t t; uint16_t c; uint8_t e; };   // то же для цвета RGB565: каналы меняются по отдельности
+// режим и длительность (мс); для LCB_VALUE ещё диапазон значения lo…hi и догон follow (мс); остальное — состояние
+struct LcbAnim {
+  uint8_t mode; uint32_t dur; int32_t lo, hi; uint32_t follow;
+  uint32_t start = 0; bool run = false; int32_t from = 0, to = 0; uint32_t t0 = 0;
+  LcbAnim(uint8_t m, uint32_t d, int32_t l = 0, int32_t h = 1, uint32_t f = 0) : mode(m), dur(d), lo(l), hi(h), follow(f) {}
+};
+uint32_t lcbNow = 0;   // время кадра: его ставит tick…(now)`.split('\n');
+    }
+    function lcbAnimLib() {
+        return `// ----- анимации: функции -----
+inline int32_t lcbEase(uint8_t e, int32_t p) {   // p: 0…1024
+  switch (e) {
+    case LCB_E_IN: return p * p >> 10;
+    case LCB_E_OUT: return 1024 - ((1024 - p) * (1024 - p) >> 10);
+    case LCB_E_INOUT: return p < 512 ? p * p >> 9 : 1024 - ((1024 - p) * (1024 - p) >> 9);
+    case LCB_E_STEP: return 0;
+    default: return p;
+  }
+}
+// значение дорожки в момент t
+template <size_t N> inline int16_t lcbKey(const LcbKey (&k)[N], uint32_t t) {
+  if (t <= k[0].t) return k[0].v;
+  for (size_t i = 0; i + 1 < N; i++) {
+    if (t >= k[i + 1].t) continue;
+    int32_t e = lcbEase(k[i].e, (int64_t)(t - k[i].t) * 1024 / (k[i + 1].t - k[i].t));
+    return k[i].v + (int32_t)(k[i + 1].v - k[i].v) * e / 1024;
+  }
+  return k[N - 1].v;
+}
+template <size_t N> inline uint16_t lcbKeyC(const LcbKeyC (&k)[N], uint32_t t) {
+  if (t <= k[0].t) return k[0].c;
+  for (size_t i = 0; i + 1 < N; i++) {
+    if (t >= k[i + 1].t) continue;
+    int32_t e = lcbEase(k[i].e, (int64_t)(t - k[i].t) * 1024 / (k[i + 1].t - k[i].t));
+    int32_t a = k[i].c, b = k[i + 1].c;
+    int32_t r = (a >> 11) + ((b >> 11) - (a >> 11)) * e / 1024;
+    int32_t g = ((a >> 5) & 63) + (((b >> 5) & 63) - ((a >> 5) & 63)) * e / 1024;
+    int32_t bl = (a & 31) + ((b & 31) - (a & 31)) * e / 1024;
+    return r << 11 | g << 5 | bl;
+  }
+  return k[N - 1].c;
+}
+// LCB_VALUE: показанное значение — догоняет новое за follow мс с торможением
+inline int32_t lcbValue(const LcbAnim& a, uint32_t now) {
+  if (!a.run) return a.lo;
+  int32_t dt = (int32_t)(now - a.t0);
+  if (dt < 0) dt = 0;
+  if (a.follow && (uint32_t)dt < a.follow) return a.from + (int64_t)(a.to - a.from) * lcbEase(LCB_E_OUT, (int64_t)dt * 1024 / a.follow) / 1024;
+  return a.to;
+}
+inline void lcbStart(LcbAnim& a) { a.start = millis(); a.run = true; }
+inline void lcbSet(LcbAnim& a, int32_t v) { uint32_t now = millis(); a.from = lcbValue(a, now); a.to = v; a.t0 = now; a.run = true; }
+// момент анимации (мс от её начала) в кадре lcbNow
+inline uint32_t lcbTime(const LcbAnim& a) {
+  uint32_t now = lcbNow;
+  switch (a.mode) {
+    case LCB_LOOP: return (now - a.start) % a.dur;
+    case LCB_PINGPONG: { uint32_t ph = (now - a.start) % (2 * a.dur); return ph <= a.dur ? ph : 2 * a.dur - ph; }
+    case LCB_ONCE: {
+      if (!a.run || (int32_t)(now - a.start) < 0) return 0;
+      uint32_t e = now - a.start;
+      return e < a.dur ? e : a.dur;
+    }
+    default: {
+      int32_t v = lcbValue(a, now);
+      if (v < a.lo) v = a.lo;
+      if (v > a.hi) v = a.hi;
+      return (uint32_t)((int64_t)(v - a.lo) * a.dur / (a.hi - a.lo));
+    }
+  }
+}`.split('\n');
+    }
+    // one key array: { time, value, easing }; a text key's value is the number of its case in the switch
+    function keyArrayLines(T) {
+        const { tr, s } = T, c = COLOR_P(tr.p), E = k => STEP_P(tr.p) ? 'LCB_E_STEP' : EASES.find(x => x[0] === k.e)[2];
+        const val = (k, i) => tr.p === 'text' ? i : c ? (k.pc && palEntry(k.pc) ? k.pc : fmt565(k.v)) : k.v;
+        const items = tr.keys.map((k, i) => `{ ${k.t}, ${val(k, i)}, ${E(k)} }`), head = `const ${c ? 'LcbKeyC' : 'LcbKey'} ${T.arr}[] = {`, note = `// ${s.name}: ${propName(s, tr.p)}`;
+        if (items.length <= 4 && tr.p !== 'text') return [`${head} ${items.join(', ')} };  ${note}`];
+        return [`${head}  ${note}`, ...items.map((it, i) => `  ${it},${tr.p === 'text' ? `  // «${String(tr.keys[i].v).replace(/\n/g, ' ')}»` : ''}`), '};'];
+    }
+    function animBlockLines(sc, list) {
+        const out = [`// ---------- анимации экрана «${sc.name}» ----------`];
+        for (const A of list) {
+            const a = A.a, m = MODES.find(x => x[0] === a.mode);
+            out.push(`// «${a.name}»: ${m[1]}` + (a.mode === 'value' ? ` ${a.lo}…${a.hi} (вся шкала — ${a.dur} мс)${a.follow ? `, догон ${a.follow} мс` : ''} — ${A.fn}(v)` : `, ${a.dur} мс${a.mode === 'once' ? ` — запуск: ${A.fn}()` : ''}`));
+            out.push(`LcbAnim ${A.v} = { ${m[2]}, ${a.dur}${a.mode === 'value' ? `, ${a.lo}, ${a.hi}, ${a.follow}` : ''} };`);
+            if (a.mode === 'once') out.push(`void ${A.fn}() { lcbStart(${A.v}); }`);
+            if (a.mode === 'value') out.push(`void ${A.fn}(int32_t v) { lcbSet(${A.v}, v); }`);
+            for (const T of A.tracks) out.push(...keyArrayLines(T));
+            out.push('');
+        }
+        return out;
+    }
+
+    function buildLines(P = plan(S.codeMode === 'full')) {
         const L = t => ({ t, i: -1 }), ind = l => ({ ...l, t: l.t ? '  ' + l.t : l.t });
         const pal = S.palette.map(p => L(`constexpr uint16_t ${p.n} = ${fmt565(p.c)};`));
         const all = P.vis.flatMap((v, k) => v.map(s => ({ s, k, e: P.shapes.get(s) })));
@@ -1771,6 +2076,7 @@ inline void lcbText(int16_t x, int16_t y, const char* s, const GFXfont* f, uint8
             if (cur.some(s => s.t === 'img')) notes.push(L(`// массивы картинок — в режиме «весь скетч»${header ? ' (images.h)' : ''}`));
             if (cur.some(s => s.t === 'text' && s.var)) notes.push(L('// функции меняющегося текста — в режиме «весь скетч»'));
             if (cur.some(usesLcb)) notes.push(L('// функции lcb… (градиенты и сглаживание) — в режиме «весь скетч»'));
+            if (S.screens[S.cur].anims.some(a => a.tracks.length)) notes.push(L('// анимации — в режиме «весь скетч»; здесь — кадр, на котором стоит бегунок'));
             const pre = [...pal, ...constLines(cur, P).map(L), ...notes], body = screenLines(S.cur, P, false);
             return pre.length ? [...pre, L(''), ...body] : body;
         }
@@ -1782,15 +2088,34 @@ inline void lcbText(int16_t x, int16_t y, const char* s, const GFXfont* f, uint8
             ...(consts.length ? [L('// координаты именованных элементов'), ...consts, L('')] : []),
             L('St7789* lcd;                 // драйвер (твоя библиотека)'), L('GFXcanvas16 canvas(W, H);    // холст в памяти, на нём рисуем'), L(''),
             ...(header ? [] : arrays()),
+            ...(P.ticks.some(Boolean) ? [...lcbAnimTypes().map(t => ({ t, i: -1, lib: true })), L('')] : []),
             ...(all.some(o => usesLcb(o.s)) ? [...lcbLib(all.some(o => o.s.t === 'text' && usesLcb(o.s) && !FONT_DATA[o.s.font])).map(t => ({ t, i: -1, lib: true })), L('')] : []),
+            ...(P.ticks.some(Boolean) ? [...lcbAnimLib().map(t => ({ t, i: -1, lib: true })), L('')] : []),
             L('// Показать холст на экране'), L('void present() {'), L('  lcd->drawImage(0, 0, W, H, canvas.getBuffer());'), L('}'), L(''),
-            ...vars.flatMap(o => [...varFnLines(o.s, o.e, bgExpr(S.screens[o.k])).map(L), L('')]),
+            ...vars.flatMap(o => [...(o.e.val ? [L(`String ${o.e.val} = "${cstr(varText(o.s))}";  // значение «${o.s.var}»: экран с анимацией перерисовывается целиком каждый кадр`)] : []), ...varFnLines(o.s, o.e, bgExpr(S.screens[o.k])).map(L), L('')]),
+            ...S.screens.flatMap((sc, k) => P.anims[k].length ? animBlockLines(sc, P.anims[k]).map(L) : []),
         ];
-        // with several screens a screen can't rely on text settings left by another one
+        // with several screens a screen can't rely on text settings left by another one; an animated screen can't rely on the previous frame
         const unknown = S.screens.length > 1;
-        S.screens.forEach((sc, k) => out.push(L(`// Экран «${sc.name}»`), L(`void ${P.fns[k]}() {`), L(`  canvas.fillScreen(${bgExpr(sc)});  // фон`), ...screenLines(k, P, unknown).map(ind), L('}'), L('')));
+        S.screens.forEach((sc, k) => {
+            const used = P.anims[k].filter(A => A.tracks.length);
+            out.push(L(`// Экран «${sc.name}»`), L(`void ${P.fns[k]}() {`), L(`  canvas.fillScreen(${bgExpr(sc)});  // фон`),
+                ...(used.length ? [L(`  const uint32_t ${used.map(A => `${A.tv} = lcbTime(${A.v})`).join(', ')};  // момент анимаций, мс`)] : []),
+                ...screenLines(k, P, unknown || !!P.ticks[k]).map(ind), L('}'), L(''));
+            if (P.ticks[k]) out.push(L(`// Кадр экрана «${sc.name}» с анимациями: вызывай в loop() — ${P.ticks[k]}(millis());`), L(`void ${P.ticks[k]}(uint32_t now) {`), L('  lcbNow = now;'), L(`  ${P.fns[k]}();`), L('  present();'), L('}'), L(''));
+        });
         out.push(L('void setup() {'), L('  Serial.begin(115200);'), L('  lcd = &Waveshare147::begin();'), L(''), L(`  ${P.fns[0]}();`), L('  present();'), L('}'), L(''), L('void loop() {'));
-        if (vars.length) { const o = vars[0]; out.push(L('  // пример обновления меняющегося текста:'), L(`  // ${o.e.fn}("${cstr(varText(o.s))}");`), L('  // present();')); }
+        if (P.ticks[0]) out.push(L(`  ${P.ticks[0]}(millis());  // кадр анимаций экрана «${S.screens[0].name}»`));
+        S.screens.forEach((sc, k) => { if (k && P.ticks[k]) out.push(L(`  // ${P.ticks[k]}(millis());  // вместо него — когда показан экран «${sc.name}»`)); });
+        for (const A of P.anims.flat()) {
+            if (A.a.mode === 'once') out.push(L(`  // ${A.fn}();  // запустить «${A.a.name}»`));
+            if (A.a.mode === 'value') out.push(L(`  // ${A.fn}(${Math.round((A.a.lo + A.a.hi) / 2)});  // «${A.a.name}»: значение ${A.a.lo}…${A.a.hi}`));
+        }
+        if (vars.length) {
+            const o = vars[0];
+            if (o.e.val) out.push(L('  // новое значение меняющегося текста (нарисуется со следующим кадром):'), L(`  // ${o.e.val} = "${cstr(varText(o.s))}";`));
+            else out.push(L('  // пример обновления меняющегося текста:'), L(`  // ${o.e.fn}("${cstr(varText(o.s))}");`), L('  // present();'));
+        }
         out.push(L('}'));
         return out;
     }
@@ -1839,8 +2164,7 @@ inline void lcbText(int16_t x, int16_t y, const char* s, const GFXfont* f, uint8
     function splitFunctions(src) {
         const out = [], re = /\bvoid\s+(\w+)\s*\(([^)]*)\)\s*\{/g; let m;
         while ((m = re.exec(src))) {
-            let d = 1, i = re.lastIndex, q = false;
-            for (; i < src.length && d; i++) { const ch = src[i]; if (q) { if (ch === '\\') i++; else if (ch === '"') q = false; } else if (ch === '"') q = true; else if (ch === '{') d++; else if (ch === '}') d--; }
+            const i = blockEnd(src, re.lastIndex);
             out.push({ name: m[1], params: m[2].trim(), body: src.slice(re.lastIndex, i - 1), start: m.index, end: i }); re.lastIndex = i;
         }
         return out;
@@ -1893,13 +2217,38 @@ inline void lcbText(int16_t x, int16_t y, const char* s, const GFXfont* f, uint8
         }
         return rect ? v : null;
     }
+    // body of a block that starts at `from` (just after its '{'), braces matched outside string literals → index after the closing '}'
+    function blockEnd(src, from) {
+        let d = 1, i = from, q = false;
+        for (; i < src.length && d; i++) { const ch = src[i]; if (q) { if (ch === '\\') i++; else if (ch === '"') q = false; } else if (ch === '"') q = true; else if (ch === '{') d++; else if (ch === '}') d--; }
+        return i;
+    }
+    // an animated sketch → its frame at 0 ms: lcbKey(arr, t) is the first key of arr; if (N) / switch (N) keep only the branch that runs
+    function staticFrame(src, pal, vars) {
+        const first = {};
+        for (const m of src.matchAll(/\bconst\s+LcbKeyC?\s+(\w+)\s*\[\s*\]\s*=\s*\{\s*\{\s*[^,{}]+,\s*([^,{}]+),/g)) { const v = evalNum(m[2], pal, vars); if (v != null) first[m[1]] = v; }
+        const strs = {}; for (const m of src.matchAll(/\bString\s+(\w+)\s*=\s*("(?:\\.|[^"\\])*")\s*;/g)) strs[m[1]] = m[2];
+        src = src.replace(/\blcbKeyC?\s*\(\s*(\w+)\s*,\s*\w+\s*\)/g, (m, n) => first[n] != null ? String(first[n]) : m).replace(/\b(\w+)\s*\.\s*c_str\s*\(\s*\)/g, (m, n) => strs[n] || m);
+        const branches = src => {
+            const re = /\b(if|switch)\s*\(\s*(-?\d+)\s*\)\s*\{/g; let m, out = '', last = 0;
+            while ((m = re.exec(src))) {
+                const end = blockEnd(src, re.lastIndex), body = src.slice(re.lastIndex, end - 1), n = +m[2]; let keep = '';
+                if (m[1] === 'if') keep = n ? body : '';
+                else { const cs = body.split(/\bcase\s+(-?\d+)\s*:/); for (let k = 1; k < cs.length; k += 2) if (+cs[k] === n) keep = cs[k + 1]; }
+                out += src.slice(last, m.index) + ' ' + branches(keep) + ' '; last = end; re.lastIndex = end;
+            }
+            return out + src.slice(last);
+        };
+        return branches(src);
+    }
     function parseCode(raw) {
         const names = {}; for (const m of raw.matchAll(/\/\/\s*Экран\s*«([^»\n]*)»\s*\n\s*void\s+(\w+)\s*\(/g)) names[m[2]] = m[1];
-        const src = raw.replace(/("(?:\\.|[^"\\])*")|\/\/.*$|\/\*[\s\S]*?\*\//gm, (m, q) => q || '');
+        let src = raw.replace(/("(?:\\.|[^"\\])*")|\/\/.*$|\/\*[\s\S]*?\*\//gm, (m, q) => q || '');
         const pal = {}, vars = {};
         for (const m of src.matchAll(/\b(?:constexpr|const)\s+uint16_t\s+([A-Za-z_]\w*)\s*=\s*([^;]+);/g)) { const v = evalNum(m[2], pal, vars); if (v != null) pal[m[1]] = v & 0xFFFF; }
         for (const m of src.matchAll(/\b(?:constexpr|const)\s+(?:int|int16_t|int32_t)\s+([A-Za-z_]\w*)\s*=\s*([^;]+);/g)) { if (m[1] === 'W' || m[1] === 'H') continue; const v = evalNum(m[2], pal, vars); if (v != null) vars[m[1]] = v; }
-        const ctx = { pal, vars, varFns: {}, skipped: 0, imgSkipped: 0, pcOf: a => a != null && pal[a.trim()] != null ? a.trim() : '' };
+        const anim = /\bLcbAnim\b/.test(src); if (anim) src = staticFrame(src, pal, vars);
+        const ctx = { pal, vars, varFns: {}, skipped: 0, imgSkipped: 0, anim, pcOf: a => a != null && pal[a.trim()] != null ? a.trim() : '' };
         const fns = splitFunctions(src);
         for (const f of fns) if (/^const\s+char\s*\*\s*\w+$/.test(f.params)) { const v = parseVarFn(f, ctx); if (v) ctx.varFns[f.name] = v; }
         const scr = fns.filter(f => !f.params && !['setup', 'loop', 'present'].includes(f.name) && /canvas\s*\./.test(f.body));
@@ -2021,7 +2370,7 @@ inline void lcbText(int16_t x, int16_t y, const char* s, const GFXfont* f, uint8
             if (sc.bg != null) { S.bg = sc.bg; S.bgPc = sc.bgPc; }
         }
         S.screens.forEach((_, k) => withScreen(k, () => { ensureNames(); normalize(); }));
-        importMsg.textContent = `Загружено фигур: ${n}${r.multi ? `, экранов: ${r.screens.length}` : ''}${np ? `, цветов палитры: ${np}` : ''}${r.skipped ? `, пропущено: ${r.skipped} (не разобрал аргументы)` : ''}${r.imgSkipped ? `. Картинки не импортируются — пропущено вызовов: ${r.imgSkipped}` : ''}.`;
+        importMsg.textContent = `Загружено фигур: ${n}${r.multi ? `, экранов: ${r.screens.length}` : ''}${np ? `, цветов палитры: ${np}` : ''}${r.skipped ? `, пропущено: ${r.skipped} (не разобрал аргументы)` : ''}${r.imgSkipped ? `. Картинки не импортируются — пропущено вызовов: ${r.imgSkipped}` : ''}${r.anim ? '. Анимации не импортируются — загружен кадр на 0 мс' : ''}.`;
         syncSettings(); update();
     }
     const uniqueName = (base, taken) => { let n = base, k = 2; while (taken.includes(n)) n = base + ' ' + k++; return n; };
@@ -2072,6 +2421,233 @@ inline void lcbText(int16_t x, int16_t y, const char* s, const GFXfont* f, uint8
         inp.addEventListener('blur', () => fin(true));
     });
     function uniqueVar(base, ids) { let n = base, k = 2; while (ids.has(n)) n = base + k++; ids.add(n); return n; }
+
+    // ---------- timeline: animations of the current screen ----------
+    // time is in ms everywhere; in the value mode the axis is labelled in values (value → moment: valueT)
+    const tlEl = document.getElementById('tl'); let tlHtml = '';
+    const INSET = 8; // px kept free at both ends of a lane, so that keys at 0 and at the end stay clickable
+    // keep the open animation, the playhead and the selected keys valid after any change (undo, deleted shapes, a shorter animation)
+    function animFix() {
+        const as = anims(); if (!as[AN.k]) AN.k = Math.max(0, as.length - 1);
+        const a = openAnim(); if (!a) { AN.rec = false; AN.sel = []; AN.t = 0; stopPlay(); return; }
+        AN.t = Math.max(0, Math.min(a.dur, AN.t | 0));
+        const live = new Set(a.tracks.flatMap(tr => tr.keys)); AN.sel = AN.sel.filter(k => live.has(k));
+    }
+    const trackOfKey = k => { const a = openAnim(); return a && a.tracks.find(tr => tr.keys.includes(k)); };
+    const keyLabel = (a, t) => a.mode === 'value' ? String(tValue(a, t)) : t + ' мс';
+    function niceStep(span, px, minPx) { const raw = span * minPx / Math.max(1, px), p = 10 ** Math.floor(Math.log10(raw || 1)); for (const m of [1, 2, 5, 10]) if (m * p >= raw) return Math.max(1, m * p); return 10 * p; }
+    const tlPos = f => `calc(${INSET}px + (100% - ${2 * INSET}px) * ${Math.max(0, Math.min(1, f))})`;
+    function renderTimeline() {
+        if (tlEl.contains(document.activeElement) && document.activeElement.matches('input:not([type=checkbox]):not([type=range]),select')) { renderPlayhead(); return; } // don't rebuild under typing
+        const as = anims(), a = openAnim(), sc = S.screens[S.cur];
+        const chips = as.map((x, k) => `<button class="tl-a" data-k="${k}" aria-pressed="${k === AN.k}" title="Двойной клик — переименовать">${esc(x.name)}<span class="tl-n">${x.tracks.length}</span></button>`).join('');
+        let h = `<div class="tl-head"><span class="tl-title">Анимации</span>${chips}<button class="tab-b" data-a="add" title="Новая анимация экрана" aria-label="Новая анимация">+</button>`;
+        tlEl.toggleAttribute('data-folded', !!S.tlFolded && !!a);
+        if (!a) { tlEl.dataset.empty = ''; h += '<span class="msg">У этого экрана анимаций нет. Нажми +, двигай фигуры с включённой записью ● — получатся ключевые кадры.</span></div>'; }
+        else {
+            delete tlEl.dataset.empty;
+            h += `<button class="tab-b" data-a="dup" title="Дублировать анимацию" aria-label="Дублировать анимацию">⧉</button><button class="tab-b" data-a="del" title="Удалить анимацию" aria-label="Удалить анимацию">×</button>
+      <span class="seg" id="tlMode">${MODES.map(([m, l]) => `<button data-v="${m}" aria-pressed="${a.mode === m}">${l}</button>`).join('')}</span>
+      <label class="set" title="Длительность, мс${a.mode === 'value' ? ': на весь диапазон значения' : ''}">длит. <input type="number" id="tlDur" min="1" max="600000" value="${a.dur}" style="width:72px"> мс</label>`
+                + (a.mode === 'value' ? `<label class="set">от <input type="number" id="tlLo" value="${a.lo}" style="width:60px"></label><label class="set">до <input type="number" id="tlHi" value="${a.hi}" style="width:60px"></label>
+      <label class="set" title="За сколько мс показ догоняет новое значение (0 — сразу)">догон <input type="number" id="tlFollow" min="0" max="60000" value="${a.follow}" style="width:60px"> мс</label>
+      <label class="set" title="Проверить догон: задай значение, как setЗначение(v) на плате">значение <input type="number" id="tlVal" value="${tValue(a, AN.t)}" style="width:60px"></label>` : '')
+                + `<span class="grow"></span><button class="btn tl-rec" id="tlRec" aria-pressed="${AN.rec}" title="Запись: любое изменение фигуры ставит ключ на бегунке">● запись</button>
+      <button class="btn" id="tlPlay" title="Проиграть (пробел)" aria-label="${AN.play ? 'Пауза' : 'Проиграть'}">${AN.play ? '⏸' : '▶'}</button><span class="spec tl-time" id="tlTime"></span>
+      <button class="tab-b" id="tlFold" title="${S.tlFolded ? 'Развернуть таймлайн' : 'Свернуть таймлайн: холсту больше места'}" aria-label="${S.tlFolded ? 'Развернуть таймлайн' : 'Свернуть таймлайн'}">${S.tlFolded ? '▴' : '▾'}</button></div>`;
+            h += keyEditor(a);
+            // ruler: ms, or values in the value mode
+            const W = Math.max(100, (tlEl.clientWidth || 600) - 170), span = a.mode === 'value' ? a.hi - a.lo : a.dur, step = niceStep(span, W, 64), ticks = [];
+            for (let u = 0; u <= span; u += step) ticks.push(`<span class="tl-tick" style="left:${tlPos(u / span)}">${a.mode === 'value' ? a.lo + u : u}</span>`);
+            h += `<div class="tl-grid" id="tlGrid"><div class="tl-row tl-ruler"><div class="tl-lbl">${a.mode === 'value' ? 'значение' : 'мс'}</div><div class="tl-lane" data-lane>${ticks.join('')}</div></div>`;
+            const sel = new Set(AN.sel), kf = (k, tr) => `<button class="kf${k.t > a.dur ? ' late' : ''}" data-tr="${a.tracks.indexOf(tr)}" data-kk="${tr.keys.indexOf(k)}" style="left:${tlPos(k.t / a.dur)}" aria-pressed="${sel.has(k)}" title="${escA(propName(S.shapes.find(s => s.id === tr.id), tr.p) + ' · ' + keyLabel(a, k.t) + ' · ' + keyValue(tr, k))}" aria-label="Ключ ${keyLabel(a, k.t)}"></button>`;
+            const byShape = new Map(); for (const tr of a.tracks) { if (!byShape.has(tr.id)) byShape.set(tr.id, []); byShape.get(tr.id).push(tr); }
+            for (const s of [...sc.shapes].reverse()) {
+                const trs = byShape.get(s.id); if (!trs) continue;
+                const fold = AN.fold.has(s.id), on = S.sel.some(i => S.shapes[i] === s), times = [...new Set(trs.flatMap(tr => tr.keys.map(k => k.t)))];
+                h += `<div class="tl-row tl-shape${on ? ' on' : ''}" data-id="${s.id}"><div class="tl-lbl"><button class="ly-tw" data-a="fold" aria-label="${fold ? 'Развернуть' : 'Свернуть'}">${fold ? '▸' : '▾'}</button><svg class="ly-ic" viewBox="0 0 24 24">${ICONS[s.t]}</svg><span class="tl-nm">${esc(s.name || '')}</span></div><div class="tl-lane" data-lane>${times.map(t => `<span class="kf-sum" style="left:${tlPos(t / a.dur)}"></span>`).join('')}</div></div>`;
+                if (!fold) for (const tr of trs.sort((p, q) => animProps(s).indexOf(p.p) - animProps(s).indexOf(q.p))) h += `<div class="tl-row"><div class="tl-lbl tl-prop">${esc(propName(s, tr.p))}</div><div class="tl-lane" data-lane>${tr.keys.map(k => kf(k, tr)).join('')}</div></div>`;
+            }
+            if (!a.tracks.length) h += `<div class="tl-row"><div class="tl-lbl"></div><div class="msg tl-empty">Ключей пока нет. ${AN.rec ? 'Запись включена: поставь бегунок и измени фигуру — двигай, тяни ручки, меняй цвет.' : 'Включи ● запись и измени фигуру или нажми ◆ у свойства в панели фигуры.'}</div></div>`;
+            h += '<div class="tl-ph" id="tlPh"></div></div>';
+        }
+        if (h !== tlHtml) { tlEl.innerHTML = tlHtml = h; }
+        renderPlayhead();
+    }
+    function keyValue(tr, k) { return tr.p === 'vis' ? (k.v ? 'видна' : 'скрыта') : tr.p === 'text' ? '«' + k.v + '»' : COLOR_P(tr.p) ? (k.pc || fmt565(k.v)) : String(k.v); }
+    // selected keys: one → time, value and easing; several → common easing
+    function keyEditor(a) {
+        if (!AN.sel.length) return '';
+        const ks = AN.sel, k = ks[0], tr = trackOfKey(k), s = tr && S.shapes.find(x => x.id === tr.id); if (!tr || !s) return '';
+        const eSel = ks.every(x => !STEP_P(trackOfKey(x).p)) ? `<label class="set">плавность до следующего <select id="kfE">${EASES.map(([v, l]) => `<option value="${v}"${ks.every(x => x.e === v) ? ' selected' : ''}>${l}</option>`).join('')}${ks.some(x => x.e !== k.e) ? '<option value="" selected>—</option>' : ''}</select></label>` : '';
+        if (ks.length > 1) return `<div class="tl-key"><span class="set">выбрано ключей: <b>${ks.length}</b></span>${eSel}<button class="btn danger" id="kfDel">Удалить</button><span class="msg">Shift+клик — добавить ключ, тяни — сдвинуть все, ⌘/Ctrl+C / V — копировать на бегунок.</span></div>`;
+        let val;
+        if (tr.p === 'vis') val = `<label class="set"><input type="checkbox" id="kfVis"${k.v ? ' checked' : ''}> видна</label>`;
+        else if (tr.p === 'text') val = `<input type="text" id="kfText" value="${escA(k.v)}" style="width:160px" aria-label="Текст">`;
+        else if (COLOR_P(tr.p)) val = `<input type="color" id="kfC" value="${toHex(k.v)}" aria-label="Цвет">${S.palette.length ? `<select id="kfPc" aria-label="Из палитры"><option value="">${fmt565(k.v)}</option>${S.palette.map(p => `<option${p.n === k.pc ? ' selected' : ''}>${p.n}</option>`).join('')}</select>` : `<span class="spec">${fmt565(k.v)}</span>`}`;
+        else val = `<input type="number" id="kfV" value="${k.v}" style="width:64px" aria-label="Значение">`;
+        return `<div class="tl-key"><span class="set"><b>${esc(s.name)}</b> · ${esc(propName(s, tr.p))}</span><label class="set">${a.mode === 'value' ? 'значение' : 'время, мс'} <input type="number" id="kfT" value="${a.mode === 'value' ? tValue(a, k.t) : k.t}" style="width:72px"></label>${val}${eSel}<button class="btn danger" id="kfDel">Удалить</button></div>`;
+    }
+    function renderPlayhead() {
+        const a = openAnim(), ph = document.getElementById('tlPh'), tm = document.getElementById('tlTime'); if (!a) return;
+        if (ph) ph.style.left = `calc(var(--lbl) + ${INSET}px + (100% - var(--lbl) - ${2 * INSET}px) * ${AN.t / a.dur})`;
+        if (tm) tm.textContent = a.mode === 'value' ? `значение ${tValue(a, AN.t)} · ${AN.t} мс` : `${AN.t} / ${a.dur} мс`;
+    }
+    // a frame without the full update: playback and scrubbing
+    function showFrame() { animApply(); render(); renderPlayhead(); }
+    // lane x → ms (snapped to 10 ms unless Alt; near a key or the playhead it sticks to it)
+    function laneT(e, r, a, keys) {
+        const w = r.width - 2 * INSET, f = Math.max(0, Math.min(1, (e.clientX - r.left - INSET) / w));
+        let t = Math.round(f * a.dur); if (!e.altKey) t = Math.min(a.dur, Math.round(t / 10) * 10);
+        for (const kt of keys || []) if (Math.abs((kt - f * a.dur) / a.dur * w) <= 5) return kt;
+        return t;
+    }
+    function stopPlay() { if (AN.play) { cancelAnimationFrame(AN.play.raf); AN.play = null; } if (AN.follow) { cancelAnimationFrame(AN.follow.raf); AN.follow = null; } }
+    // playback in the editor: loop and ping-pong repeat, once stops at the end, the value mode sweeps there and back
+    function togglePlay() {
+        const a = openAnim(); if (!a) return;
+        if (AN.play) { stopPlay(); update(); return; }
+        stopPlay(); if (a.mode === 'once' && AN.t >= a.dur) AN.t = 0;
+        const t0 = performance.now() - AN.t;
+        const step = () => {
+            const el = Math.floor(performance.now() - t0), d = a.dur;
+            if (a.mode === 'loop') AN.t = el % d;
+            else if (a.mode === 'once') AN.t = Math.min(el, d);
+            else { const ph = el % (2 * d); AN.t = ph <= d ? ph : 2 * d - ph; }
+            showFrame();
+            if (a.mode === 'once' && AN.t >= d) { AN.play = null; update(); return; }
+            AN.play.raf = requestAnimationFrame(step);
+        };
+        AN.play = { raf: requestAnimationFrame(step) }; renderTimeline();
+    }
+    // value mode: a new value is followed like lcbSet() does on the board
+    function previewValue(a, v) {
+        stopPlay(); const from = tValue(a, AN.t), f = { from, to: v, t0: performance.now() };
+        if (!a.follow) { AN.t = valueT(a, v); update(); return; }
+        const step = () => { AN.t = valueT(a, followV(a, f, performance.now())); showFrame(); if (performance.now() - f.t0 >= a.follow) { AN.follow = null; update(); return; } AN.follow.raf = requestAnimationFrame(step); };
+        AN.follow = { raf: requestAnimationFrame(step) };
+    }
+    function newAnim(name) { return { name, mode: 'loop', dur: 1000, lo: 0, hi: 100, follow: 0, tracks: [] }; }
+    tlEl.addEventListener('click', e => {
+        const chip = e.target.closest('.tl-a'), b = e.target.closest('[data-a]'), a = openAnim();
+        if (chip) { if (+chip.dataset.k !== AN.k) { stopPlay(); AN.k = +chip.dataset.k; AN.t = 0; AN.sel = []; update(); } return; }
+        if (b && b.dataset.a === 'fold') { const id = +b.closest('[data-id]').dataset.id; AN.fold.has(id) ? AN.fold.delete(id) : AN.fold.add(id); renderTimeline(); return; }
+        if (b) {
+            const as = anims(), names = as.map(x => x.name); stopPlay(); push();
+            if (b.dataset.a === 'add') { as.push(newAnim(uniqueName('Анимация ' + (as.length + 1), names))); AN.k = as.length - 1; AN.t = 0; AN.rec = true; }
+            if (b.dataset.a === 'dup' && a) {
+                const c = JSON.parse(JSON.stringify(a)); c.name = uniqueName(a.name + ' копия', names); c.tracks = []; // one property belongs to one animation: the copy starts empty but keeps the settings
+                as.splice(AN.k + 1, 0, c); AN.k++; AN.t = 0;
+            }
+            if (b.dataset.a === 'del' && a) { as.splice(AN.k, 1); AN.k = Math.max(0, AN.k - 1); AN.t = 0; }
+            AN.sel = []; update(); return;
+        }
+        const mode = e.target.closest('#tlMode button');
+        if (mode && a && a.mode !== mode.dataset.v) { push(); a.mode = mode.dataset.v; update(); return; }
+        if (e.target.closest('#tlRec')) { AN.rec = !AN.rec; renderTimeline(); renderInspector(); return; }
+        if (e.target.closest('#tlPlay')) { togglePlay(); return; }
+        if (e.target.closest('#tlFold')) { S.tlFolded = !S.tlFolded; update(); return; }
+        if (e.target.closest('#kfDel')) { delKeys(); return; }
+        const nm = e.target.closest('.tl-shape .tl-nm');
+        if (nm) { const i = S.shapes.findIndex(s => s.id === +nm.closest('[data-id]').dataset.id); if (i >= 0) { setSel([i]); S.tool = 'select'; update(); } }
+    });
+    tlEl.addEventListener('dblclick', e => {
+        const chip = e.target.closest('.tl-a'); if (!chip) return; const a = anims()[+chip.dataset.k];
+        const inp = document.createElement('input'); inp.type = 'text'; inp.className = 'tab-in'; inp.value = a.name; inp.setAttribute('aria-label', 'Имя анимации');
+        chip.replaceWith(inp); inp.focus(); inp.select();
+        let done = false;
+        const fin = ok => { if (done) return; done = true; const v = inp.value.trim(); if (ok && v && v !== a.name) { push(); a.name = uniqueName(v, anims().filter(x => x !== a).map(x => x.name)); } inp.blur(); tlHtml = ''; update(); };
+        inp.addEventListener('keydown', ev => { ev.stopPropagation(); if (ev.key === 'Enter') fin(true); if (ev.key === 'Escape') fin(false); });
+        inp.addEventListener('blur', () => fin(true));
+    });
+    tlEl.addEventListener('change', e => {
+        const a = openAnim(), id = e.target.id; if (!a) return;
+        const num = (lo, hi) => { const v = Math.round(+e.target.value); return e.target.value === '' || isNaN(v) ? null : Math.max(lo, Math.min(hi, v)); };
+        if (id === 'tlDur') { const v = num(1, 600000); if (v != null && v !== a.dur) { push(); a.dur = v; } }
+        if (id === 'tlLo' || id === 'tlHi') {
+            const v = num(-2e9, 2e9); if (v != null) { push(); if (id === 'tlLo') a.lo = v; else a.hi = v; if (a.hi <= a.lo) { if (id === 'tlLo') a.hi = a.lo + 1; else a.lo = a.hi - 1; } }
+        }
+        if (id === 'tlFollow') { const v = num(0, 60000); if (v != null) { push(); a.follow = v; } }
+        if (id === 'tlVal') { const v = num(-2e9, 2e9); e.target.blur(); if (v != null) previewValue(a, v); return; }
+        // key editor
+        const k = AN.sel[0], tr = k && trackOfKey(k);
+        if (id === 'kfE' && e.target.value) { push(); for (const x of AN.sel) if (!STEP_P(trackOfKey(x).p)) x.e = e.target.value; }
+        if (tr && id === 'kfT') {
+            let t = num(a.mode === 'value' ? Math.min(a.lo, a.hi) : 0, a.mode === 'value' ? Math.max(a.lo, a.hi) : a.dur);
+            if (t != null) { if (a.mode === 'value') t = valueT(a, t); if (t !== k.t) { push(); moveKeys(new Map([[k, t]])); } }
+        }
+        if (tr && id === 'kfV') { const v = num(-32768, 32767); if (v != null) { push(); k.v = v; } }
+        if (tr && id === 'kfText') { push(); k.v = e.target.value; }
+        if (tr && id === 'kfVis') { push(); k.v = e.target.checked ? 1 : 0; }
+        if (tr && id === 'kfPc') { const p = palEntry(e.target.value); push(); if (p) { k.v = p.c; k.pc = p.n; } else delete k.pc; }
+        e.target.blur(); update();
+    });
+    tlEl.addEventListener('input', e => { const k = AN.sel[0]; if (e.target.id === 'kfC' && k) { push('kfc'); k.v = to565(e.target.value); delete k.pc; update(true); } });
+    // new times for keys (Map key → t); a moved key takes the place of a key that was at that time
+    function moveKeys(to) {
+        const a = openAnim();
+        for (const tr of a.tracks) {
+            if (!tr.keys.some(k => to.has(k))) continue;
+            for (const [k, t] of to) if (tr.keys.includes(k)) k.t = t;
+            const taken = new Set(tr.keys.filter(k => to.has(k)).map(k => k.t));
+            tr.keys = tr.keys.filter(k => to.has(k) || !taken.has(k.t)).sort((p, q) => p.t - q.t);
+        }
+    }
+    function delKeys() { if (!AN.sel.length) return; push(); const del = new Set(AN.sel); for (const tr of openAnim().tracks) tr.keys = tr.keys.filter(k => !del.has(k)); AN.sel = []; update(); }
+    // keys to the clipboard: track, offset from the first one, value
+    function copyKeys() {
+        const a = openAnim(); if (!a || !AN.sel.length) return false; const t0 = Math.min(...AN.sel.map(k => k.t));
+        AN.clip = AN.sel.map(k => { const tr = trackOfKey(k); return { id: tr.id, p: tr.p, dt: k.t - t0, k: { ...k } }; }); return true;
+    }
+    function pasteKeys() {
+        const a = openAnim(); if (!a || !AN.clip) return false; push(); const sel = [];
+        for (const c of AN.clip) {
+            const s = S.shapes.find(x => x.id === c.id); if (!s || !animProps(s).includes(c.p)) continue;
+            const o = trackOf(c.id, c.p); if (o && o.a !== a) { flash(`«${propName(s, c.p)}» у «${s.name}» анимируется в «${o.a.name}».`); continue; }
+            let tr = o && o.tr; if (!tr) { tr = { id: c.id, p: c.p, keys: [] }; a.tracks.push(tr); }
+            const t = Math.min(a.dur, AN.t + c.dt), k = setKey(tr, t, c.k.v, c.k.pc); k.e = c.k.e; sel.push(k);
+        }
+        AN.sel = sel; update(); return true;
+    }
+    // pointer: a key — select (Shift adds) and drag; a lane — move the playhead
+    let tlDrag = null;
+    tlEl.addEventListener('pointerdown', e => {
+        AN.focus = true; const a = openAnim(); if (!a || e.button !== 0) return;
+        const kf = e.target.closest('.kf'), lane = e.target.closest('[data-lane]');
+        if (kf) {
+            const tr = a.tracks[+kf.dataset.tr], k = tr.keys[+kf.dataset.kk];
+            if (e.shiftKey) { AN.sel = AN.sel.includes(k) ? AN.sel.filter(x => x !== k) : [...AN.sel, k]; update(); return; }
+            if (!AN.sel.includes(k)) AN.sel = [k];
+            tlEl.setPointerCapture(e.pointerId);
+            tlDrag = { mode: 'keys', r: kf.parentElement.getBoundingClientRect(), k, x0: e.clientX, orig: new Map(AN.sel.map(x => [x, x.t])), snap: snapshot(), moved: false };
+            update(); return;
+        }
+        if (lane) {
+            stopPlay(); tlEl.setPointerCapture(e.pointerId);
+            const keys = [...new Set(a.tracks.flatMap(tr => tr.keys.map(k => k.t)))];
+            tlDrag = { mode: 'scrub', r: lane.getBoundingClientRect(), keys }; if (!e.shiftKey) AN.sel = []; // the lanes are rebuilt while dragging: keep the rectangle
+            AN.t = laneT(e, tlDrag.r, a, keys); renderTimeline(); showFrame();
+        }
+    });
+    tlEl.addEventListener('pointermove', e => {
+        const a = openAnim(); if (!tlDrag || !a) return;
+        if (tlDrag.mode === 'scrub') { AN.t = laneT(e, tlDrag.r, a, tlDrag.keys); showFrame(); return; }
+        const w = tlDrag.r.width - 2 * INSET; let dt = Math.round((e.clientX - tlDrag.x0) / w * a.dur);
+        if (!tlDrag.moved && Math.abs(e.clientX - tlDrag.x0) < 3) return;
+        if (!e.altKey) { const t = tlDrag.orig.get(tlDrag.k) + dt, near = Math.abs((t - AN.t) / a.dur * w) <= 5 ? AN.t : Math.round(t / 10) * 10; dt = near - tlDrag.orig.get(tlDrag.k); }
+        const lo = Math.min(...tlDrag.orig.values()), hi = Math.max(...tlDrag.orig.values()); dt = Math.max(-lo, Math.min(a.dur - hi, dt));
+        if (!tlDrag.moved) { push('', tlDrag.snap); tlDrag.moved = true; }
+        for (const [k, t] of tlDrag.orig) k.t = t + dt;
+        for (const tr of a.tracks) tr.keys.sort((p, q) => p.t - q.t);
+        showFrame(); renderTimeline();
+    });
+    const tlUp = () => {
+        if (!tlDrag) return; const d = tlDrag; tlDrag = null;
+        if (d.mode === 'keys' && d.moved) moveKeys(new Map([...d.orig.keys()].map(k => [k, k.t])));
+        update();
+    };
+    tlEl.addEventListener('pointerup', tlUp); tlEl.addEventListener('pointercancel', tlUp);
+    document.addEventListener('pointerdown', e => { if (!tlEl.contains(e.target)) AN.focus = false; }, true);
 
     // ---------- adding pictures: file button / I, drag and drop onto the stage, paste ----------
     const fileIn = document.getElementById('imgFile'), stageMsg = document.getElementById('stageMsg');
@@ -2521,6 +3097,11 @@ void loop() {
     document.addEventListener('keydown', e => {
         if (e.target.matches('input,textarea,select')) return;
         const k = e.key, mod = e.ctrlKey || e.metaKey;
+        // the timeline was clicked last: Delete and ⌘/Ctrl+C / V work on its keys
+        if (AN.focus && AN.sel.length && !mod && (k === 'Delete' || k === 'Backspace')) { e.preventDefault(); delKeys(); return; }
+        if (AN.focus && mod && !e.altKey && e.code === 'KeyC' && getSelection().isCollapsed && copyKeys()) { e.preventDefault(); return; }
+        if (AN.focus && mod && !e.altKey && e.code === 'KeyV' && AN.clip) { e.preventDefault(); pasteKeys(); return; }
+        if (k === ' ' && !mod && openAnim()) { e.preventDefault(); togglePlay(); return; }
         // e.code, so shortcuts work with any keyboard layout
         if (mod && e.code === 'KeyZ') { e.preventDefault(); e.shiftKey ? redo() : undo(); return; }
         if (mod && e.code === 'KeyY') { e.preventDefault(); redo(); return; }
@@ -2536,7 +3117,7 @@ void loop() {
         if (map[k.toLowerCase()]) { setTool(map[k.toLowerCase()]); return; }
         if (k.toLowerCase() === 'f') { toggleFill(); return; }
         if (e.code === 'KeyI') { fileIn.click(); return; }
-        if (k === 'Escape') { triPts = null; preview = null; S.sel = []; update(); return; }
+        if (k === 'Escape') { triPts = null; preview = null; S.sel = []; AN.sel = []; update(); return; }
         if ((k === 'Delete' || k === 'Backspace') && S.sel.length) { e.preventDefault(); act('del'); return; }
         const arrows = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
         if (arrows[k] && S.sel.length) { e.preventDefault(); const n = e.shiftKey ? 10 : 1; push('nudge' + S.sel.join()); shiftSel(S.sel, arrows[k][0] * n, arrows[k][1] * n); update(); }
@@ -2544,8 +3125,11 @@ void loop() {
 
     // ---------- update ----------
     function update(fast) {
-        syncPalette();
-        render(); status(); renderCode(); renderLayers(); renderPalette(); renderBgPc(); renderTabs(); renderFonts();
+        ensureIds();
+        if (AN.play || AN.follow) stopPlay(); // any change pauses playback, so keys don't land at a random moment
+        if (AN.scr !== S.cur) { stopPlay(); Object.assign(AN, { scr: S.cur, k: 0, t: 0, sel: [], follow: null }); animBase = new Map(); }
+        animDetect(); syncPalette(); animClean(); animFix(); animApply();
+        renderTimeline(); render(); status(); renderCode(); renderLayers(); renderPalette(); renderBgPc(); renderTabs(); renderFonts();
         if (!fast || !insBody.contains(document.activeElement)) renderInspector();
         else { const s = one(); if (s) insBody.querySelectorAll('input[data-k]').forEach(inp => { if (inp !== document.activeElement) inp.value = s[inp.dataset.k]; }); }
         rail.querySelectorAll('[data-tool]').forEach(b => b.setAttribute('aria-pressed', b.dataset.tool === S.tool));
@@ -2560,7 +3144,7 @@ void loop() {
         hintEl.textContent = HINTS[S.tool];
         save();
     }
-    window.addEventListener('resize', () => { syncSettings(); render(); });
-    S.screens.forEach((_, k) => withScreen(k, () => { ensureNames(); normalize(); }));
+    window.addEventListener('resize', () => { syncSettings(); render(); renderTimeline(); });
+    ensureIds(); S.screens.forEach((_, k) => withScreen(k, () => { ensureNames(); normalize(); }));
     syncSettings(); update();
 })();

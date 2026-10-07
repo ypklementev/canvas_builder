@@ -119,8 +119,23 @@ textarea {
 .app {
     display: grid;
     grid-template-columns: 64px minmax(0, 1fr) 380px;
-    grid-template-rows: auto minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr) auto;
     height: 100%
+}
+
+.rail {
+    grid-column: 1;
+    grid-row: 2 / 4
+}
+
+.stage {
+    grid-column: 2;
+    grid-row: 2
+}
+
+.side {
+    grid-column: 3;
+    grid-row: 2 / 4
 }
 
 header {
@@ -939,6 +954,275 @@ dialog#rxDlg::backdrop {
     gap: 6px
 }
 
+/* timeline: animations of the screen, under the stage */
+.tl {
+    grid-column: 2;
+    grid-row: 3;
+    border-top: 1px solid var(--line);
+    background: var(--panel);
+    padding: 8px 12px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-height: 0;
+    overflow: auto;
+    --lbl: 150px
+}
+
+/* a fixed height while there is an animation: new tracks scroll inside instead of re-zooming the canvas under the mouse */
+.tl:not([data-empty]):not([data-folded]) {
+    height: clamp(160px, 28vh, 280px)
+}
+
+.tl[data-folded] .tl-key,
+.tl[data-folded] .tl-grid {
+    display: none
+}
+
+.tl-head,
+.tl-key {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap
+}
+
+.tl-head .grow {
+    flex: 1
+}
+
+.tl-title {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    color: var(--muted);
+    font-weight: 600
+}
+
+.tl-a {
+    border: 1px solid var(--line);
+    background: var(--bg);
+    border-radius: 6px;
+    padding: 3px 8px;
+    font-size: 12px;
+    cursor: pointer;
+    display: inline-flex;
+    gap: 6px;
+    align-items: center;
+    max-width: 22ch;
+    white-space: nowrap
+}
+
+.tl-a[aria-pressed=true] {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+    color: var(--accent);
+    font-weight: 600
+}
+
+.tl-n {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--muted)
+}
+
+.tl-rec[aria-pressed=true] {
+    background: var(--danger);
+    border-color: var(--danger);
+    color: #fff
+}
+
+.tl-time {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    min-width: 13ch;
+    text-align: right
+}
+
+.tl-key {
+    padding: 5px 8px;
+    border-radius: 6px;
+    background: var(--bg)
+}
+
+.tl-grid {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    user-select: none
+}
+
+.tl-row {
+    display: grid;
+    grid-template-columns: var(--lbl) minmax(0, 1fr);
+    min-height: 22px;
+    align-items: stretch;
+    border-bottom: 1px solid var(--line)
+}
+
+.tl-lbl {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    overflow: hidden;
+    white-space: nowrap;
+    padding-right: 6px
+}
+
+.tl-prop {
+    padding-left: 34px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--muted)
+}
+
+.tl-nm {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    cursor: pointer
+}
+
+.tl-shape.on .tl-nm {
+    color: var(--accent);
+    font-weight: 600
+}
+
+.tl-shape .ly-ic {
+    width: 14px;
+    height: 14px;
+    flex: none;
+    color: var(--muted)
+}
+
+.tl-lane {
+    position: relative;
+    cursor: text;
+    min-height: 22px
+}
+
+.tl-ruler .tl-lane {
+    cursor: ew-resize
+}
+
+.tl-tick {
+    position: absolute;
+    top: 3px;
+    transform: translateX(-50%);
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--muted);
+    pointer-events: none
+}
+
+.tl-tick::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: 14px;
+    height: 5px;
+    border-left: 1px solid var(--line)
+}
+
+/* a key: a diamond; filled when selected */
+.kf {
+    position: absolute;
+    top: 50%;
+    width: 11px;
+    height: 11px;
+    padding: 0;
+    border: 1.5px solid var(--accent);
+    background: var(--panel);
+    transform: translate(-50%, -50%) rotate(45deg);
+    cursor: grab;
+    border-radius: 2px
+}
+
+.kf[aria-pressed=true] {
+    background: var(--accent)
+}
+
+.kf.late {
+    opacity: .4
+}
+
+.kf-sum {
+    position: absolute;
+    top: 50%;
+    width: 7px;
+    height: 7px;
+    background: var(--muted);
+    transform: translate(-50%, -50%) rotate(45deg);
+    pointer-events: none
+}
+
+.tl-ph {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 0;
+    border-left: 2px solid var(--danger);
+    pointer-events: none;
+    margin-left: -1px
+}
+
+.tl-empty {
+    padding: 6px 0
+}
+
+/* keys of the selected shape in the inspector */
+.anim-ins {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 10px
+}
+
+.kbs {
+    gap: 4px
+}
+
+.kb {
+    border: 1px solid var(--line);
+    background: var(--bg);
+    border-radius: 6px;
+    padding: 2px 7px;
+    font-family: var(--mono);
+    font-size: 11px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px
+}
+
+.kb .kd {
+    width: 7px;
+    height: 7px;
+    transform: rotate(45deg);
+    border: 1.5px solid var(--muted)
+}
+
+.kb[data-st=tr] .kd {
+    border-color: var(--accent)
+}
+
+.kb[data-st=on] {
+    border-color: var(--accent);
+    color: var(--accent)
+}
+
+.kb[data-st=on] .kd {
+    border-color: var(--accent);
+    background: var(--accent)
+}
+
+.kb:disabled {
+    opacity: .45;
+    cursor: default
+}
+
 @media (max-width:980px) {
 
     html,
@@ -971,6 +1255,23 @@ dialog#rxDlg::backdrop {
     .side {
         border-left: 0;
         overflow: visible
+    }
+
+    .rail,
+    .stage,
+    .side,
+    .tl {
+        grid-column: 1;
+        grid-row: auto
+    }
+
+    .tl {
+        --lbl: 110px
+    }
+
+    .tl:not([data-empty]):not([data-folded]) {
+        height: auto;
+        max-height: 70vh
     }
 }
 
