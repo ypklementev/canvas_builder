@@ -5,19 +5,20 @@
     // palette (shared by all screens): [{n: 'C_BG', c}]; shape.pc / shape.epc / screen.bgPc / S.colorPc = palette name the color comes from (the number is kept in sync)
     // assets: {id: dataURL} of uploaded pictures, shape.src points here; not part of undo snapshots, so history stays small
     // shape.id: stable within its screen (animation tracks point at it); screen.anims: [{name, mode, dur, lo, hi, follow, tracks: [{id, p, keys: [{t, v, e, pc}]}]}]
+    // screen.tr: the transition onto this screen {type, dur, ease, c, pc}
     // shape.rot: degrees around the pivot ox, oy (screen pixels); shape.o: opacity 0…254 (absent = 255); text.scroll: one clipped line moved by sx
     // sprite: {t: 'sprite', x, y, w, h, mode, scale, thr, inv, c, f, nw, nh, frames: [{d, src} | {d, shapes}]}; frame shapes are relative to the frame's top-left
     const START = [];
     const blankScreen = name => ({ name, shapes: [], groups: [], bg: 0x0000, bgPc: '', anims: [] });
     const S = { W: 172, H: 320, screens: [Object.assign(blankScreen('Main'), { shapes: START })], cur: 0, palette: [], assets: {}, nextG: 1, nextId: 1, sel: [], tool: 'select', fill: false, color: 0xFFFF, colorPc: '', radius: 8, zoom: 'auto', grid: true, codeMode: 'snippet', textFont: '', textSize: 2, coordConsts: false, imgHeader: false, fonts: [], tlFolded: false };
     for (const k of ['shapes', 'groups', 'bg', 'bgPc']) Object.defineProperty(S, k, { get: () => S.screens[S.cur][k], set: v => { S.screens[S.cur][k] = v; }, enumerable: false });
-    const KEY = 'lcd-canvas-builder-v5', OLD_KEYS = ['lcd-canvas-builder-v4', 'lcd-canvas-builder-v3', 'lcd-canvas-builder-v2', 'lcd-canvas-builder-v1'];
+    const KEY = 'lcd-canvas-builder-v6', OLD_KEYS = ['lcd-canvas-builder-v5', 'lcd-canvas-builder-v4', 'lcd-canvas-builder-v3', 'lcd-canvas-builder-v2', 'lcd-canvas-builder-v1'];
     try {
         let d = JSON.parse(localStorage.getItem(KEY) || 'null');
         if (!d) for (const k of OLD_KEYS) { const o = JSON.parse(localStorage.getItem(k) || 'null'); if (o && Array.isArray(o.screens)) { d = o; break; } if (o && Array.isArray(o.shapes)) { d = migrate(o); break; } }
         if (d && Array.isArray(d.screens) && d.screens.length) { delete d.sel; Object.assign(S, d); S.cur = Math.min(Math.max(0, S.cur | 0), S.screens.length - 1); }
     } catch (e) { }
-    // v4 → v5: only new optional fields (rot, ox, oy, o, scroll, sx) and the sprite type, so a v4 state loads as it is; the v4 key is left untouched
+    // v5 → v6: screens get an optional default transition tr: {type, dur, ease, c, pc}; v4 → v5: only new optional fields (rot, ox, oy, o, scroll, sx) and the sprite type, so a v4 state loads as it is; the v4 key is left untouched
     // v3 → v4: screens get an (empty) list of animations; shapes get ids from ensureIds() at start-up; the v3 key is left untouched
     for (const sc of S.screens) if (!Array.isArray(sc.anims)) sc.anims = [];
     if (!(S.nextId > 0)) S.nextId = 1;
@@ -520,15 +521,18 @@
     // → {width, height, data: RGBA} with alpha 0 where nothing was drawn; null while a picture inside is still loading
     function rasterFrame(shapes, w, h, bg) {
         if (!(w >= 1 && h >= 1)) return null;
-        // it runs in the middle of drawing the sprite: everything raster() uses is put back afterwards
-        const keep = [img, u32, idb, S.W, S.H, curCol, cur565, curId, seenBuf, paint, pbx, pby, pbw, pbh, opa, seen, clipBox]; let ready = true;
+        let ready = true;
+        const b = offscreen(w, h, bg, () => { for (const s of shapes) { if ((s.t === 'img' || s.t === 'sprite') && !imgData(s)) ready = false; if (!s.hidden) raster(s, 0); } });
+        const data = new Uint8ClampedArray(w * h * 4);
+        for (let i = 0; i < w * h; i++) if (b.idb[i] >= 0) { const v = b.u32[i]; data[i * 4] = v & 255; data[i * 4 + 1] = v >> 8 & 255; data[i * 4 + 2] = v >> 16 & 255; data[i * 4 + 3] = 255; }
+        return ready ? { width: w, height: h, data } : null;
+    }
+    // draw into a separate w×h buffer filled with bg → {u32, idb}; it may run in the middle of drawing (a sprite frame),
+    // so everything raster() uses is put back afterwards
+    function offscreen(w, h, bg, draw) {
+        const keep = [img, u32, idb, S.W, S.H, curCol, cur565, curId, seenBuf, paint, pbx, pby, pbw, pbh, opa, seen, clipBox];
         u32 = new Uint32Array(w * h).fill(toU32(bg)); idb = new Int32Array(w * h).fill(-1); S.W = w; S.H = h; seenBuf = null; paint = null; opa = 255; seen = null; clipBox = null;
-        try {
-            for (const s of shapes) { if ((s.t === 'img' || s.t === 'sprite') && !imgData(s)) ready = false; if (!s.hidden) raster(s, 0); }
-            const data = new Uint8ClampedArray(w * h * 4);
-            for (let i = 0; i < w * h; i++) if (idb[i] >= 0) { const v = u32[i]; data[i * 4] = v & 255; data[i * 4 + 1] = v >> 8 & 255; data[i * 4 + 2] = v >> 16 & 255; data[i * 4 + 3] = 255; }
-            return ready ? { width: w, height: h, data } : null;
-        } finally { [img, u32, idb, S.W, S.H, curCol, cur565, curId, seenBuf, paint, pbx, pby, pbw, pbh, opa, seen, clipBox] = keep; }
+        try { draw(); return { u32, idb }; } finally { [img, u32, idb, S.W, S.H, curCol, cur565, curId, seenBuf, paint, pbx, pby, pbw, pbh, opa, seen, clipBox] = keep; }
     }
     // Adafruit drawBitmap(x, y, bitmap, w, h, color) / drawRGBBitmap(x, y, bitmap[, mask], w, h)
     function drawImg(s) {
@@ -775,6 +779,7 @@
             for (const s of deepShapes(sc.shapes)) { fix(s, 'c', 'pc'); fix(s, 'ec', 'epc'); if (s.grad) for (const st of s.grad.stops) fix(st, 'c', 'pc'); }
             for (const a of sc.anims) for (const tr of a.tracks) if (COLOR_P(tr.p)) for (const k of tr.keys) fix(k, 'v', 'pc');
             if (sc.bgPc) { const p = palEntry(sc.bgPc); if (p) sc.bg = p.c; else sc.bgPc = ''; }
+            if (sc.tr) fix(sc.tr, 'c', 'pc');
         }
         if (S.colorPc) { const p = palEntry(S.colorPc); if (p) S.color = p.c; else S.colorPc = ''; }
     }
@@ -962,9 +967,13 @@
     function render() {
         const W = S.W, H = S.H;
         if (!img || img.width !== W || img.height !== H) { off.width = W; off.height = H; img = offx.createImageData(W, H); u32 = new Uint32Array(img.data.buffer); idb = new Int32Array(W * H); }
-        u32.fill(toU32(S.bg)); idb.fill(-1);
-        S.shapes.forEach((s, i) => { if (!hiddenAt(i) && s.vis !== 0) raster(s, lockedAt(i) ? -3 : i); }); // vis 0: switched off by an animation key at this moment
-        if (preview) raster(preview, -2);
+        idb.fill(-1);
+        if (transView && transView.length === W * H) for (let i = 0; i < W * H; i++) u32[i] = toU32(transView[i]); // a transition preview: only its frame, no selection
+        else {
+            u32.fill(toU32(S.bg));
+            S.shapes.forEach((s, i) => { if (!hiddenAt(i) && s.vis !== 0) raster(s, lockedAt(i) ? -3 : i); }); // vis 0: switched off by an animation key at this moment
+            if (preview) raster(preview, -2);
+        }
         emptyHint.hidden = S.shapes.length > 0 || !!preview || !!triPts;
         offx.putImageData(img, 0, 0);
         scale = calcScale();
@@ -978,7 +987,7 @@
             for (let j = 0; j <= H; j++) { vx.strokeStyle = j % 10 === 0 ? 'rgba(128,140,160,.45)' : 'rgba(128,140,160,.14)'; vx.beginPath(); vx.moveTo(0, j * scale + .5); vx.lineTo(cw, j * scale + .5); vx.stroke(); }
         }
         if (triPts && hover) { vx.strokeStyle = '#7ea2ff'; vx.setLineDash([4, 3]); vx.beginPath(); const pts = [...triPts, hover]; pts.forEach((p, i) => { const X = (p.x + .5) * scale, Y = (p.y + .5) * scale; i ? vx.lineTo(X, Y) : vx.moveTo(X, Y); }); vx.stroke(); vx.setLineDash([]); }
-        const sel = S.sel.filter(i => S.shapes[i]);
+        const sel = transView ? [] : S.sel.filter(i => S.shapes[i]);
         // a turned rectangle or picture: dashed line through its turned corner pixels
         if (sel.length === 1 && rotOk(S.shapes[sel[0]]) && turned(S.shapes[sel[0]]).q) {
             const q = turned(S.shapes[sel[0]]).q; vx.setLineDash([2, 3]); vx.lineWidth = 1; vx.strokeStyle = 'rgba(47,95,208,.8)'; vx.beginPath();
@@ -1301,7 +1310,7 @@
             const v = e.target.value.trim(), warn = document.getElementById('palWarn');
             if (v === p.n) return;
             if (!validName(v, p)) { warn.textContent = 'Имя — идентификатор C++ (латиница, цифры, _), не W/H/имя цвета и без повторов.'; e.target.value = p.n; return; }
-            push(); for (const sc of S.screens) { for (const s of deepShapes(sc.shapes)) { if (s.pc === p.n) s.pc = v; if (s.epc === p.n) s.epc = v; if (s.grad) for (const st of s.grad.stops) if (st.pc === p.n) st.pc = v; } for (const a of sc.anims) for (const tr of a.tracks) for (const k of tr.keys) if (k.pc === p.n) k.pc = v; if (sc.bgPc === p.n) sc.bgPc = v; } if (S.colorPc === p.n) S.colorPc = v; p.n = v; warn.textContent = ''; animBase = new Map(); update();
+            push(); for (const sc of S.screens) { for (const s of deepShapes(sc.shapes)) { if (s.pc === p.n) s.pc = v; if (s.epc === p.n) s.epc = v; if (s.grad) for (const st of s.grad.stops) if (st.pc === p.n) st.pc = v; } for (const a of sc.anims) for (const tr of a.tracks) for (const k of tr.keys) if (k.pc === p.n) k.pc = v; if (sc.bgPc === p.n) sc.bgPc = v; if (sc.tr && sc.tr.pc === p.n) sc.tr.pc = v; } if (S.colorPc === p.n) S.colorPc = v; p.n = v; warn.textContent = ''; animBase = new Map(); update();
         }
     });
     palEl.addEventListener('focusout', () => setTimeout(() => { renderPalette(); renderBgPc(); }, 0));
@@ -1863,10 +1872,12 @@
 
     // every C++ name of the sketch, allocated in one pass so they stay unique: screen functions, constant prefixes, arrays, changing-text functions
     // anim: the whole sketch — animated properties become lcbKey(…) of their key arrays; without it every value is the shown frame
+    // mgr: the whole sketch with several screens — the screen manager (enum Screen, goTo, lcbTick) instead of tick<Screen>()
     function plan(anim) {
-        const used = new Set(['W', 'H', 'canvas', 'lcd', 'present', 'setup', 'loop', 'lcbNow', ...S.palette.map(p => p.n)]);
+        const used = new Set(['W', 'H', 'canvas', 'lcd', 'present', 'setup', 'loop', 'lcbNow', 'goTo', 'lcbTick', 'Screen', ...S.palette.map(p => p.n)]);
         const take = (base, sep = '_') => { let n = base, k = 2; while (used.has(n)) n = base + sep + k++; used.add(n); return n; };
-        const P = { fns: S.screens.map(sc => take('draw' + pascalId(sc.name), '')), shapes: new Map(), vis: [] };
+        const P = { fns: S.screens.map(sc => take('draw' + pascalId(sc.name), '')), shapes: new Map(), vis: [], mgr: !!anim && S.screens.length > 1 };
+        P.scr = P.mgr ? S.screens.map(sc => take('SCR_' + upperId(sc.name))) : [];
         S.screens.forEach((sc, k) => withScreen(k, () => { // frames of shapes are drawn on their own screen's background
             const vis = S.shapes.filter((_, i) => !hiddenAt(i)); P.vis.push(vis);
             for (const s of vis) {
@@ -1884,7 +1895,7 @@
         if (anim) S.screens.forEach((sc, k) => {
             if (!sc.anims.length) return;
             const vis = new Map(P.vis[k].map(s => [s.id, s]));
-            P.ticks[k] = take('tick' + pascalId(sc.name), '');
+            P.ticks[k] = P.mgr ? '' : take('tick' + pascalId(sc.name), '');
             for (const a of sc.anims) {
                 const N = pascalId(a.name), A = { a, v: take('anim' + N, ''), fn: a.mode === 'once' ? take('start' + N, '') : a.mode === 'value' ? take('set' + N, '') : '', tv: take('t' + N, ''), tracks: [] };
                 for (const tr of a.tracks) {
@@ -1897,8 +1908,10 @@
                 P.anims[k].push(A);
             }
             // a changing text on an animated screen keeps its value: every frame redraws the whole screen
-            for (const s of P.vis[k]) if (s.t === 'text' && s.var) P.shapes.get(s).val = take(s.var + 'Value');
+            if (!P.mgr) for (const s of P.vis[k]) if (s.t === 'text' && s.var) P.shapes.get(s).val = take(s.var + 'Value');
         });
+        // with the manager every screen is redrawn when it is shown again, so every changing text keeps its value
+        if (P.mgr) P.vis.forEach(v => { for (const s of v) if (s.t === 'text' && s.var) P.shapes.get(s).val = take(s.var + 'Value'); });
         return P;
     }
     // a coordinate: the number, or NAME_X when the element has constants
@@ -2528,6 +2541,116 @@ inline uint32_t lcbTime(const LcbAnim& a) {
         return out;
     }
 
+    // ---------- screens and transitions in the sketch (C++ twin of transPixels below) ----------
+    const TRANS = [['none', 'мгновенно', 'LCB_T_NONE'], ['slide-left', 'сдвиг влево', 'LCB_T_SLIDE_LEFT'], ['slide-right', 'сдвиг вправо', 'LCB_T_SLIDE_RIGHT'], ['slide-up', 'сдвиг вверх', 'LCB_T_SLIDE_UP'], ['slide-down', 'сдвиг вниз', 'LCB_T_SLIDE_DOWN'],
+        ['wipe-left', 'шторка влево', 'LCB_T_WIPE_LEFT'], ['wipe-right', 'шторка вправо', 'LCB_T_WIPE_RIGHT'], ['wipe-up', 'шторка вверх', 'LCB_T_WIPE_UP'], ['wipe-down', 'шторка вниз', 'LCB_T_WIPE_DOWN'], ['fade', 'затухание через цвет', 'LCB_T_FADE']];
+    // the transition onto a screen (screen.tr, set on its tab); absent → instant
+    const trOf = sc => Object.assign({ type: 'none', dur: 300, ease: 'inout', c: 0x0000 }, sc.tr || {});
+    const trColor = tr => tr.pc && palEntry(tr.pc) ? tr.pc : fmt565(tr.c);
+    const trName = tr => tr.type === 'none' ? 'мгновенно' : `${TRANS.find(x => x[0] === tr.type)[1]}${tr.type === 'fade' ? ' ' + trColor(tr) : ''}, ${tr.dur} мс`;
+    const easeC = e => EASES.find(x => x[0] === e)[2];
+    // types go above every function of the sketch (the Arduino IDE puts its prototypes before the first one)
+    function mgrTypes(P) {
+        return ['// ---------- экраны и переходы: типы ----------', `enum : uint8_t { ${TRANS.map(x => x[2]).join(', ')} };`,
+            'struct LcbTrans { uint8_t type, ease; uint32_t dur; uint16_t color; };   // переход: вид, плавность, длительность (мс), цвет затухания',
+            `enum Screen : uint8_t { ${P.scr.join(', ')} };`];
+    }
+    function mgrLines(P) {
+        return `// ---------- LCD Canvas Builder: экраны и переходы ----------
+// goTo(SCR_…) — переход по умолчанию этого экрана (задаётся на его вкладке в редакторе);
+// goTo(SCR_…, LCB_T_…, мс) или goTo(SCR_…, LCB_T_…, мс, плавность, цвет) — любой другой.
+// lcbTick(millis()) в loop() рисует текущий экран (с анимациями — каждый кадр, без них — только когда нужно)
+// или кадр перехода и вызывает present(). Сдвигу и шторке нужен второй буфер кадра (W × H × 2 байт):
+// он берётся в PSRAM, если она есть; если памяти не хватило, переход становится мгновенным.
+void (*const lcbScreens[])() = { ${P.fns.join(', ')} };   // функции экранов по номеру Screen
+const bool lcbLive[] = { ${S.screens.map(sc => String(sc.anims.some(a => a.tracks.length))).join(', ')} };   // экран с анимациями перерисовывается каждый кадр
+const LcbTrans lcbTrDefault[] = {   // переход на экран по умолчанию
+${S.screens.map((sc, k) => { const tr = trOf(sc); return `  { ${TRANS.find(x => x[0] === tr.type)[2]}, ${easeC(tr.ease)}, ${tr.dur}, ${trColor(tr)} },  // «${sc.name}»: ${trName(tr)}`; }).join('\n')}
+};
+Screen lcbScr = ${P.scr[0]}, lcbFrom = ${P.scr[0]};   // текущий экран и тот, с которого идёт переход
+LcbTrans lcbTr = { LCB_T_NONE, LCB_E_INOUT, 0, 0 };
+uint32_t lcbTrT0 = 0;
+bool lcbDirty = true;           // экран надо перерисовать
+uint16_t* lcbPrev = nullptr;    // кадр, с которого начался сдвиг или шторка
+
+// перерисовать текущий экран в следующем lcbTick (например, после нового значения меняющегося текста)
+inline void lcbRedraw() { lcbDirty = true; }
+
+void goTo(Screen s, uint8_t type, uint32_t ms, uint8_t ease, uint16_t color) {
+  if (type != LCB_T_NONE && type != LCB_T_FADE && ms) {
+    if (!lcbPrev) lcbPrev = (uint16_t*)(psramFound() ? ps_malloc((size_t)W * H * 2) : malloc((size_t)W * H * 2));
+    if (lcbPrev) memcpy(lcbPrev, canvas.getBuffer(), (size_t)W * H * 2);
+    else type = LCB_T_NONE;   // памяти не хватило — переход мгновенный
+  }
+  lcbFrom = lcbScr; lcbScr = s;
+  lcbTr.type = ms ? type : (uint8_t)LCB_T_NONE; lcbTr.ease = ease; lcbTr.dur = ms; lcbTr.color = color;
+  lcbTrT0 = millis(); lcbDirty = true;
+}
+void goTo(Screen s, uint8_t type, uint32_t ms) { goTo(s, type, ms, LCB_E_INOUT, 0x0000); }
+void goTo(Screen s) { const LcbTrans& d = lcbTrDefault[s]; goTo(s, d.type, d.dur, d.ease, d.color); }
+
+// RGB565 от a к b, k: 0…1024
+inline uint16_t lcbMix(uint16_t a, uint16_t b, int32_t k) {
+  int32_t r = (a >> 11) + ((b >> 11) - (a >> 11)) * k / 1024;
+  int32_t g = ((a >> 5) & 63) + (((b >> 5) & 63) - ((a >> 5) & 63)) * k / 1024;
+  int32_t bl = (a & 31) + ((b & 31) - (a & 31)) * k / 1024;
+  return r << 11 | g << 5 | bl;
+}
+// кадр перехода, p: 0…1024 после плавности. Новый экран рисуется на холсте, старый берётся из lcbPrev;
+// затухание: первая половина — старый экран к цвету, вторая — от цвета к новому (второй буфер не нужен)
+void lcbTransFrame(int32_t p) {
+  uint16_t* buf = canvas.getBuffer();
+  if (lcbTr.type == LCB_T_FADE) {
+    bool first = p < 512;
+    lcbScreens[first ? lcbFrom : lcbScr]();
+    int32_t k = first ? p * 2 : (1024 - p) * 2;
+    for (uint32_t i = 0; i < (uint32_t)W * H; i++) buf[i] = lcbMix(buf[i], lcbTr.color, k);
+    return;
+  }
+  lcbScreens[lcbScr]();
+  int32_t dx = W * p / 1024, dy = H * p / 1024;
+  switch (lcbTr.type) {
+    case LCB_T_SLIDE_LEFT:   // новый въезжает справа
+      for (int y = 0; y < H; y++) { uint16_t* r = buf + y * W; memmove(r + W - dx, r, dx * 2); memcpy(r, lcbPrev + y * W + dx, (W - dx) * 2); }
+      break;
+    case LCB_T_SLIDE_RIGHT:  // новый въезжает слева
+      for (int y = 0; y < H; y++) { uint16_t* r = buf + y * W; memmove(r, r + W - dx, dx * 2); memcpy(r + dx, lcbPrev + y * W, (W - dx) * 2); }
+      break;
+    case LCB_T_SLIDE_UP:     // новый въезжает снизу
+      memmove(buf + (H - dy) * W, buf, (size_t)dy * W * 2); memcpy(buf, lcbPrev + dy * W, (size_t)(H - dy) * W * 2);
+      break;
+    case LCB_T_SLIDE_DOWN:   // новый въезжает сверху
+      memmove(buf, buf + (H - dy) * W, (size_t)dy * W * 2); memcpy(buf + dy * W, lcbPrev, (size_t)(H - dy) * W * 2);
+      break;
+    case LCB_T_WIPE_LEFT:    // новый открывается от правого края
+      for (int y = 0; y < H; y++) memcpy(buf + y * W, lcbPrev + y * W, (W - dx) * 2);
+      break;
+    case LCB_T_WIPE_RIGHT:   // от левого края
+      for (int y = 0; y < H; y++) memcpy(buf + y * W + dx, lcbPrev + y * W + dx, (W - dx) * 2);
+      break;
+    case LCB_T_WIPE_UP:      // от нижнего края
+      memcpy(buf, lcbPrev, (size_t)(H - dy) * W * 2);
+      break;
+    case LCB_T_WIPE_DOWN:    // от верхнего края
+      memcpy(buf + dy * W, lcbPrev + dy * W, (size_t)(H - dy) * W * 2);
+      break;
+  }
+}
+// вызывай в loop(): lcbTick(millis());
+void lcbTick(uint32_t now) {
+  lcbNow = now;
+  if (lcbTr.type != LCB_T_NONE) {
+    uint32_t e = now - lcbTrT0;
+    if (e < lcbTr.dur) { lcbTransFrame(lcbEase(lcbTr.ease, (int64_t)e * 1024 / lcbTr.dur)); present(); return; }
+    lcbTr.type = LCB_T_NONE; lcbDirty = true;   // переход закончился
+  }
+  if (!lcbDirty && !lcbLive[lcbScr]) return;
+  lcbDirty = false;
+  lcbScreens[lcbScr]();
+  present();
+}`.split('\n');
+    }
+
     function buildLines(P = plan(S.codeMode === 'full')) {
         const L = t => ({ t, i: -1 }), ind = l => ({ ...l, t: l.t ? '  ' + l.t : l.t });
         const pal = S.palette.map(p => L(`constexpr uint16_t ${p.n} = ${fmt565(p.c)};`));
@@ -2546,7 +2669,7 @@ inline uint32_t lcbTime(const LcbAnim& a) {
             return pre.length ? [...pre, L(''), ...body] : body;
         }
         const fonts = [...new Set(all.filter(o => o.s.t === 'text' && o.s.font).map(o => o.s.font))], consts = all.flatMap(o => constLines([o.s], P)).map(L);
-        const paint = all.some(o => usesLcb(o.s, o.e)), rot = all.some(o => rotOn(o.s, o.e));
+        const paint = all.some(o => usesLcb(o.s, o.e)), rot = all.some(o => rotOn(o.s, o.e)), anim = P.mgr || P.ticks.some(Boolean), lib = t => ({ t, i: -1, lib: true });
         const out = [
             L('#include <Waveshare_LCD147.h>'), L('#include <Adafruit_GFX.h>'), ...fonts.map(f => L(FONT_DATA[f] && FONT_DATA[f].custom ? `#include "${f}.h"  // шрифт проекта, файл — в разделе «Шрифты»` : `#include <Fonts/${f}.h>`)), ...(header ? [L('#include "images.h"')] : []), L(''),
             L(`constexpr int W = ${S.W};   // ширина экрана`), L(`constexpr int H = ${S.H};   // высота экрана`), L(''),
@@ -2554,13 +2677,14 @@ inline uint32_t lcbTime(const LcbAnim& a) {
             ...(consts.length ? [L('// координаты именованных элементов'), ...consts, L('')] : []),
             L('St7789* lcd;                 // драйвер (твоя библиотека)'), L('GFXcanvas16 canvas(W, H);    // холст в памяти, на нём рисуем'), L(''),
             ...(header ? [] : arrays()),
-            ...(P.ticks.some(Boolean) ? [...lcbAnimTypes().map(t => ({ t, i: -1, lib: true })), L('')] : []),
+            ...(anim ? [...lcbAnimTypes().map(lib), L('')] : []),
+            ...(P.mgr ? [...mgrTypes(P).map(lib), L('')] : []),
             ...(rot ? [L('struct LcbPt { int16_t x, y; };   // точка после поворота lcbRot() (типы — выше всех функций скетча)'), L('')] : []),
             ...(paint ? [...lcbLib(all.some(o => o.s.t === 'text' && usesLcb(o.s, o.e) && !FONT_DATA[o.s.font]), all.some(o => opaOn(o.s, o.e)), all.some(o => scrolls(o.s))).map(t => ({ t, i: -1, lib: true })), L('')] : []),
             ...(rot ? [...lcbRotLib(all.some(o => isPic(o.s) && rotOn(o.s, o.e)), paint).map(t => ({ t, i: -1, lib: true })), L('')] : []),
-            ...(P.ticks.some(Boolean) ? [...lcbAnimLib().map(t => ({ t, i: -1, lib: true })), L('')] : []),
+            ...(anim ? [...lcbAnimLib().map(lib), L('')] : []),
             L('// Показать холст на экране'), L('void present() {'), L('  lcd->drawImage(0, 0, W, H, canvas.getBuffer());'), L('}'), L(''),
-            ...vars.flatMap(o => [...(o.e.val ? [L(`String ${o.e.val} = "${cstr(varText(o.s))}";  // значение «${o.s.var}»: экран с анимацией перерисовывается целиком каждый кадр`)] : []), ...varFnLines(o.s, o.e, bgExpr(S.screens[o.k])).map(L), L('')]),
+            ...vars.flatMap(o => [...(o.e.val ? [L(`String ${o.e.val} = "${cstr(varText(o.s))}";  // значение «${o.s.var}»: ${P.mgr ? 'экран перерисовывается целиком, когда его показывают' : 'экран с анимацией перерисовывается целиком каждый кадр'}`)] : []), ...varFnLines(o.s, o.e, bgExpr(S.screens[o.k])).map(L), L('')]),
             ...S.screens.flatMap((sc, k) => P.anims[k].length ? animBlockLines(sc, P.anims[k]).map(L) : []),
         ];
         // with several screens a screen can't rely on text settings left by another one; an animated screen can't rely on the previous frame
@@ -2572,7 +2696,13 @@ inline uint32_t lcbTime(const LcbAnim& a) {
                 ...screenLines(k, P, unknown || !!P.ticks[k]).map(ind), L('}'), L(''));
             if (P.ticks[k]) out.push(L(`// Кадр экрана «${sc.name}» с анимациями: вызывай в loop() — ${P.ticks[k]}(millis());`), L(`void ${P.ticks[k]}(uint32_t now) {`), L('  lcbNow = now;'), L(`  ${P.fns[k]}();`), L('  present();'), L('}'), L(''));
         });
-        out.push(L('void setup() {'), L('  Serial.begin(115200);'), L('  lcd = &Waveshare147::begin();'), L(''), L(`  ${P.fns[0]}();`), L('  present();'), L('}'), L(''), L('void loop() {'));
+        if (P.mgr) out.push(...mgrLines(P).map(lib), L(''));
+        out.push(L('void setup() {'), L('  Serial.begin(115200);'), L('  lcd = &Waveshare147::begin();'), L(''), ...(P.mgr ? [L(`  lcbTick(millis());  // первый экран «${S.screens[0].name}»`)] : [L(`  ${P.fns[0]}();`), L('  present();')]), L('}'), L(''), L('void loop() {'));
+        if (P.mgr) {
+            out.push(L('  lcbTick(millis());  // текущий экран с анимациями или кадр перехода'));
+            S.screens.forEach((sc, k) => { if (k) out.push(L(`  // goTo(${P.scr[k]});  // на «${sc.name}»: ${trName(trOf(sc))}`)); });
+            out.push(L(`  // goTo(${P.scr[0]}, LCB_T_FADE, 400, LCB_E_INOUT, 0x0000);  // или любой переход: вид, мс, плавность, цвет`));
+        }
         if (P.ticks[0]) out.push(L(`  ${P.ticks[0]}(millis());  // кадр анимаций экрана «${S.screens[0].name}»`));
         S.screens.forEach((sc, k) => { if (k && P.ticks[k]) out.push(L(`  // ${P.ticks[k]}(millis());  // вместо него — когда показан экран «${sc.name}»`)); });
         for (const A of P.anims.flat()) {
@@ -2581,7 +2711,8 @@ inline uint32_t lcbTime(const LcbAnim& a) {
         }
         if (vars.length) {
             const o = vars[0];
-            if (o.e.val) out.push(L('  // новое значение меняющегося текста (нарисуется со следующим кадром):'), L(`  // ${o.e.val} = "${cstr(varText(o.s))}";`));
+            if (o.e.val && P.mgr) out.push(L('  // новое значение меняющегося текста (lcbRedraw — чтобы экран без анимаций перерисовался):'), L(`  // ${o.e.val} = "${cstr(varText(o.s))}"; lcbRedraw();`));
+            else if (o.e.val) out.push(L('  // новое значение меняющегося текста (нарисуется со следующим кадром):'), L(`  // ${o.e.val} = "${cstr(varText(o.s))}";`));
             else out.push(L('  // пример обновления меняющегося текста:'), L(`  // ${o.e.fn}("${cstr(varText(o.s))}");`), L('  // present();'));
         }
         out.push(L('}'));
@@ -2721,7 +2852,16 @@ inline uint32_t lcbTime(const LcbAnim& a) {
         const fns = splitFunctions(src);
         for (const f of fns) if (/^const\s+char\s*\*\s*\w+$/.test(f.params)) { const v = parseVarFn(f, ctx); if (v) ctx.varFns[f.name] = v; }
         const scr = fns.filter(f => !f.params && !['setup', 'loop', 'present'].includes(f.name) && /canvas\s*\./.test(f.body));
-        if (scr.length) { const screens = scr.map(f => ({ name: names[f.name] || f.name.replace(/^draw(?=\w)/, ''), ...parseBody(f.body, ctx) })); return { ...ctx, multi: true, screens }; }
+        if (scr.length) {
+            const screens = scr.map(f => ({ name: names[f.name] || f.name.replace(/^draw(?=\w)/, ''), ...parseBody(f.body, ctx) }));
+            // default transitions of the screen manager, in the order of the screens
+            const td = src.match(/\blcbTrDefault\s*\[\s*\]\s*=\s*\{([\s\S]*?)\}\s*;/);
+            if (td) [...td[1].matchAll(/\{\s*(LCB_T_\w+)\s*,\s*(LCB_E_\w+)\s*,\s*(\d+)\s*,\s*([^{}]+?)\s*\}/g)].forEach((m, k) => {
+                const t = TRANS.find(x => x[2] === m[1]), e = EASES.find(x => x[2] === m[2]), c = evalNum(m[4], pal, vars); if (!screens[k] || !t || !e) return;
+                screens[k].tr = { type: t[0], dur: +m[3], ease: e[0], c: c == null ? 0 : c }; if (ctx.pcOf(m[4])) screens[k].tr.pc = ctx.pcOf(m[4]);
+            });
+            return { ...ctx, multi: true, screens };
+        }
         // no screen functions (a snippet or the old one-screen sketch): everything outside changing-text functions is one screen
         let rest = src; for (const f of fns.filter(f => ctx.varFns[f.name]).reverse()) rest = rest.slice(0, f.start) + rest.slice(f.end);
         const screens = [parseBody(rest, ctx)]; return { ...ctx, multi: false, screens }; // counters are read after parsing
@@ -2854,7 +2994,7 @@ inline uint32_t lcbTime(const LcbAnim& a) {
         S.sel = [];
         if (r.multi) {
             const taken = replace ? [] : S.screens.map(sc => sc.name);
-            const made = r.screens.map(sc => { const scr = blankScreen(uniqueName(sc.name || 'Экран', taken)); taken.push(scr.name); scr.shapes = sc.out; if (sc.bg != null) { scr.bg = sc.bg; scr.bgPc = sc.bgPc; } return scr; });
+            const made = r.screens.map(sc => { const scr = blankScreen(uniqueName(sc.name || 'Экран', taken)); taken.push(scr.name); scr.shapes = sc.out; if (sc.bg != null) { scr.bg = sc.bg; scr.bgPc = sc.bgPc; } if (sc.tr) scr.tr = sc.tr; return scr; });
             if (replace) { S.screens = made; S.cur = 0; } else { S.screens.push(...made); S.cur = S.screens.length - made.length; }
         } else {
             const sc = r.screens[0];
@@ -3140,6 +3280,94 @@ inline uint32_t lcbTime(const LcbAnim& a) {
     };
     tlEl.addEventListener('pointerup', tlUp); tlEl.addEventListener('pointercancel', tlUp);
     document.addEventListener('pointerdown', e => { if (!tlEl.contains(e.target)) AN.focus = false; }, true);
+
+    // ---------- transitions in the editor: the same frames lcbTick() / lcbTransFrame() give on the board ----------
+    // a screen's own frame T ms after start-up: loop and ping-pong run from 0, once and value haven't been started (0 ms)
+    const animAt = (a, T) => a.mode === 'loop' ? T % a.dur : a.mode === 'pingpong' ? (ph => ph <= a.dur ? ph : 2 * a.dur - ph)(T % (2 * a.dur)) : 0;
+    // screen k at T ms as RGB565 words, without touching what the editor shows
+    function screenPixels(k, T) {
+        return withScreen(k, () => {
+            const sc = S.screens[k], shapes = JSON.parse(JSON.stringify(sc.shapes)), byId = new Map(shapes.map(s => [s.id, s]));
+            for (const s of shapes) delete s.vis;
+            for (const a of sc.anims) { const t = animAt(a, T); for (const tr of a.tracks) { const s = byId.get(tr.id); if (s && tr.keys.length) setP(s, tr.p, ...evalTrack(tr, t)); } }
+            const b = offscreen(S.W, S.H, sc.bg, () => shapes.forEach((s, i) => { if (!hiddenAt(i) && s.vis !== 0) raster(s, i); }));
+            return Uint16Array.from(b.u32, from32);
+        });
+    }
+    // e ms into the transition from screen `from` to `to`; prev — `from` when it started (what lcbPrev holds on the board)
+    function transPixels(from, to, tr, e, prev) {
+        const W = S.W, H = S.H;
+        if (tr.type === 'none' || !tr.dur || e >= tr.dur) return screenPixels(to, e);
+        const p = ease(tr.ease, Math.trunc(e * 1024 / tr.dur));
+        if (tr.type === 'fade') { const first = p < 512, k = first ? p * 2 : (1024 - p) * 2; return screenPixels(first ? from : to, e).map(c => mix565(c, tr.c, k)); }
+        const nw = screenPixels(to, e), out = new Uint16Array(W * H), dx = Math.trunc(W * p / 1024), dy = Math.trunc(H * p / 1024);
+        for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+            const i = y * W + x; let v;
+            switch (tr.type) {
+                case 'slide-left': v = x < W - dx ? prev[i + dx] : nw[i - (W - dx)]; break;
+                case 'slide-right': v = x < dx ? nw[i + W - dx] : prev[i - dx]; break;
+                case 'slide-up': v = y < H - dy ? prev[i + dy * W] : nw[i - (H - dy) * W]; break;
+                case 'slide-down': v = y < dy ? nw[i + (H - dy) * W] : prev[i - dy * W]; break;
+                case 'wipe-left': v = x < W - dx ? prev[i] : nw[i]; break;
+                case 'wipe-right': v = x < dx ? nw[i] : prev[i]; break;
+                case 'wipe-up': v = y < H - dy ? prev[i] : nw[i]; break;
+                default: v = y < dy ? nw[i] : prev[i]; // wipe-down
+            }
+            out[i] = v;
+        }
+        return out;
+    }
+    // the bar under the tabs: the transition onto the current screen, and its preview from another screen (canvas and board)
+    const trBar = document.getElementById('trBar'); let trHtml = '', transView = null;
+    const TV = { from: -1, e: 0, on: false, raf: 0, prev: null };
+    function renderTrBar() {
+        trBar.hidden = S.screens.length < 2; if (trBar.hidden) { trHtml = ''; return; }
+        if (trBar.contains(document.activeElement) && document.activeElement.matches('input:not([type=range]),select')) return; // don't rebuild under typing
+        const sc = S.screens[S.cur], tr = trOf(sc), on = tr.type !== 'none';
+        if (TV.from === S.cur || !S.screens[TV.from]) TV.from = S.cur ? S.cur - 1 : 1;
+        const h = `<span class="set">Переход на «${esc(sc.name)}»</span><select id="trType" aria-label="Переход на этот экран">${TRANS.map(([v, l]) => `<option value="${v}"${v === tr.type ? ' selected' : ''}>${l}</option>`).join('')}</select>`
+            + (on ? `<label class="set"><input type="number" id="trDur" min="1" max="60000" value="${tr.dur}" style="width:64px" aria-label="Длительность перехода, мс"> мс</label><select id="trEase" aria-label="Плавность перехода">${EASES.filter(x => x[0] !== 'step').map(([v, l]) => `<option value="${v}"${v === tr.ease ? ' selected' : ''}>${l}</option>`).join('')}</select>` : '')
+            + (tr.type === 'fade' ? `<input type="color" id="trC" value="${toHex(tr.c)}" aria-label="Цвет затухания">${S.palette.length ? `<select id="trPc" aria-label="Цвет затухания из палитры"><option value="">${fmt565(tr.c)}</option>${S.palette.map(p => `<option${p.n === tr.pc ? ' selected' : ''}>${p.n}</option>`).join('')}</select>` : ''}` : '')
+            + `<span class="grow"></span><label class="set">проиграть из <select id="trFrom">${S.screens.map((x, k) => k === S.cur ? '' : `<option value="${k}"${k === TV.from ? ' selected' : ''}>${esc(x.name)}</option>`).join('')}</select></label>`
+            + `<button class="btn" id="trPlay" title="Проиграть переход на холсте (и на плате, если подключена)" aria-label="Проиграть переход"></button>`
+            + (on ? `<input type="range" id="trT" min="0" max="${tr.dur}" value="0" aria-label="Момент перехода, мс">` : '') + '<span class="spec" id="trTime"></span>';
+        if (h !== trHtml) trBar.innerHTML = trHtml = h;
+        syncTrBar();
+    }
+    function syncTrBar() {
+        const tr = trOf(S.screens[S.cur]), pl = document.getElementById('trPlay'), t = document.getElementById('trT'), tm = document.getElementById('trTime'); if (!pl) return;
+        pl.textContent = TV.raf ? '⏸' : '▶';
+        if (t && document.activeElement !== t) t.value = TV.on ? Math.min(TV.e, tr.dur) : 0;
+        tm.textContent = TV.on ? (tr.type === 'none' ? 'мгновенно' : `${Math.min(TV.e, tr.dur)} / ${tr.dur} мс`) : '';
+    }
+    // the canvas shows the transition e ms in (at the end — the new screen); any edit goes back to the normal view
+    function showTrans(e) {
+        if (!TV.prev) TV.prev = screenPixels(TV.from, 0);
+        TV.on = true; TV.e = e; transView = transPixels(TV.from, S.cur, trOf(S.screens[S.cur]), e, TV.prev); render(); syncTrBar();
+    }
+    function stopTrans() { cancelAnimationFrame(TV.raf); TV.raf = 0; TV.on = false; TV.prev = null; transView = null; }
+    function playTrans() {
+        if (TV.raf) { cancelAnimationFrame(TV.raf); TV.raf = 0; syncTrBar(); return; }
+        stopPlay(); const dur = trOf(S.screens[S.cur]).type === 'none' ? 0 : trOf(S.screens[S.cur]).dur, t0 = performance.now(); TV.prev = null;
+        const step = () => { const e = Math.floor(performance.now() - t0); if (e >= dur) { TV.raf = 0; showTrans(dur); return; } showTrans(e); TV.raf = requestAnimationFrame(step); };
+        TV.raf = requestAnimationFrame(step); syncTrBar();
+    }
+    trBar.addEventListener('change', e => {
+        const sc = S.screens[S.cur], tr = trOf(sc), id = e.target.id, v = e.target.value;
+        if (id === 'trFrom') { TV.from = +v; TV.prev = null; if (TV.on) showTrans(TV.e); return; }
+        if (id === 'trT') return;
+        push();
+        if (id === 'trType') tr.type = v;
+        if (id === 'trDur') { const d = Math.round(+v); if (d >= 1) tr.dur = Math.min(60000, d); }
+        if (id === 'trEase') tr.ease = v;
+        if (id === 'trPc') { const p = palEntry(v); if (p) { tr.pc = p.n; tr.c = p.c; } else delete tr.pc; }
+        sc.tr = tr; e.target.blur(); update();
+    });
+    trBar.addEventListener('input', e => {
+        if (e.target.id === 'trT') { cancelAnimationFrame(TV.raf); TV.raf = 0; showTrans(+e.target.value); }
+        if (e.target.id === 'trC') { const sc = S.screens[S.cur], tr = trOf(sc); push('trc' + S.cur); tr.c = to565(e.target.value); delete tr.pc; sc.tr = tr; update(true); }
+    });
+    trBar.addEventListener('click', e => { if (e.target.closest('#trPlay')) playTrans(); });
 
     // ---------- adding pictures: file button / I, drag and drop onto the stage, paste ----------
     const fileIn = document.getElementById('imgFile'), stageMsg = document.getElementById('stageMsg');
@@ -3650,11 +3878,12 @@ void loop() {
 
     // ---------- update ----------
     function update(fast) {
+        if (TV.on || TV.raf) stopTrans(); // any change ends the transition preview
         ensureIds();
         if (AN.play || AN.follow) stopPlay(); // any change pauses playback, so keys don't land at a random moment
         if (AN.scr !== S.cur) { stopPlay(); Object.assign(AN, { scr: S.cur, k: 0, t: 0, sel: [], follow: null }); animBase = new Map(); }
         animDetect(); syncPalette(); animClean(); animFix(); animApply();
-        renderTimeline(); render(); status(); renderCode(); renderLayers(); renderPalette(); renderBgPc(); renderTabs(); renderFonts();
+        renderTimeline(); render(); status(); renderCode(); renderLayers(); renderPalette(); renderBgPc(); renderTabs(); renderTrBar(); renderFonts();
         if (!fast || !insBody.contains(document.activeElement)) renderInspector();
         else { const s = one(); if (s) insBody.querySelectorAll('input[data-k]').forEach(inp => { if (inp !== document.activeElement) inp.value = fieldVal(s, inp.dataset.k); }); }
         rail.querySelectorAll('[data-tool]').forEach(b => b.setAttribute('aria-pressed', b.dataset.tool === S.tool));

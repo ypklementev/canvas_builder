@@ -1336,3 +1336,22 @@ input[type=range][data-k=o] {
 .fx select {
     max-width: 170px
 }
+
+/* ---------- stage 8: screen transitions ---------- */
+.trbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    max-width: 100%;
+    margin-bottom: 8px;
+    font-size: 12px
+}
+
+.trbar[hidden] {
+    display: none
+}
+
+.trbar input[type=range] {
+    width: 120px
+}
