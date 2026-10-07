@@ -1280,3 +1280,59 @@ dialog#rxDlg::backdrop {
         transition: none !important
     }
 }
+/* ---------- stage 7: rotation, opacity, sprites, effects ---------- */
+.fields.xf {
+    grid-template-columns: repeat(3, minmax(0, 1fr))
+}
+
+input[type=range][data-k=o] {
+    width: 120px;
+    vertical-align: middle
+}
+
+.frames {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 10px
+}
+
+.fr {
+    padding: 2px 4px;
+    border-radius: 6px;
+    border: 1px solid transparent
+}
+
+.fr.on {
+    border-color: var(--accent);
+    background: var(--accent-soft)
+}
+
+.fr-th {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    border: 1px solid var(--line);
+    background: var(--bg);
+    border-radius: 5px;
+    padding: 2px 6px 2px 2px;
+    cursor: pointer;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: inherit
+}
+
+.fr-th canvas {
+    height: 28px;
+    max-width: 56px;
+    image-rendering: pixelated;
+    background: repeating-conic-gradient(#8883 0 25%, transparent 0 50%) 0 0 / 8px 8px
+}
+
+.fx {
+    margin-top: 10px
+}
+
+.fx select {
+    max-width: 170px
+}

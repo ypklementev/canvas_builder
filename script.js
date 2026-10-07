@@ -5,16 +5,19 @@
     // palette (shared by all screens): [{n: 'C_BG', c}]; shape.pc / shape.epc / screen.bgPc / S.colorPc = palette name the color comes from (the number is kept in sync)
     // assets: {id: dataURL} of uploaded pictures, shape.src points here; not part of undo snapshots, so history stays small
     // shape.id: stable within its screen (animation tracks point at it); screen.anims: [{name, mode, dur, lo, hi, follow, tracks: [{id, p, keys: [{t, v, e, pc}]}]}]
+    // shape.rot: degrees around the pivot ox, oy (screen pixels); shape.o: opacity 0…254 (absent = 255); text.scroll: one clipped line moved by sx
+    // sprite: {t: 'sprite', x, y, w, h, mode, scale, thr, inv, c, f, nw, nh, frames: [{d, src} | {d, shapes}]}; frame shapes are relative to the frame's top-left
     const START = [];
     const blankScreen = name => ({ name, shapes: [], groups: [], bg: 0x0000, bgPc: '', anims: [] });
     const S = { W: 172, H: 320, screens: [Object.assign(blankScreen('Main'), { shapes: START })], cur: 0, palette: [], assets: {}, nextG: 1, nextId: 1, sel: [], tool: 'select', fill: false, color: 0xFFFF, colorPc: '', radius: 8, zoom: 'auto', grid: true, codeMode: 'snippet', textFont: '', textSize: 2, coordConsts: false, imgHeader: false, fonts: [], tlFolded: false };
     for (const k of ['shapes', 'groups', 'bg', 'bgPc']) Object.defineProperty(S, k, { get: () => S.screens[S.cur][k], set: v => { S.screens[S.cur][k] = v; }, enumerable: false });
-    const KEY = 'lcd-canvas-builder-v4', OLD_KEYS = ['lcd-canvas-builder-v3', 'lcd-canvas-builder-v2', 'lcd-canvas-builder-v1'];
+    const KEY = 'lcd-canvas-builder-v5', OLD_KEYS = ['lcd-canvas-builder-v4', 'lcd-canvas-builder-v3', 'lcd-canvas-builder-v2', 'lcd-canvas-builder-v1'];
     try {
         let d = JSON.parse(localStorage.getItem(KEY) || 'null');
         if (!d) for (const k of OLD_KEYS) { const o = JSON.parse(localStorage.getItem(k) || 'null'); if (o && Array.isArray(o.screens)) { d = o; break; } if (o && Array.isArray(o.shapes)) { d = migrate(o); break; } }
         if (d && Array.isArray(d.screens) && d.screens.length) { delete d.sel; Object.assign(S, d); S.cur = Math.min(Math.max(0, S.cur | 0), S.screens.length - 1); }
     } catch (e) { }
+    // v4 → v5: only new optional fields (rot, ox, oy, o, scroll, sx) and the sprite type, so a v4 state loads as it is; the v4 key is left untouched
     // v3 → v4: screens get an (empty) list of animations; shapes get ids from ensureIds() at start-up; the v3 key is left untouched
     for (const sc of S.screens) if (!Array.isArray(sc.anims)) sc.anims = [];
     if (!(S.nextId > 0)) S.nextId = 1;
@@ -28,7 +31,7 @@
     let assetsVer = 0, assetsKey = '', assetsJson = '{}';
     function save() {
         try {
-            const { sel, assets, ...rest } = S, used = new Set(S.screens.flatMap(sc => sc.shapes.filter(s => s.t === 'img').map(s => s.src)));
+            const { sel, assets, ...rest } = S, used = usedAssets();
             const key = assetsVer + ':' + [...used].sort().join();
             if (key !== assetsKey) { assetsJson = JSON.stringify(Object.fromEntries(Object.entries(assets).filter(([k]) => used.has(k)))); assetsKey = key; }
             localStorage.setItem(KEY, '{"assets":' + assetsJson + ',' + JSON.stringify(rest).slice(1));
@@ -65,10 +68,19 @@
     // ---------- Adafruit GFX rasterizer (same algorithms as the library) ----------
     const off = document.createElement('canvas'), offx = off.getContext('2d');
     let img, u32, idb, curCol = 0, cur565 = 0, curId = -1;
+    // opacity of the current shape (0…255); while it is below 255 every pixel is blended once (seen); clipBox: [x0, y0, x1, y1) of a scrolling text
+    let opa = 255, seen = null, clipBox = null;
     // a: coverage 0…16 (16 = solid); with a gradient (paint) the colour comes from the pixel position; id -3: locked, keeps what is below clickable
+    // coverage × opacity = e of 4080: below that the colour is mixed with what is on the canvas (at opacity 255 exactly as a / 16)
     function px(x, y, a = 16) {
-        if (x < 0 || y < 0 || x >= S.W || y >= S.H || a <= 0) return; const i = y * S.W + x;
-        if (paint || a < 16) { let c = paint ? paintColor(x, y) : cur565; if (a < 16) c = blend565(from32(u32[i]), c, a); u32[i] = toU32(c); }
+        if (x < 0 || y < 0 || x >= S.W || y >= S.H || a <= 0) return;
+        if (clipBox && (x < clipBox[0] || y < clipBox[1] || x >= clipBox[2] || y >= clipBox[3])) return;
+        const i = y * S.W + x, e = a * opa;
+        if (paint || e < 4080) {
+            let c = paint ? paintColor(x, y) : cur565;
+            if (e < 4080) { if (!e) return; if (opa < 255) { if (seen[i]) return; seen[i] = 1; } c = blendA(from32(u32[i]), c, e); }
+            u32[i] = toU32(c);
+        }
         else u32[i] = curCol;
         if (curId !== -3) idb[i] = curId;
     }
@@ -180,6 +192,7 @@
         const F = FONT_DATA[font]; return { pitch: F.ya * size, top: F.asc * size, block: n => (n - 1) * F.ya * size + (F.asc + F.desc) * size };
     }
     function wrapText(s) {
+        if (scrolls(s)) return [cleanText(s.font, (s.text || '').replace(/\n/g, ' '))]; // a scrolling text is one line, cut by its box
         const out = [], W = Math.max(1, s.w), fits = str => measureStr(s.font, s.size, str).w <= W;
         for (const para of cleanText(s.font, s.text || '').split('\n')) {
             let line = '';
@@ -236,14 +249,24 @@
     const ptOf = k => +((k.match(/(\d+)pt7b$/) || [0, 0])[1]);
     FONT_GROUPS.slice(2).forEach(g => g[1].sort((a, b) => a.replace(/\d+pt7b/, '').localeCompare(b.replace(/\d+pt7b/, '')) || ptOf(a) - ptOf(b)));
 
+    let seenBuf = null;
     function raster(s, id) {
         curCol = toU32(s.c); cur565 = s.c; curId = id;
+        opa = opaOf(s); if (opa < 255) { if (!seenBuf || seenBuf.length !== S.W * S.H) seenBuf = new Uint8Array(S.W * S.H); else seenBuf.fill(0); seen = seenBuf; }
+        if (rotOk(s)) s = turned(s);
         paint = gradOk(s) ? makePaint(s) : null; if (paint) [pbx, pby, pbw, pbh] = bbox(s);
         const aa = aaOk(s);
         switch (s.t) {
-            case 'text': if (s.var) drawVarText(s, aa); else for (const l of layoutText(s)) (aa ? drawStrAA : drawStr)(s.font, s.size, l.t, l.cx, l.cy); break;
-            case 'img': drawImg(s); break;
-            case 'rect': s.fill ? fillRect(s.x, s.y, s.w, s.h) : drawRect(s.x, s.y, s.w, s.h); break;
+            case 'text':
+                if (s.var) { drawVarText(s, aa); break; }
+                if (scrolls(s)) clipBox = [s.x, s.y, s.x + s.w, s.y + s.h];
+                for (const l of layoutText(s)) (aa ? drawStrAA : drawStr)(s.font, s.size, l.t, l.cx + (scrolls(s) ? s.sx | 0 : 0), l.cy);
+                break;
+            case 'img': case 'sprite': s.q ? drawImgRot(s) : drawImg(s); break;
+            case 'rect':
+                if (s.q) { const [a, b, c, d] = s.q; if (s.fill) { fillTriangle(...a, ...b, ...c); fillTriangle(...a, ...c, ...d); } else { line(...a, ...b); line(...b, ...c); line(...c, ...d); line(...d, ...a); } }
+                else s.fill ? fillRect(s.x, s.y, s.w, s.h) : drawRect(s.x, s.y, s.w, s.h);
+                break;
             case 'rrect': aa ? aaRoundRect(s.x, s.y, s.w, s.h, s.r, !s.fill) : s.fill ? fillRoundRect(s.x, s.y, s.w, s.h, s.r) : drawRoundRect(s.x, s.y, s.w, s.h, s.r); break;
             case 'circle': aa ? aaCircle(s.x, s.y, s.r, !s.fill) : s.fill ? fillCircle(s.x, s.y, s.r) : drawCircle(s.x, s.y, s.r); break;
             case 'line': (aa ? aaLine : line)(s.x0, s.y0, s.x1, s.y1); break;
@@ -253,12 +276,57 @@
                 else { const L = aa ? aaLine : line; L(s.x0, s.y0, s.x1, s.y1); L(s.x1, s.y1, s.x2, s.y2); L(s.x2, s.y2, s.x0, s.y0); } break;
             case 'pixel': px(s.x, s.y); break;
         }
-        paint = null;
+        paint = null; opa = 255; seen = null; clipBox = null;
     }
 
+    // ---------- rotation: an integer sine table, the same in the sketch (lcbSinT / lcbRot) ----------
+    // sin of whole degrees × 16384; a point turns around the pivot, rounding by (v + 8192) >> 14; positive angles turn clockwise (y goes down)
+    const ROT_T = ['rect', 'line', 'tri', 'img', 'sprite', 'rrect', 'circle', 'pixel'];
+    const SIN_T = Array.from({ length: 91 }, (_, k) => Math.round(Math.sin(k * Math.PI / 180) * 16384));
+    function isin(a) { a = ((a % 360) + 360) % 360; return a <= 90 ? SIN_T[a] : a <= 180 ? SIN_T[180 - a] : a <= 270 ? -SIN_T[a - 180] : -SIN_T[360 - a]; }
+    function rotPt(x, y, ox, oy, a) { const s = isin(a), c = isin(a + 90), dx = x - ox, dy = y - oy; return [ox + ((dx * c - dy * s + 8192) >> 14), oy + ((dx * s + dy * c + 8192) >> 14)]; }
+    const canRot = s => ROT_T.includes(s.t);
+    const rotOk = s => canRot(s) && s.rot != null && s.rot % 360 !== 0;
+    // the shape as it is drawn: vertices / centre turned around the pivot; a rectangle or a picture gets its four turned corner pixels q (TL, TR, BR, BL)
+    // a rounded rectangle and a circle turn as a point: their centre moves, the shape itself stays upright
+    function turned(s) {
+        const R = (x, y) => rotPt(x, y, s.ox, s.oy, s.rot), c = { ...s };
+        if (!['rect', 'img', 'sprite'].includes(s.t)) delete c.rot; // already turned (a picture still needs its angle for rotMap)
+        switch (s.t) {
+            case 'line': [c.x0, c.y0] = R(s.x0, s.y0); [c.x1, c.y1] = R(s.x1, s.y1); break;
+            case 'tri': [c.x0, c.y0] = R(s.x0, s.y0); [c.x1, c.y1] = R(s.x1, s.y1); [c.x2, c.y2] = R(s.x2, s.y2); break;
+            case 'circle': case 'pixel': [c.x, c.y] = R(s.x, s.y); break;
+            case 'rrect': { const hw = Math.trunc(s.w / 2), hh = Math.trunc(s.h / 2), [X, Y] = R(s.x + hw, s.y + hh); c.x = X - hw; c.y = Y - hh; break; }
+            default: c.q = [R(s.x, s.y), R(s.x + s.w - 1, s.y), R(s.x + s.w - 1, s.y + s.h - 1), R(s.x, s.y + s.h - 1)];
+        }
+        return c;
+    }
+    // a turned picture: every screen pixel around the turned corners takes the source pixel it comes from (turned back, nearest)
+    function rotMap(x, y, w, h, ox, oy, a, put) {
+        const s = isin(a), c = isin(a + 90), q = [rotPt(x, y, ox, oy, a), rotPt(x + w - 1, y, ox, oy, a), rotPt(x + w - 1, y + h - 1, ox, oy, a), rotPt(x, y + h - 1, ox, oy, a)];
+        const xa = Math.max(0, Math.min(...q.map(p => p[0])) - 1), xb = Math.min(S.W - 1, Math.max(...q.map(p => p[0])) + 1);
+        const ya = Math.max(0, Math.min(...q.map(p => p[1])) - 1), yb = Math.min(S.H - 1, Math.max(...q.map(p => p[1])) + 1);
+        for (let Y = ya; Y <= yb; Y++) for (let X = xa; X <= xb; X++) {
+            const dx = X - ox, dy = Y - oy, i = ox + ((dx * c + dy * s + 8192) >> 14) - x, j = oy + ((dy * c - dx * s + 8192) >> 14) - y;
+            if (i >= 0 && j >= 0 && i < w && j < h) put(X, Y, i, j);
+        }
+    }
+    function drawImgRot(s) {
+        const d = imgData(s); if (!d) return;
+        const bw = (s.w + 7) >> 3, icon = s.mode === 'icon';
+        rotMap(s.x, s.y, s.w, s.h, s.ox, s.oy, s.rot, (X, Y, i, j) => {
+            if (icon) { if (d.bits[j * bw + (i >> 3)] & (0x80 >> (i & 7))) px(X, Y); return; }
+            if (d.mask && !(d.mask[j * bw + (i >> 3)] & (0x80 >> (i & 7)))) return;
+            cur565 = d.px[j * s.w + i]; curCol = toU32(cur565); px(X, Y);
+        });
+    }
+    // opacity, scrolling text
+    const opaOf = s => s.o == null ? 255 : Math.max(0, Math.min(255, s.o | 0));
+    const scrolls = s => s.t === 'text' && !!s.scroll && !s.var;
+
     // ---------- gradients and anti-aliasing: the same integer maths as the generated lcb… functions ----------
-    const GRAD_T = ['rect', 'rrect', 'circle', 'line', 'tri', 'text', 'img'], AA_T = ['rrect', 'circle', 'line', 'tri', 'text'];
-    const gradOk = s => !!s.grad && GRAD_T.includes(s.t) && (s.t !== 'img' || s.mode === 'icon') && s.grad.stops && s.grad.stops.length >= 2;
+    const GRAD_T = ['rect', 'rrect', 'circle', 'line', 'tri', 'text', 'img', 'sprite'], AA_T = ['rrect', 'circle', 'line', 'tri', 'text'];
+    const gradOk = s => !!s.grad && GRAD_T.includes(s.t) && (!isPic(s) || s.mode === 'icon') && s.grad.stops && s.grad.stops.length >= 2;
     const aaFont = s => { const F = FONT_DATA[s.font]; return !!(F && F.ab); };
     const aaOk = s => !!s.aa && AA_T.includes(s.t) && (s.t !== 'text' || aaFont(s));
     const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
@@ -283,7 +351,7 @@
         return ch(11, 31) << 11 | ch(5, 63) << 5 | ch(0, 31);
     }
     const from32 = v => ((v & 0xF8) << 8) | ((v >> 5) & 0x7E0) | ((v >> 19) & 0x1F); // preview colours expand RGB565 losslessly
-    function blend565(b, f, a) { const ch = (sh, m) => { const bv = (b >> sh) & m, fv = (f >> sh) & m; return bv + Math.trunc((fv - bv) * a / 16); }; return ch(11, 31) << 11 | ch(5, 63) << 5 | ch(0, 31); }
+    function blendA(b, f, e) { const ch = (sh, m) => { const bv = (b >> sh) & m, fv = (f >> sh) & m; return bv + Math.trunc((fv - bv) * e / 4080); }; return ch(11, 31) << 11 | ch(5, 63) << 5 | ch(0, 31); }
     // coverage: 4×4 samples per pixel in 1/8 px units at 8x+1, 8x+3, 8x+5, 8x+7; shapes are measured from pixel centres (8x+4)
     function cover(x, y, inside) { let n = 0; for (let j = 1; j < 8; j += 2) for (let i = 1; i < 8; i += 2) if (inside(8 * x + i, 8 * y + j)) n++; return n; }
     // filled: radius r + ½ around the centre pixel (as wide as fillCircle); ring: 1 px between r − ½ and r + ½
@@ -375,7 +443,7 @@
         return { t, cx, cy };
     }
     function drawVarText(s, aa) {
-        const col = curCol, P = paint; paint = null; curCol = toU32(s.erase === 'color' ? s.ec : S.bg); fillRect(s.x, s.y, s.w, s.h); curCol = col; paint = P; // the erase is a plain fillRect
+        const col = curCol, P = paint, o = opa; paint = null; opa = 255; curCol = toU32(s.erase === 'color' ? s.ec : S.bg); fillRect(s.x, s.y, s.w, s.h); curCol = col; paint = P; opa = o; // the erase is a plain fillRect
         const l = varLayout(s); (aa ? drawStrAA : drawStr)(s.font, s.size, l.t, l.cx, l.cy);
     }
 
@@ -427,13 +495,40 @@
         }
         return { bits };
     }
-    function imgData(s) {
+    // a sprite shows its frame f
+    const frameIdx = s => Math.max(0, Math.min(s.frames.length - 1, s.f | 0));
+    function imgData(s) { return s.t === 'sprite' ? frameData(s, frameIdx(s)) : picData(s, s.src); }
+    function picData(s, src) {
         if (!(s.w >= 1 && s.h >= 1)) return null;
-        const e = srcImage(s.src); if (!e) return null;
-        const key = [s.src, s.w, s.h, s.mode, s.scale, s.thr, s.inv].join('|'); let r = processed.get(key); if (r) return r;
-        const rgba = resample(sourcePixels(e, s.w, s.h), s.w, s.h, s.scale === 'avg');
+        const e = srcImage(src); if (!e) return null;
+        return convert(s, src, () => sourcePixels(e, s.w, s.h));
+    }
+    // the w×h result of a source, cached by everything that changes it
+    function convert(s, srcKey, source) {
+        const key = [srcKey, s.w, s.h, s.mode, s.scale, s.thr, s.inv].join('|'); let r = processed.get(key); if (r) return r;
+        const src = source(); if (!src) return null;
+        const rgba = resample(src, s.w, s.h, s.scale === 'avg');
         r = s.mode === 'icon' ? toBits(rgba, s.w, s.h, s.thr, s.inv) : toRGB(rgba, s.w, s.h);
-        if (processed.size > 64) processed.clear(); processed.set(key, r); return r;
+        if (processed.size > 256) processed.clear(); processed.set(key, r); return r;
+    }
+    // a frame: a picture, or shapes drawn by the rasterizer on the screen background at the sprite's own size nw×nh (then scaled to w×h like a picture)
+    function frameData(s, k) {
+        const fr = s.frames[k]; if (!fr || !(s.w >= 1 && s.h >= 1)) return null;
+        if (fr.src) return picData(s, fr.src);
+        return convert(s, `shapes|${s.nw}|${s.nh}|${S.bg}|${JSON.stringify(fr.shapes)}`, () => rasterFrame(fr.shapes, s.nw, s.nh, S.bg));
+    }
+    // → {width, height, data: RGBA} with alpha 0 where nothing was drawn; null while a picture inside is still loading
+    function rasterFrame(shapes, w, h, bg) {
+        if (!(w >= 1 && h >= 1)) return null;
+        // it runs in the middle of drawing the sprite: everything raster() uses is put back afterwards
+        const keep = [img, u32, idb, S.W, S.H, curCol, cur565, curId, seenBuf, paint, pbx, pby, pbw, pbh, opa, seen, clipBox]; let ready = true;
+        u32 = new Uint32Array(w * h).fill(toU32(bg)); idb = new Int32Array(w * h).fill(-1); S.W = w; S.H = h; seenBuf = null; paint = null; opa = 255; seen = null; clipBox = null;
+        try {
+            for (const s of shapes) { if ((s.t === 'img' || s.t === 'sprite') && !imgData(s)) ready = false; if (!s.hidden) raster(s, 0); }
+            const data = new Uint8ClampedArray(w * h * 4);
+            for (let i = 0; i < w * h; i++) if (idb[i] >= 0) { const v = u32[i]; data[i * 4] = v & 255; data[i * 4 + 1] = v >> 8 & 255; data[i * 4 + 2] = v >> 16 & 255; data[i * 4 + 3] = 255; }
+            return ready ? { width: w, height: h, data } : null;
+        } finally { [img, u32, idb, S.W, S.H, curCol, cur565, curId, seenBuf, paint, pbx, pby, pbw, pbh, opa, seen, clipBox] = keep; }
     }
     // Adafruit drawBitmap(x, y, bitmap, w, h, color) / drawRGBBitmap(x, y, bitmap[, mask], w, h)
     function drawImg(s) {
@@ -459,7 +554,9 @@
         pixel: { name: 'Пиксель', f: [['x', 'x'], ['y', 'y']] },
         text: { name: 'Текст', f: [['x', 'x'], ['y', 'y'], ['w', 'w'], ['h', 'h']] },
         img: { name: 'Картинка', f: [['x', 'x'], ['y', 'y'], ['w', 'w'], ['h', 'h']] },
+        sprite: { name: 'Спрайт', f: [['x', 'x'], ['y', 'y'], ['w', 'w'], ['h', 'h']] },
     };
+    const isPic = s => s.t === 'img' || s.t === 'sprite';
     const colStr = s => s.pc && palEntry(s.pc) ? s.pc : fmt565(s.c);
     function boxHandles(s) {
         const L = Math.min(s.x, s.x + s.w - 1), T = Math.min(s.y, s.y + s.h - 1), R = Math.max(s.x, s.x + s.w - 1), B = Math.max(s.y, s.y + s.h - 1), mx = Math.floor((L + R) / 2), my = Math.floor((T + B) / 2);
@@ -475,19 +572,28 @@
         if ((B - T + 1) * scale >= 28) hs.push(mk(L, my, 'ew-resize', 'l', null), mk(R, my, 'ew-resize', 'r', null));
         return hs;
     }
+    // a turned shape has only its pivot handle (size and vertices are set in the panel); the pivot comes first, so it wins over a corner under it
     function handles(s) {
+        if (!canRot(s) || s.rot == null) return shapeHandles(s);
+        const pv = { x: s.ox, y: s.oy, cur: 'crosshair', pt: true, pivot: true, set: (s, a, b) => { s.ox = a; s.oy = b; } };
+        return rotOk(s) ? [pv] : [pv, ...shapeHandles(s)];
+    }
+    function shapeHandles(s) {
         const setR = (s, nx, ny) => { s.r = Math.round(Math.hypot(nx - s.x, ny - s.y)); };
         switch (s.t) {
-            case 'rect': case 'rrect': case 'text': case 'img': return boxHandles(s);
+            case 'rect': case 'rrect': case 'text': case 'img': case 'sprite': return boxHandles(s);
             case 'circle': return [{ x: s.x + s.r, y: s.y, cur: 'ew-resize', set: setR }, { x: s.x - s.r, y: s.y, cur: 'ew-resize', set: setR }, { x: s.x, y: s.y - s.r, cur: 'ns-resize', set: setR }, { x: s.x, y: s.y + s.r, cur: 'ns-resize', set: setR }];
             case 'line': return [{ x: s.x0, y: s.y0, cur: 'move', pt: true, set: (s, a, b) => { s.x0 = a; s.y0 = b; } }, { x: s.x1, y: s.y1, cur: 'move', pt: true, set: (s, a, b) => { s.x1 = a; s.y1 = b; } }];
             case 'tri': return [0, 1, 2].map(i => ({ x: s['x' + i], y: s['y' + i], cur: 'move', pt: true, set: (s, a, b) => { s['x' + i] = a; s['y' + i] = b; } }));
             default: return [];
         }
     }
+    // what the shape covers as drawn: a turned shape by its turned geometry (that is also the box its gradient spans, as in lcbFillQuad / lcbRotBitmap)
     function bbox(s) {
+        if (s.q) { const xs = s.q.map(p => p[0]), ys = s.q.map(p => p[1]), x = Math.min(...xs), y = Math.min(...ys); return [x, y, Math.max(...xs) - x + 1, Math.max(...ys) - y + 1]; }
+        if (rotOk(s)) return bbox(turned(s));
         switch (s.t) {
-            case 'rect': case 'rrect': case 'text': case 'img': return [Math.min(s.x, s.x + s.w), Math.min(s.y, s.y + s.h), Math.abs(s.w), Math.abs(s.h)];
+            case 'rect': case 'rrect': case 'text': case 'img': case 'sprite': return [Math.min(s.x, s.x + s.w), Math.min(s.y, s.y + s.h), Math.abs(s.w), Math.abs(s.h)];
             case 'circle': return [s.x - s.r, s.y - s.r, 2 * s.r + 1, 2 * s.r + 1];
             case 'pixel': return [s.x, s.y, 1, 1];
             default: {
@@ -496,7 +602,14 @@
             }
         }
     }
-    function moveShape(s, dx, dy) { for (const k of ['x', 'x0', 'x1', 'x2']) if (k in s) s[k] += dx; for (const k of ['y', 'y0', 'y1', 'y2']) if (k in s) s[k] += dy; }
+    // the pivot goes along, so a turned shape moves exactly by dx, dy
+    function moveShape(s, dx, dy) { for (const k of ['x', 'x0', 'x1', 'x2', 'ox']) if (k in s) s[k] += dx; for (const k of ['y', 'y0', 'y1', 'y2', 'oy']) if (k in s) s[k] += dy; }
+    // the pivot when rotation is switched on: the middle of the shape (a line: its first end, like a clock hand)
+    function pivotOf(s) { if (s.t === 'line') return [s.x0, s.y0]; const [x, y, w, h] = bbox(s); return [x + ((w - 1) >> 1), y + ((h - 1) >> 1)]; }
+    function enableRot(s) { if (s.rot == null) { [s.ox, s.oy] = pivotOf(s); s.rot = 0; } }
+    // every shape of a screen, the ones inside sprite frames too
+    const deepShapes = list => list.flatMap(s => s.t === 'sprite' ? [s, ...s.frames.flatMap(f => f.shapes ? deepShapes(f.shapes) : [])] : [s]);
+    function usedAssets() { const u = new Set(); for (const sc of S.screens) for (const s of deepShapes(sc.shapes)) { if (s.t === 'img') u.add(s.src); if (s.t === 'sprite') for (const f of s.frames) if (f.src) u.add(f.src); } return u; }
     // union bbox of several shapes → [x, y, w, h] or null
     function boxOf(idx) {
         let L = Infinity, T = Infinity, R = -Infinity, B = -Infinity;
@@ -532,19 +645,25 @@
             default: return p;
         }
     }
-    const STEP_P = p => p === 'vis' || p === 'text';
+    const STEP_P = p => p === 'vis' || p === 'text' || p === 'f';
     const COLOR_P = p => p === 'c' || /^g\d+$/.test(p);
-    const ANIM_F = { rect: ['x', 'y', 'w', 'h'], rrect: ['x', 'y', 'w', 'h', 'r'], circle: ['x', 'y', 'r'], line: ['x0', 'y0', 'x1', 'y1'], tri: ['x0', 'y0', 'x1', 'y1', 'x2', 'y2'], pixel: ['x', 'y'], text: ['x', 'y'], img: ['x', 'y'] };
+    const ANIM_F = { rect: ['x', 'y', 'w', 'h'], rrect: ['x', 'y', 'w', 'h', 'r'], circle: ['x', 'y', 'r'], line: ['x0', 'y0', 'x1', 'y1'], tri: ['x0', 'y0', 'x1', 'y1', 'x2', 'y2'], pixel: ['x', 'y'], text: ['x', 'y'], img: ['x', 'y'], sprite: ['x', 'y'] };
     // a changing text isn't animated (its function draws whatever value it gets); text wraps inside its box and a picture's array has a fixed size, so their w/h stay
+    // rotation (angle, pivot) once it is switched on; opacity always; a scrolling text — its shift sx; a sprite — its frame f (by steps)
     function animProps(s) {
         if (s.t === 'text' && s.var) return [];
         const out = [...ANIM_F[s.t]];
-        if (gradOk(s)) for (const st of s.grad.stops) out.push('g' + st.id); else if (s.t !== 'img' || s.mode === 'icon') out.push('c');
+        if (canRot(s)) out.push('rot', ...(s.rot != null ? ['ox', 'oy'] : []));
+        if (gradOk(s)) for (const st of s.grad.stops) out.push('g' + st.id); else if (!isPic(s) || s.mode === 'icon') out.push('c');
+        out.push('o');
         if (s.t === 'text') out.push('text');
+        if (scrolls(s)) out.push('sx');
+        if (s.t === 'sprite') out.push('f');
         out.push('vis'); return out;
     }
+    const PROP_NAMES = { c: 'цвет', vis: 'видимость', text: 'текст', rot: 'поворот', ox: 'ось x', oy: 'ось y', o: 'непрозрачность', sx: 'сдвиг строки', f: 'кадр' };
     function propName(s, p) {
-        if (p === 'c') return 'цвет'; if (p === 'vis') return 'видимость'; if (p === 'text') return 'текст';
+        if (PROP_NAMES[p]) return PROP_NAMES[p];
         if (COLOR_P(p)) { const k = s.grad ? s.grad.stops.findIndex(st => 'g' + st.id === p) : -1; return 'градиент ' + (k + 1); }
         const f = META[s.t].f.find(f => f[0] === p); return f ? f[1] : p;
     }
@@ -554,10 +673,14 @@
         if (p === 'vis') return [s.vis === 0 ? 0 : 1, ''];
         if (p === 'text') return [s.text || '', ''];
         if (COLOR_P(p)) { const o = p === 'c' ? s : stopOf(s, p); return o ? [o.c, o.pc || ''] : null; }
+        if (p === 'o') return [opaOf(s), ''];
+        if (p === 'sx' || p === 'f' || p === 'rot') return [s[p] | 0, ''];
         return [s[p], ''];
     }
     function setP(s, p, v, pc) {
         if (p === 'vis') { if (v) delete s.vis; else s.vis = 0; return; }
+        if (p === 'o') { if (v >= 255) delete s.o; else s.o = Math.max(0, v); return; }
+        if (p === 'rot') enableRot(s);
         if (COLOR_P(p)) { const o = p === 'c' ? s : stopOf(s, p); if (!o) return; o.c = v; if (pc) o.pc = pc; else delete o.pc; return; }
         s[p] = v;
     }
@@ -649,7 +772,7 @@
     function syncPalette() {
         const fix = (o, k, pk) => { if (!o[pk]) return; const p = palEntry(o[pk]); if (p) o[k] = p.c; else delete o[pk]; };
         for (const sc of S.screens) {
-            for (const s of sc.shapes) { fix(s, 'c', 'pc'); fix(s, 'ec', 'epc'); if (s.grad) for (const st of s.grad.stops) fix(st, 'c', 'pc'); }
+            for (const s of deepShapes(sc.shapes)) { fix(s, 'c', 'pc'); fix(s, 'ec', 'epc'); if (s.grad) for (const st of s.grad.stops) fix(st, 'c', 'pc'); }
             for (const a of sc.anims) for (const tr of a.tracks) if (COLOR_P(tr.p)) for (const k of tr.keys) fix(k, 'v', 'pc');
             if (sc.bgPc) { const p = palEntry(sc.bgPc); if (p) sc.bg = p.c; else sc.bgPc = ''; }
         }
@@ -768,7 +891,7 @@
         const shapes = piece.shapes.map(s => { const c = JSON.parse(JSON.stringify(s)); if (c.g != null) c.g = map.get(c.g); else if (parent != null) c.g = parent; moveShape(c, off, off); ids.set(c.id, S.nextId); c.id = S.nextId++; return c; });
         for (const tr of piece.tracks || []) {
             const a = anims().find(a => a.name === tr.anim); if (!a || !ids.has(tr.id)) continue;
-            const shift = /^x\d?$/.test(tr.p) || /^y\d?$/.test(tr.p) ? off : 0;
+            const shift = /^(x\d?|y\d?|ox|oy)$/.test(tr.p) ? off : 0;
             a.tracks.push({ id: ids.get(tr.id), p: tr.p, keys: tr.keys.map(k => ({ ...k, v: k.v + (shift && typeof k.v === 'number' ? shift : 0) })) });
         }
         S.shapes.splice(at, 0, ...shapes); setSelObjs(shapes); normalize();
@@ -856,6 +979,11 @@
         }
         if (triPts && hover) { vx.strokeStyle = '#7ea2ff'; vx.setLineDash([4, 3]); vx.beginPath(); const pts = [...triPts, hover]; pts.forEach((p, i) => { const X = (p.x + .5) * scale, Y = (p.y + .5) * scale; i ? vx.lineTo(X, Y) : vx.moveTo(X, Y); }); vx.stroke(); vx.setLineDash([]); }
         const sel = S.sel.filter(i => S.shapes[i]);
+        // a turned rectangle or picture: dashed line through its turned corner pixels
+        if (sel.length === 1 && rotOk(S.shapes[sel[0]]) && turned(S.shapes[sel[0]]).q) {
+            const q = turned(S.shapes[sel[0]]).q; vx.setLineDash([2, 3]); vx.lineWidth = 1; vx.strokeStyle = 'rgba(47,95,208,.8)'; vx.beginPath();
+            q.forEach((p, k) => { const X = (p[0] + .5) * scale, Y = (p[1] + .5) * scale; k ? vx.lineTo(X, Y) : vx.moveTo(X, Y); }); vx.closePath(); vx.stroke(); vx.setLineDash([]);
+        }
         if (sel.length > 1) { vx.lineWidth = 1; vx.strokeStyle = 'rgba(47,95,208,.9)'; for (const i of sel) { const [x, y, w, h] = bbox(S.shapes[i]); vx.strokeRect(x * scale + .5, y * scale + .5, w * scale - 1, h * scale - 1); } }
         const sb = boxOf(sel);
         if (sb) {
@@ -863,7 +991,11 @@
             vx.setLineDash([5, 4]); vx.lineWidth = 1.5; vx.strokeStyle = '#ffffff'; vx.strokeRect(x * scale - 1.5, y * scale - 1.5, w * scale + 3, h * scale + 3);
             vx.lineDashOffset = 5; vx.strokeStyle = '#2f5fd0'; vx.strokeRect(x * scale - 1.5, y * scale - 1.5, w * scale + 3, h * scale + 3); vx.setLineDash([]); vx.lineDashOffset = 0;
             const s = one();
-            if (s && !lockedAt(sel[0])) for (const hd of handles(s)) { const X = (hd.x + .5) * scale, Y = (hd.y + .5) * scale; vx.fillStyle = '#fff'; vx.strokeStyle = '#2f5fd0'; vx.lineWidth = 1.5; vx.fillRect(X - 4, Y - 4, 8, 8); vx.strokeRect(X - 4, Y - 4, 8, 8); }
+            if (s && !lockedAt(sel[0])) for (const hd of handles(s)) {
+                const X = (hd.x + .5) * scale, Y = (hd.y + .5) * scale; vx.fillStyle = '#fff'; vx.strokeStyle = '#2f5fd0'; vx.lineWidth = 1.5;
+                if (hd.pivot) { vx.strokeStyle = GC; vx.beginPath(); vx.arc(X, Y, 5, 0, 2 * Math.PI); vx.fill(); vx.stroke(); vx.beginPath(); vx.moveTo(X - 9, Y); vx.lineTo(X + 9, Y); vx.moveTo(X, Y - 9); vx.lineTo(X, Y + 9); vx.stroke(); continue; }
+                vx.fillRect(X - 4, Y - 4, 8, 8); vx.strokeRect(X - 4, Y - 4, 8, 8);
+            }
         }
         if (guides.x.length || guides.y.length) {
             vx.strokeStyle = GC; vx.lineWidth = 1; vx.beginPath();
@@ -950,7 +1082,7 @@
     // locked shapes don't write the ID buffer, so clicks go through them
     function pick(x, y) {
         let box = -1;
-        for (let i = S.shapes.length - 1; i >= 0; i--) { const s = S.shapes[i]; if ((s.t !== 'text' && s.t !== 'img') || hiddenAt(i) || lockedAt(i) || s.vis === 0) continue; const [bx, by, bw, bh] = bbox(s); if (x >= bx && y >= by && x < bx + bw && y < by + bh) { box = i; break; } }
+        for (let i = S.shapes.length - 1; i >= 0; i--) { const s = S.shapes[i]; if ((s.t !== 'text' && !isPic(s)) || hiddenAt(i) || lockedAt(i) || s.vis === 0) continue; const [bx, by, bw, bh] = bbox(s); if (x >= bx && y >= by && x < bx + bw && y < by + bh) { box = i; break; } }
         for (let rad = 0; rad <= 3; rad++) {
             let best = -1;
             for (let dy = -rad; dy <= rad; dy++)for (let dx = -rad; dx <= rad; dx++) { const X = x + dx, Y = y + dy; if (X < 0 || Y < 0 || X >= S.W || Y >= S.H) continue; const v = idb[Y * S.W + X]; if (v > best) best = v; }
@@ -1075,6 +1207,7 @@
         pixel: '<rect x="9" y="9" width="6" height="6" fill="currentColor"/>',
         text: '<path d="M5 6V4h14v2M12 4v16M9 20h6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>',
         img: '<rect x="3.5" y="5" width="17" height="14" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="9" cy="10" r="1.8" fill="currentColor"/><path d="M4.5 18l5-5 3 3 3-4 4.5 5.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>',
+        sprite: '<rect x="4" y="3.5" width="16" height="17" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M8 3.5v17M16 3.5v17M4 8h4M4 12h4M4 16h4M16 8h4M16 12h4M16 16h4" fill="none" stroke="currentColor" stroke-width="1.4"/>',
         group: '<path d="M3 6h6l2 2h10v11H3z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>',
     };
     const AL = 'fill="currentColor"';
@@ -1168,7 +1301,7 @@
             const v = e.target.value.trim(), warn = document.getElementById('palWarn');
             if (v === p.n) return;
             if (!validName(v, p)) { warn.textContent = 'Имя — идентификатор C++ (латиница, цифры, _), не W/H/имя цвета и без повторов.'; e.target.value = p.n; return; }
-            push(); for (const sc of S.screens) { for (const s of sc.shapes) { if (s.pc === p.n) s.pc = v; if (s.epc === p.n) s.epc = v; if (s.grad) for (const st of s.grad.stops) if (st.pc === p.n) st.pc = v; } for (const a of sc.anims) for (const tr of a.tracks) for (const k of tr.keys) if (k.pc === p.n) k.pc = v; if (sc.bgPc === p.n) sc.bgPc = v; } if (S.colorPc === p.n) S.colorPc = v; p.n = v; warn.textContent = ''; animBase = new Map(); update();
+            push(); for (const sc of S.screens) { for (const s of deepShapes(sc.shapes)) { if (s.pc === p.n) s.pc = v; if (s.epc === p.n) s.epc = v; if (s.grad) for (const st of s.grad.stops) if (st.pc === p.n) st.pc = v; } for (const a of sc.anims) for (const tr of a.tracks) for (const k of tr.keys) if (k.pc === p.n) k.pc = v; if (sc.bgPc === p.n) sc.bgPc = v; } if (S.colorPc === p.n) S.colorPc = v; p.n = v; warn.textContent = ''; animBase = new Map(); update();
         }
     });
     palEl.addEventListener('focusout', () => setTimeout(() => { renderPalette(); renderBgPc(); }, 0));
@@ -1224,16 +1357,40 @@
         insBody.innerHTML = `<div class="row" style="justify-content:space-between"><span><span class="chip" style="background:${toHex(s.c)}"></span><b>${esc(s.name || m.name)}</b> <span class="spec">${[(s.name || '').startsWith(m.name) ? '' : m.name, s.pc].filter(Boolean).join(' · ')}</span></span>
     ${m.canFill ? `<span class="seg" id="insFill"><button data-f="0" aria-pressed="${!s.fill}">draw</button><button data-f="1" aria-pressed="${!!s.fill}">fill</button></span>` : ''}</div>
     <div class="fields" style="margin-top:10px">${m.f.map(([k, l]) => `<label>${l}<input type="number" data-k="${k}" id="f-${k}" value="${s[k]}"></label>`).join('')}</div>
-    ${paintInspector(s)}${s.t === 'text' ? textInspector(s) : ''}${s.t === 'img' ? imgInspector(s) : ''}${animInspector(s)}
+    ${xformInspector(s)}${paintInspector(s)}${s.t === 'text' ? textInspector(s) : ''}${isPic(s) ? imgInspector(s) : ''}${s.t === 'sprite' ? spriteInspector(s) : ''}${animInspector(s)}${fxHtml([s])}
     ${alignHtml('data-al', ALIGN, 'По экрану', 'Выравнивание по экрану')}`;
-        insBody.querySelectorAll('input[data-k]').forEach(inp => inp.addEventListener('input', () => {
-            if (inp.value === '' || isNaN(+inp.value)) return; push('f' + i + inp.dataset.k); S.shapes[i][inp.dataset.k] = Math.trunc(+inp.value); update(true);
-        }));
-        bindPaintInspector(s, i); bindAnimInspector(s);
+        bindFields(i);
+        bindXform(s); bindPaintInspector(s, i); bindAnimInspector(s); bindFx();
         if (s.t === 'text') bindTextInspector(s, i);
-        if (s.t === 'img') bindImgInspector(s, i);
+        if (isPic(s)) bindImgInspector(s, i);
+        if (s.t === 'sprite') bindSpriteInspector(s);
         const f = document.getElementById('insFill');
         if (f) f.onclick = e => { const b = e.target.closest('button'); if (!b) return; push(); s.fill = b.dataset.f === '1'; S.fill = s.fill; update(); };
+    }
+    // number fields of the panel (data-k = property): coordinates, angle and pivot, opacity, the shift of a scrolling text
+    const fieldVal = (s, k) => k === 'o' ? opaOf(s) : k === 'rot' ? s.rot | 0 : (k === 'ox' || k === 'oy') && s.rot == null ? pivotOf(s)[k === 'ox' ? 0 : 1] : s[k] ?? 0;
+    function bindFields(i) {
+        insBody.querySelectorAll('input[data-k]').forEach(inp => inp.addEventListener('input', () => {
+            if (inp.value === '' || isNaN(+inp.value)) return;
+            const s = S.shapes[i], k = inp.dataset.k; let v = Math.trunc(+inp.value);
+            push('f' + i + k);
+            if (k === 'o') v = Math.max(0, Math.min(255, v));
+            if (k === 'rot' || k === 'ox' || k === 'oy') enableRot(s);
+            setP(s, k, v, ''); update(true);
+        }));
+    }
+    // rotation (rectangles, lines, triangles, pictures turn; a rounded rectangle, a circle and a pixel turn as a point) and opacity
+    function xformInspector(s) {
+        const o = opaOf(s), on = s.rot != null, pt = ['rrect', 'circle', 'pixel'].includes(s.t);
+        const rot = !canRot(s) ? '' : `<div class="fields xf" style="margin-top:8px"><label title="Градусы, по часовой стрелке">поворот°<input type="number" data-k="rot" id="f-rot" value="${fieldVal(s, 'rot')}"></label>`
+            + `<label title="Ось поворота: её можно тянуть на холсте">ось x<input type="number" data-k="ox" id="f-ox" value="${fieldVal(s, 'ox')}"></label><label>ось y<input type="number" data-k="oy" id="f-oy" value="${fieldVal(s, 'oy')}"></label></div>`
+            + (on ? `<div class="row"><button class="btn" id="rotMid" title="Ось — в середину фигуры">ось в центр</button><button class="btn" id="rotOff" title="Убрать поворот вместе с его ключами">без поворота</button>${pt ? '<span class="msg">поворачивается как точка: двигается центр</span>' : rotOk(s) && s.t !== 'line' && s.t !== 'tri' ? '<span class="msg">ручки размера скрыты — размер в полях выше</span>' : ''}</div>` : '');
+        return rot + `<div class="row"><label class="set" title="0 — не видно, 255 — непрозрачно; смешивается с тем, что уже нарисовано под фигурой">непрозрачность <input type="range" data-k="o" id="f-or" min="0" max="255" value="${o}"></label><input type="number" data-k="o" id="f-o" min="0" max="255" value="${o}" style="width:56px" aria-label="Непрозрачность 0…255"></div>`;
+    }
+    function bindXform(s) {
+        const mid = document.getElementById('rotMid'), off = document.getElementById('rotOff');
+        if (mid) mid.onclick = () => { const r = s.rot; delete s.rot; const [x, y] = pivotOf(s); s.rot = r; if (x === s.ox && y === s.oy) return; push(); s.ox = x; s.oy = y; update(); };
+        if (off) off.onclick = () => { push(); for (const a of anims()) a.tracks = a.tracks.filter(tr => tr.id !== s.id || !['rot', 'ox', 'oy'].includes(tr.p)); delete s.rot; delete s.ox; delete s.oy; animBase = new Map(); update(); };
     }
     function renderMulti() {
         const ns = selNodes(), grp = selGroup();
@@ -1242,9 +1399,12 @@
             + '<button class="btn" data-a="dup" title="Дублировать (Ctrl+D)">Копия</button><button class="btn danger" data-a="del" title="Удалить (Del)">Удалить</button>';
         insBody.innerHTML = `<div class="row">${grp ? `<label class="set">Группа <input type="text" id="grpName" value="${escA(grp.g.name)}" style="width:160px"></label>` : ''}<span class="spec">выбрано фигур: ${S.sel.length}${ns.length > 1 ? `, объектов: ${ns.length}` : ''}</span></div>
     ${ns.length >= 2 ? alignHtml('data-sal', SALIGN, 'Между собой', 'Выравнивание внутри выделения', k => (k === 'dh' || k === 'dv') && ns.length < 3) : ''}
-    ${alignHtml('data-al', ALIGN, 'По экрану', 'Выравнивание по экрану')}`;
+    ${alignHtml('data-al', ALIGN, 'По экрану', 'Выравнивание по экрану')}
+    ${ns.length >= 2 ? `<div class="row"><button class="btn" id="mkSprite" title="Каждый выбранный объект (фигура или группа) становится кадром, по порядку слоёв снизу вверх">Спрайт из выделения: ${ns.length} кадр${ns.length < 5 ? 'а' : 'ов'}</button></div>` : ''}${fxHtml(selShapes())}`;
         const gn = document.getElementById('grpName');
         if (gn) gn.addEventListener('change', () => { const v = gn.value.trim(); if (v && v !== grp.g.name) { push(); grp.g.name = v; } update(); });
+        const mk = document.getElementById('mkSprite'); if (mk) mk.onclick = spriteFromSel;
+        bindFx();
     }
     function textInspector(s) {
         const opts = fontGroups().map(([g, ks]) => `<optgroup label="${g}">${ks.map(k => `<option value="${k}"${k === s.font ? ' selected' : ''}>${fontLabel(k)}</option>`).join('')}</optgroup>`).join('');
@@ -1265,7 +1425,7 @@
       ${seg('insAlign', 'align', [['left', '⇤', 'Влево'], ['center', '↔', 'По центру'], ['right', '⇥', 'Вправо']])}
       ${seg('insVAlign', 'valign', [['top', 'верх', 'Прижать к верху блока'], ['middle', 'центр', 'По центру блока по высоте'], ['bottom', 'низ', 'Прижать к низу блока']])}
       <button class="btn" id="fitH" title="Высота рамки = высота текста">Высота по тексту</button>
-    </div></div>`;
+    </div>${s.var ? '' : `<div class="row"><label class="set" title="Одна строка без переносов, обрезается по рамке; сдвиг двигает её внутри рамки. Эффект «Бегущая строка» анимирует сдвиг"><input type="checkbox" id="insScroll"${s.scroll ? ' checked' : ''}> бегущая строка</label>${s.scroll ? `<label class="set">сдвиг <input type="number" data-k="sx" id="f-sx" value="${s.sx | 0}" style="width:64px"> px</label>` : ''}</div>`}</div>`;
     }
     function textWarn(s) {
         const bad = [...new Set([...(s.text || '')].filter(ch => ch !== '\n' && !supported(s.font, ch)))];
@@ -1275,7 +1435,7 @@
     }
     // fill: plain colour or gradient (2–4 stops), plus smoothing where it applies
     function paintInspector(s) {
-        const canGrad = GRAD_T.includes(s.t) && (s.t !== 'img' || s.mode === 'icon'), canAA = AA_T.includes(s.t);
+        const canGrad = GRAD_T.includes(s.t) && (!isPic(s) || s.mode === 'icon'), canAA = AA_T.includes(s.t);
         if (!canGrad && !canAA) return '';
         const g = s.grad, on = !!g && canGrad, aaDis = s.t === 'text' && !aaFont(s);
         let h = `<div class="paint"><div class="row">${canGrad ? `<span class="set">Заливка</span><span class="seg" id="pMode"><button data-v="solid" aria-pressed="${!on}">цвет</button><button data-v="grad" aria-pressed="${on}">градиент</button></span>` : ''}
@@ -1357,13 +1517,14 @@
     }
     function imgInspector(s) {
         const seg = (id, key, items) => `<span class="seg" id="${id}">${items.map(([v, l, t]) => `<button data-v="${v}" title="${t}" aria-pressed="${s[key] === v}">${l}</button>`).join('')}</span>`;
-        const d = imgData(s), bw = (s.w + 7) >> 3, icon = s.mode === 'icon', bytes = icon ? bw * s.h : s.w * s.h * 2 + (d && d.mask ? bw * s.h : 0);
+        const d = imgData(s), bw = (s.w + 7) >> 3, icon = s.mode === 'icon', n = s.t === 'sprite' ? s.frames.length : 1, holes = s.t === 'sprite' ? spriteMasked(s) : !!(d && d.mask);
+        const bytes = n * (icon ? bw * s.h : s.w * s.h * 2 + (holes ? bw * s.h : 0));
         return `<div class="txt">
     <div class="row">${seg('imgMode', 'mode', [['color', 'цвет', 'RGB565-массив и drawRGBBitmap'], ['icon', 'иконка', '1-битная маска и drawBitmap цветом фигуры']])}
       ${seg('imgScale', 'scale', [['nearest', 'без сглаживания', 'Каждый пиксель берётся из ближайшего пикселя исходника'], ['avg', 'усреднение', 'Каждый пиксель — среднее по своей области исходника']])}</div>
     ${icon ? `<div class="row"><label class="set">порог <input type="range" id="imgThr" min="1" max="255" value="${s.thr}"></label><span class="spec" id="imgThrV">${s.thr}</span><label class="set"><input type="checkbox" id="imgInv"${s.inv ? ' checked' : ''}> инверсия</label></div>
     <div class="msg">Пиксель горит, если он темнее порога (прозрачное считается белым). Цвет иконки — в разделе «Цвет», можно из палитры.</div>` : ''}
-    <div class="row"><button class="btn" id="imgRatio" title="Подогнать высоту под пропорции исходной картинки">Исходные пропорции</button><span class="spec">${d ? (!icon && d.mask ? 'с прозрачностью · ' : '') : 'загружается… · '}${bytes.toLocaleString('ru')} байт</span></div></div>`;
+    <div class="row"><button class="btn" id="imgRatio" title="Подогнать высоту под пропорции исходной картинки">Исходные пропорции</button><span class="spec">${d ? (!icon && holes ? 'с прозрачностью · ' : '') : 'загружается… · '}${bytes.toLocaleString('ru')} байт</span></div></div>`;
     }
     function bindImgInspector(s, i) {
         for (const [id, key] of [['imgMode', 'mode'], ['imgScale', 'scale']]) document.getElementById(id).onclick = e => { const b = e.target.closest('button'); if (!b || s[key] === b.dataset.v) return; push(); s[key] = b.dataset.v; update(); };
@@ -1372,6 +1533,163 @@
         const inv = document.getElementById('imgInv');
         if (inv) inv.onchange = () => { push(); s.inv = inv.checked; update(); };
         document.getElementById('imgRatio').onclick = () => { if (!s.nw || !s.nh) return; push(); s.h = Math.max(1, Math.round(s.w * s.nh / s.nw)); update(); };
+    }
+
+    // ---------- sprites: frames of pictures or of shapes; the frame number is the animated property f ----------
+    // a colour sprite with holes in any frame gets a mask for every frame: the sketch picks the frame and its mask by one index
+    const spriteMasked = s => s.mode !== 'icon' && s.frames.some((_, k) => { const d = frameData(s, k); return !!(d && d.mask); });
+    // durations become the keys of the f track (frame k from the sum of the durations before it); the animation is at least that long
+    function rebuildSpriteKeys(s) {
+        const o = trackOf(s.id, 'f'); if (!o) return false;
+        let t = o.tr.keys.length ? o.tr.keys[0].t : 0;
+        o.tr.keys = s.frames.map((fr, k) => { const key = { t, v: k, e: 'step' }; t += Math.max(1, fr.d | 0); return key; });
+        const other = Math.max(0, ...o.a.tracks.filter(tr => tr !== o.tr).flatMap(tr => tr.keys.map(k => k.t)));
+        o.a.dur = Math.max(1, Math.min(600000, Math.max(t, other))); return true;
+    }
+    function spriteInspector(s) {
+        const o = trackOf(s.id, 'f'), cur = frameIdx(s);
+        return `<div class="frames"><div class="row"><span class="set">Кадры</span><span class="spec">${o ? `анимация «${esc(o.a.name)}»` : 'не анимируется — показан кадр ' + (cur + 1)}</span><span class="grow"></span>`
+            + `<button class="btn" id="frAdd" title="Добавить кадры-картинки (можно выбрать несколько файлов)">+ картинки</button><button class="btn" id="frSplit" title="Вернуть кадры на холст: картинки и группы «кадр N», видим текущий">Разобрать</button></div>`
+            + s.frames.map((fr, k) => `<div class="row fr${k === cur ? ' on' : ''}" data-k="${k}"><button class="fr-th" data-a="show" title="Показать кадр ${k + 1}" aria-label="Показать кадр ${k + 1}"><canvas width="${Math.max(1, s.w)}" height="${Math.max(1, s.h)}"></canvas><span>${k + 1}</span></button>`
+                + `<span class="spec">${fr.src ? 'картинка' : 'фигур: ' + fr.shapes.length}</span><span class="grow"></span><label class="set"><input type="number" data-fd min="1" max="60000" value="${fr.d}" style="width:62px" aria-label="Длительность кадра ${k + 1}"> мс</label>`
+                + `<button class="btn" data-a="up" title="Раньше"${k ? '' : ' disabled'}>↑</button><button class="btn" data-a="down" title="Позже"${k < s.frames.length - 1 ? '' : ' disabled'}>↓</button><button class="btn" data-a="del" title="Убрать кадр"${s.frames.length > 1 ? '' : ' disabled'} aria-label="Убрать кадр ${k + 1}">×</button></div>`).join('')
+            + `<div class="msg">${o ? 'Длительности — это ключи «кадр» на таймлайне: их можно доправить там, но правка длительности здесь расставит ключи заново.' : 'Чтобы кадры сменялись, нажми ◆ «кадр» в ключах открытой анимации или создай спрайт заново.'}</div></div>`;
+    }
+    function drawThumbs(s) {
+        insBody.querySelectorAll('.fr').forEach(row => {
+            const c = row.querySelector('canvas'), d = frameData(s, +row.dataset.k); if (!c || !d) return;
+            const x = c.getContext('2d'), im = x.createImageData(s.w, s.h), u = new Uint32Array(im.data.buffer), bw = (s.w + 7) >> 3;
+            for (let j = 0; j < s.h; j++) for (let i = 0; i < s.w; i++) {
+                const on = s.mode === 'icon' ? d.bits[j * bw + (i >> 3)] & (0x80 >> (i & 7)) : !d.mask || d.mask[j * bw + (i >> 3)] & (0x80 >> (i & 7));
+                if (on) u[j * s.w + i] = toU32(s.mode === 'icon' ? s.c : d.px[j * s.w + i]);
+            }
+            x.putImageData(im, 0, 0);
+        });
+    }
+    function bindSpriteInspector(s) {
+        const box = insBody.querySelector('.frames'); if (!box) return; drawThumbs(s);
+        box.addEventListener('click', e => {
+            const b = e.target.closest('[data-a]'), row = e.target.closest('.fr'); if (!b || !row || b.disabled) return; const k = +row.dataset.k, o = trackOf(s.id, 'f');
+            if (b.dataset.a === 'show') {
+                // on the timeline: the playhead goes to the frame's first key; otherwise it becomes the frame the sprite shows
+                if (o) { const key = o.tr.keys.find(x => x.v === k); if (key) { if (o.a !== openAnim()) { AN.k = anims().indexOf(o.a); } AN.t = Math.min(key.t, o.a.dur); update(); } return; }
+                push(); s.f = k; update(); return;
+            }
+            push();
+            if (b.dataset.a === 'del') { s.frames.splice(k, 1); s.f = Math.min(s.f | 0, s.frames.length - 1); }
+            if (b.dataset.a === 'up' || b.dataset.a === 'down') { const j = b.dataset.a === 'up' ? k - 1 : k + 1; [s.frames[k], s.frames[j]] = [s.frames[j], s.frames[k]]; }
+            rebuildSpriteKeys(s); update();
+        });
+        box.addEventListener('change', e => {
+            if (!e.target.matches('[data-fd]')) return; const v = Math.round(+e.target.value);
+            if (!(v >= 1)) { update(); return; }
+            push(); s.frames[+e.target.closest('.fr').dataset.k].d = Math.min(60000, v); rebuildSpriteKeys(s); update();
+        });
+        document.getElementById('frAdd').onclick = () => { spriteFiles = s; fileIn.multiple = true; fileIn.click(); };
+        document.getElementById('frSplit').onclick = () => splitSprite(s);
+    }
+    // a new sprite at x, y; with several frames it gets its own looping animation with one key per frame
+    function addSprite(frames, x, y, nw, nh, w, h, at) {
+        const s = { t: 'sprite', x, y, w: w || nw, h: h || nh, nw, nh, mode: 'color', scale: 'nearest', thr: 128, inv: false, c: S.color, f: 0, frames };
+        s.name = shapeName('sprite'); if (S.colorPc) s.pc = S.colorPc;
+        S.shapes.splice(at == null ? S.shapes.length : at, 0, s); ensureIds();
+        if (frames.length > 1) {
+            const as = anims(), a = newAnim(uniqueName(s.name, as.map(x => x.name)));
+            a.tracks.push({ id: s.id, p: 'f', keys: [] }); as.push(a); rebuildSpriteKeys(s);
+            AN.k = as.length - 1; AN.t = 0; AN.sel = [];
+        }
+        return s;
+    }
+    // every selected object (a shape or a whole group) is a frame, in draw order; frames are aligned by their top-left corners
+    function spriteFromSel() {
+        const ns = selNodes(); if (ns.length < 2) return;
+        const frames = []; let W = 0, H = 0, X = 0, Y = 0;
+        for (const n of ns) {
+            const idx = nodeIdx(n).filter(i => !hiddenAt(i)); if (!idx.length) continue;
+            if (idx.some(i => S.shapes[i].t === 'sprite')) { flash('Спрайт не может быть кадром другого спрайта.'); return; }
+            const [bx, by, bw, bh] = boxOf(idx);
+            const shapes = idx.map(i => { const c = JSON.parse(JSON.stringify(S.shapes[i])); for (const k of ['g', 'id', 'vis', 'locked', 'hidden', 'var', 'erase', 'ec', 'epc']) delete c[k]; moveShape(c, -bx, -by); return c; });
+            if (!frames.length) { X = bx; Y = by; }
+            frames.push({ d: 100, shapes }); W = Math.max(W, bw); H = Math.max(H, bh);
+        }
+        if (frames.length < 2) { flash('Для спрайта нужно хотя бы два видимых кадра.'); return; }
+        push(); const at = Math.min(...S.sel); delSel(); const s = addSprite(frames, X, Y, W, H, 0, 0, at);
+        normalize(); setSelObjs([s]); S.tool = 'select'; update();
+    }
+    // back onto the canvas: a picture frame → a picture, a frame of shapes → a group «… · кадр N»; only the frame shown stays visible
+    function splitSprite(s) {
+        push(); const at = S.shapes.indexOf(s), cur = frameIdx(s), out = [];
+        s.frames.forEach((fr, k) => {
+            const name = `${s.name} · кадр ${k + 1}`;
+            if (fr.src) { const p = { t: 'img', x: s.x, y: s.y, w: s.w, h: s.h, src: fr.src, nw: fr.nw || s.w, nh: fr.nh || s.h, mode: s.mode, scale: s.scale, thr: s.thr, inv: s.inv, c: s.c, name }; if (s.pc) p.pc = s.pc; if (s.g != null) p.g = s.g; if (k !== cur) p.hidden = true; out.push(p); return; }
+            const gid = S.nextG++; S.groups.push(Object.assign({ id: gid, name, parent: s.g ?? null }, k !== cur ? { hidden: true } : {}));
+            for (const c0 of fr.shapes) { const c = JSON.parse(JSON.stringify(c0)); moveShape(c, s.x, s.y); c.g = gid; if (!c.name) c.name = shapeName(c.t); out.push(c); }
+        });
+        S.shapes.splice(at, 1, ...out); setSelObjs(out); normalize(); update();
+    }
+
+    // ---------- ready-made effects: each one becomes an ordinary animation with tracks that can be edited afterwards ----------
+    // [key, menu label, what it does, which shapes, name of the animation it makes]
+    const PULSE_T = ['rect', 'rrect', 'circle', 'line', 'tri'];
+    const FX = [
+        ['blink', 'Мигание', 'видимость: 500 мс видно, 500 мс нет', s => true, 'Мигание'],
+        ['pulse', 'Пульс: размер', 'плавно больше на 20 % и обратно', s => PULSE_T.includes(s.t), 'Пульс'],
+        ['pulsec', 'Пульс: цвет', 'цвет плавно светлеет и обратно', s => animProps(s).some(COLOR_P), 'Пульс цвета'],
+        ['marquee', 'Бегущая строка', 'текст едет справа налево внутри рамки, 40 px/с', s => s.t === 'text' && !s.var, 'Бегущая строка'],
+        ['spin', 'Спиннер', 'полный оборот за секунду; у нескольких фигур — вокруг общего центра', s => canRot(s), 'Спиннер'],
+        ['bar', 'Прогресс-бар', 'заполнение по значению 0…100: setProgress(v)', s => s.t === 'rect' || s.t === 'rrect', 'Прогресс'],
+    ];
+    function fxHtml(ss) {
+        const list = FX.filter(f => ss.length && ss.every(s => animProps(s).length && f[3](s)));
+        if (!list.length) return '';
+        return `<div class="row fx"><span class="set">Эффект</span><select id="fxSel" aria-label="Добавить готовый эффект"><option value="">— добавить —</option>${list.map(([k, n, t]) => `<option value="${k}" title="${t}">${n}</option>`).join('')}</select><span class="msg">станет новой анимацией с обычными ключами</span></div>`;
+    }
+    function bindFx() { const sel = document.getElementById('fxSel'); if (sel) sel.onchange = () => { const k = sel.value; sel.value = ''; if (k) applyFx(k, selShapes()); }; }
+    // a bigger copy of the geometry around its middle (pulse)
+    function pulsed(s) {
+        const k = v => Math.max(v + 2, Math.round(v * 1.2));
+        if (s.t === 'circle') return { r: Math.max(s.r + 1, Math.round(s.r * 1.2)) };
+        if (s.t === 'rect' || s.t === 'rrect') { const w = k(s.w), h = k(s.h); return { x: s.x - ((w - s.w) >> 1), y: s.y - ((h - s.h) >> 1), w, h }; }
+        const [bx, by, bw, bh] = bbox({ ...s, rot: 0 }), cx = bx + (bw - 1) / 2, cy = by + (bh - 1) / 2, out = {};
+        for (const p of ANIM_F[s.t]) out[p] = p[0] === 'x' ? Math.round(cx + (s[p] - cx) * 1.2) : Math.round(cy + (s[p] - cy) * 1.2);
+        return out;
+    }
+    function applyFx(kind, ss) {
+        const snap = snapshot(), fx = FX.find(f => f[0] === kind), as = anims(), a = newAnim(uniqueName(fx[4], as.map(x => x.name))), skipped = [];
+        const track = (s, p, keys) => {
+            const o = trackOf(s.id, p); if (o) { skipped.push(`«${propName(s, p)}» у «${s.name}» (в «${o.a.name}»)`); return; }
+            const tr = { id: s.id, p, keys: [] }; tr.keys = keys.map(([t, v, e, pc]) => newKey(tr, t, v, pc, e)); a.tracks.push(tr);
+        };
+        if (kind === 'blink') for (const s of ss) track(s, 'vis', [[0, 1], [500, 0]]);
+        if (kind === 'pulse') for (const s of ss) for (const [p, v] of Object.entries(pulsed(s))) track(s, p, [[0, s[p]], [500, v], [1000, s[p]]]);
+        if (kind === 'pulsec') for (const s of ss) for (const p of animProps(s).filter(COLOR_P)) { const [c, pc] = getP(s, p); track(s, p, [[0, c, 'inout', pc], [500, mix565(c, 0xFFFF, 512)], [1000, c, 'inout', pc]]); }
+        if (kind === 'marquee') {
+            let dur = 1000;
+            for (const s of ss) {
+                const was = JSON.stringify(s); s.scroll = true; s.sx = 0; s.align = 'left';
+                const tw = Math.max(1, measureStr(s.font, s.size, wrapText(s)[0] || '').w); dur = Math.max(dur, Math.round((s.w + tw) * 1000 / 40));
+                track(s, 'sx', [[0, s.w, 'linear'], [dur, -tw, 'linear']]); if (!a.tracks.some(tr => tr.id === s.id)) Object.assign(s, JSON.parse(was));
+            }
+            a.dur = dur; for (const tr of a.tracks) tr.keys[1].t = dur; // texts of different length: all keys at the end of the longest
+        }
+        if (kind === 'spin') {
+            const box = ss.length > 1 ? boxOf(S.sel) : null;
+            for (const s of ss) {
+                if (trackOf(s.id, 'rot')) { track(s, 'rot', []); continue; }
+                enableRot(s); if (box) { s.ox = box[0] + ((box[2] - 1) >> 1); s.oy = box[1] + ((box[3] - 1) >> 1); }
+                track(s, 'rot', [[0, s.rot, 'linear'], [1000, s.rot + 360, 'linear']]);
+            }
+        }
+        if (kind === 'bar') {
+            Object.assign(a, { mode: 'value', lo: 0, hi: 100, follow: 300 });
+            for (const s of ss) {
+                if (s.h > s.w) { track(s, 'y', [[0, s.y + s.h, 'linear'], [1000, s.y, 'linear']]); track(s, 'h', [[0, 0, 'linear'], [1000, s.h, 'linear']]); } // a tall bar fills from the bottom
+                else track(s, 'w', [[0, 0, 'linear'], [1000, s.w, 'linear']]);
+            }
+        }
+        if (skipped.length) flash('Уже анимируется в другой анимации, пропущено: ' + skipped.join(', ') + '.');
+        if (!a.tracks.length) { restore(snap); update(); return; }
+        push('', snap); as.push(a); stopPlay(); AN.k = as.length - 1; AN.t = 0; AN.sel = []; animBase = new Map(); update();
     }
     function bindTextInspector(s, i) {
         const ta = document.getElementById('insText');
@@ -1387,10 +1705,12 @@
         document.getElementById('fitH').onclick = () => { push(); s.h = Math.max(1, s.var ? textBounds(s.font, s.size, varText(s)).h : fontMetrics(s.font, s.size).block(Math.max(1, wrapText(s).length))); update(); };
         document.getElementById('insVar').onchange = e => {
             push();
-            if (e.target.checked) { s.var = uniqueVar('text', new Set(S.screens.flatMap(x => x.shapes.map(t => t.var)).filter(Boolean))); s.erase = 'bg'; s.ec = S.bg; s.text = (s.text || '').replace(/\n/g, ' '); }
+            if (e.target.checked) { s.var = uniqueVar('text', new Set(S.screens.flatMap(x => x.shapes.map(t => t.var)).filter(Boolean))); s.erase = 'bg'; s.ec = S.bg; s.text = (s.text || '').replace(/\n/g, ' '); delete s.scroll; delete s.sx; }
             else for (const k of ['var', 'erase', 'ec', 'epc']) delete s[k];
             update();
         };
+        const sc = document.getElementById('insScroll');
+        if (sc) sc.onchange = () => { push(); if (sc.checked) { s.scroll = true; s.sx = 0; } else { delete s.scroll; delete s.sx; } update(); };
         const vid = document.getElementById('insVarId');
         if (vid) vid.onchange = () => { const v = lead(vid.value.trim().replace(/[^A-Za-z0-9_]/g, '_')); if (v && v !== s.var) { push(); s.var = v; } update(); };
         const er = document.getElementById('insErase');
@@ -1547,16 +1867,18 @@
         const used = new Set(['W', 'H', 'canvas', 'lcd', 'present', 'setup', 'loop', 'lcbNow', ...S.palette.map(p => p.n)]);
         const take = (base, sep = '_') => { let n = base, k = 2; while (used.has(n)) n = base + sep + k++; used.add(n); return n; };
         const P = { fns: S.screens.map(sc => take('draw' + pascalId(sc.name), '')), shapes: new Map(), vis: [] };
-        S.screens.forEach((sc, k) => {
-            const vis = withScreen(k, () => S.shapes.filter((_, i) => !hiddenAt(i))); P.vis.push(vis);
+        S.screens.forEach((sc, k) => withScreen(k, () => { // frames of shapes are drawn on their own screen's background
+            const vis = S.shapes.filter((_, i) => !hiddenAt(i)); P.vis.push(vis);
             for (const s of vis) {
                 const e = {};
                 if (S.coordConsts && customName(s)) e.pre = take(upperId(s.name));
                 if (s.t === 'img') { e.arr = take(snakeId(s.name)); const d = imgData(s); if (d && d.mask && s.mode !== 'icon') e.mask = take(e.arr + '_mask'); }
+                // a sprite: one array per frame (sprite_1, sprite_2, …) and, in colour with holes, a mask for each
+                if (s.t === 'sprite') { e.arr = take(snakeId(s.name)); e.frames = s.frames.map((_, n) => take(`${e.arr}_${n + 1}`)); if (spriteMasked(s)) e.masks = e.frames.map(n => take(n + '_mask')); }
                 if (s.t === 'text' && s.var) e.fn = take(varFn(s.var), '');
                 P.shapes.set(s, e);
             }
-        });
+        }));
         // animations: anim<Name> state, start<Name>() / set<Name>(v), t<Name> local time, tick<Screen>(now), <anim>_<shape>_<prop> key arrays
         P.anim = !!anim; P.anims = S.screens.map(() => []); P.ticks = S.screens.map(() => '');
         if (anim) S.screens.forEach((sc, k) => {
@@ -1569,6 +1891,8 @@
                     const s = vis.get(tr.id), e = s && P.shapes.get(s); if (!e) continue; // hidden shapes are not in the sketch
                     const T = { arr: take(`${snakeId(a.name)}_${snakeId(s.name)}_${tr.p === 'c' || tr.p[0] !== 'g' ? tr.p : 'g' + (s.grad.stops.findIndex(st => 'g' + st.id === tr.p) + 1)}`), tv: A.tv, tr, s };
                     (e.anim = e.anim || {})[tr.p] = T; A.tracks.push(T);
+                    // an animated frame number picks the frame from tables of pointers: sprite_frames[f], sprite_masks[f]
+                    if (tr.p === 'f') { e.tab = take(e.arr + '_frames'); if (e.masks) e.mtab = take(e.arr + '_masks'); }
                 }
                 P.anims[k].push(A);
             }
@@ -1578,7 +1902,17 @@
         return P;
     }
     // a coordinate: the number, or NAME_X when the element has constants
-    const V = (s, e, k) => e && e.anim && e.anim[k] ? `lcbKey(${e.anim[k].arr}, ${e.anim[k].tv})` : e && e.pre ? `${e.pre}_${k.toUpperCase()}` : String(s[k]);
+    const V = (s, e, k) => e && e.anim && e.anim[k] ? `lcbKey(${e.anim[k].arr}, ${e.anim[k].tv})` : e && e.pre && FIELDS[s.t].includes(k) ? `${e.pre}_${k.toUpperCase()}` : String(s[k]);
+    // a property that is not a coordinate (angle, pivot, opacity, scroll shift, frame): its key array or its value
+    const animated = (e, p) => !!(e && e.anim && e.anim[p]);
+    const VA = (s, e, k) => animated(e, k) ? `lcbKey(${e.anim[k].arr}, ${e.anim[k].tv})` : String(k === 'o' ? opaOf(s) : s[k] | 0);
+    // a + b as C++: folded when both are numbers
+    const isNum = t => /^-?\d+$/.test(String(t));
+    const addE = (a, b) => isNum(a) && isNum(b) ? String(+a + +b) : isNum(b) ? plus(String(a), +b) : `${a} + ${b}`;
+    const halfE = t => isNum(t) ? String(Math.trunc(+t / 2)) : `${t} / 2`;
+    const opaOn = (s, e) => opaOf(s) < 255 || animated(e, 'o');
+    // turned on the board: a set angle, or an animated one (then also at 0°, which gives the same pixels as the plain call)
+    const rotOn = (s, e) => canRot(s) && s.rot != null && (s.rot % 360 !== 0 || animated(e, 'rot'));
     // the colour: a palette name, a literal, or the colour key array of the animation
     const colE = (s, e, p = 'c') => e && e.anim && e.anim[p] ? `lcbKeyC(${e.anim[p].arr}, ${e.anim[p].tv})` : colStr(s);
     // a position derived from x / y (text lines): relative to the coordinate when that is a name or an animated value
@@ -1593,19 +1927,62 @@
             case 'line': return `canvas.drawLine(${v('x0')}, ${v('y0')}, ${v('x1')}, ${v('y1')}, ${c});`;
             case 'tri': return `canvas.${p}Triangle(${v('x0')}, ${v('y0')}, ${v('x1')}, ${v('y1')}, ${v('x2')}, ${v('y2')}, ${c});`;
             case 'pixel': return `canvas.drawPixel(${v('x')}, ${v('y')}, ${c});`;
-            case 'img': return s.mode === 'icon' ? `canvas.drawBitmap(${v('x')}, ${v('y')}, ${e.arr}, ${v('w')}, ${v('h')}, ${c});`
-                : `canvas.drawRGBBitmap(${v('x')}, ${v('y')}, ${e.arr}, ${e.mask ? e.mask + ', ' : ''}${v('w')}, ${v('h')});`;
         }
     }
+    // a picture or a sprite: drawBitmap / drawRGBBitmap, through lcb… with a gradient or opacity, lcbRot…Bitmap when turned;
+    // a sprite's array is its frame f, or sprite_frames[f] while f is animated
+    function picCode(s, e) {
+        const v = k => V(s, e, k), icon = s.mode === 'icon', lcb = usesLcb(s, e), rot = rotOn(s, e);
+        let bmp = e.arr, mask = e.mask;
+        if (s.t === 'sprite') {
+            if (animated(e, 'f') && e.tab) { const f = VA(s, e, 'f'); bmp = `${e.tab}[${f}]`; mask = e.mtab ? `${e.mtab}[${f}]` : null; }
+            else { const f = frameIdx(s); bmp = e.frames[f]; mask = e.masks ? e.masks[f] : null; }
+        }
+        const xy = `${v('x')}, ${v('y')}`, wh = `${v('w')}, ${v('h')}`, R = rot ? `, ${VA(s, e, 'ox')}, ${VA(s, e, 'oy')}, ${VA(s, e, 'rot')}` : '';
+        if (icon) {
+            if (lcb) return lcbWrap(s, e, P => [rot ? `lcbRotBitmap(${xy}, ${bmp}, ${wh}, ${P}${R});` : `lcbDrawBitmap(${xy}, ${bmp}, ${wh}, ${P});`]);
+            return [rot ? `lcbRotBitmap(${xy}, ${bmp}, ${wh}, ${colE(s, e)}${R});` : `canvas.drawBitmap(${xy}, ${bmp}, ${wh}, ${colE(s, e)});`];
+        }
+        if (rot) return [`lcbRotRGBBitmap(${xy}, ${bmp}, ${mask || 'nullptr'}, ${wh}${R});`];
+        if (lcb) return [`lcbDrawRGBBitmap(${xy}, ${bmp}, ${mask || 'nullptr'}, ${wh});`]; // opacity
+        return [`canvas.drawRGBBitmap(${xy}, ${bmp}, ${mask ? mask + ', ' : ''}${wh});`];
+    }
+    // a turned shape: its points go through lcbRot(x, y, ox, oy, angle) on the board, then the usual call draws them;
+    // a rectangle becomes its four corners (two triangles / four lines, lcbFillQuad / lcbDrawQuad with a gradient)
+    function rotCode(s, e) {
+        const v = k => V(s, e, k), R = (x, y) => `lcbRot(${x}, ${y}, ${VA(s, e, 'ox')}, ${VA(s, e, 'oy')}, ${VA(s, e, 'rot')})`;
+        // the same shape with every coordinate already an expression; the turned ones become p….x / p….y
+        const r = { ...s }, e2 = { ...e, pre: undefined, anim: e && e.anim ? Object.fromEntries(Object.entries(e.anim).filter(([k]) => !FIELDS[s.t].includes(k))) : undefined };
+        for (const k of FIELDS[s.t]) r[k] = v(k);
+        let pts, body;
+        const call = () => usesLcb(s, e) ? lcbWrap(r, e2, P => [lcbCall(r, e2, P)]) : [codeLine(r, e2)];
+        if (s.t === 'line' || s.t === 'tri') {
+            pts = (s.t === 'line' ? [0, 1] : [0, 1, 2]).map(n => [`p${n}`, r['x' + n], r['y' + n]]);
+            for (const [n] of pts) { r['x' + n[1]] = n + '.x'; r['y' + n[1]] = n + '.y'; }
+            body = call();
+        } else if (s.t === 'circle' || s.t === 'pixel') { pts = [['p', r.x, r.y]]; r.x = 'p.x'; r.y = 'p.y'; body = call(); }
+        else if (s.t === 'rrect') { pts = [['p', addE(r.x, halfE(r.w)), addE(r.y, halfE(r.h))]]; r.x = isNum(r.w) ? plus('p.x', -Math.trunc(+r.w / 2)) : `p.x - ${r.w} / 2`; r.y = isNum(r.h) ? plus('p.y', -Math.trunc(+r.h / 2)) : `p.y - ${r.h} / 2`; body = call(); }
+        else { // rect: corners TL, TR, BR, BL
+            const x1 = addE(addE(r.x, r.w), -1), y1 = addE(addE(r.y, r.h), -1);
+            pts = [['p0', r.x, r.y], ['p1', x1, r.y], ['p2', x1, y1], ['p3', r.x, y1]];
+            const P = n => `p${n}.x, p${n}.y`, c = colE(s, e);
+            if (usesLcb(s, e)) body = lcbWrap(r, e2, Pt => [`lcb${s.fill ? 'Fill' : 'Draw'}Quad(${P(0)}, ${P(1)}, ${P(2)}, ${P(3)}, ${Pt});`]);
+            else body = s.fill ? [`canvas.fillTriangle(${P(0)}, ${P(1)}, ${P(2)}, ${c});`, `canvas.fillTriangle(${P(0)}, ${P(2)}, ${P(3)}, ${c});`]
+                : [[0, 1], [1, 2], [2, 3], [3, 0]].map(([a, b]) => `canvas.drawLine(${P(a)}, ${P(b)}, ${c});`);
+        }
+        return [`{ const LcbPt ${pts.map(([n, x, y]) => `${n} = ${R(x, y)}`).join(', ')};`, ...body.map((l, k, a) => '  ' + l + (k === a.length - 1 ? ' }' : ''))];
+    }
     // an animated text: every key's text is laid out by the editor, a switch picks the one of the moment
+    // a scrolling text: one line moved by sx, cut by its box (lcbClip … lcbNoClip)
     function textCode(s, st, e) {
-        const tt = e && e.anim && e.anim.text, texts = tt ? tt.tr.keys.map(k => k.v) : [s.text || ''];
+        const tt = e && e.anim && e.anim.text, texts = tt ? tt.tr.keys.map(k => k.v) : [s.text || ''], sc = scrolls(s);
         const lit = t => { const q = `"${cstr(t)}"`; return FONT_DATA[s.font] && FONT_DATA[s.font].cp && /[^\x00-\x7F]/.test(t) ? `cp1251(${q})` : q; };
-        const cases = line => texts.map(t => layoutText({ ...s, text: t }).flatMap(l => line(at(s, e, 'x', l.cx), at(s, e, 'y', l.cy), lit(l.t))));
+        const cases = line => texts.map(t => layoutText({ ...s, text: t }).flatMap(l => line(sc ? addE(at(s, e, 'x', l.cx), VA(s, e, 'sx')) : at(s, e, 'x', l.cx), at(s, e, 'y', l.cy), lit(l.t))));
         const pick = cs => tt ? [`switch (lcbKey(${tt.arr}, ${tt.tv})) {`, ...cs.flatMap((c, k) => [`  case ${k}:  // «${texts[k].replace(/\n/g, ' ')}»`, ...c.map(l => '    ' + l), '    break;']), '}'] : cs[0];
-        if (usesLcb(s)) { // gradient / smooth text: drawn by lcbText, the canvas text settings are left alone
+        if (usesLcb(s, e)) { // gradient / smooth / see-through / scrolling text: drawn by lcbText, the canvas text settings are left alone
             if (cases(() => ['']).every(c => !c.length)) return [];
-            return lcbWrap(s, e, P => pick(cases((cx, cy, q) => [lcbTextCall(s, e, P, cx, cy, q)])));
+            const body = lcbWrap(s, e, P => pick(cases((cx, cy, q) => [lcbTextCall(s, e, P, cx, cy, q)])));
+            return sc ? [`lcbClip(${V(s, e, 'x')}, ${V(s, e, 'y')}, ${V(s, e, 'w')}, ${V(s, e, 'h')});  // бегущая строка: только внутри рамки`, ...body, 'lcbNoClip();'] : body;
         }
         const out = [], col = colE(s, e);
         if (!st.wrap) { out.push('canvas.setTextWrap(false);  // переносы уже посчитаны редактором'); st.wrap = true; }
@@ -1617,7 +1994,9 @@
     function shapeCode(s, e, st) {
         // the function sets font, size and colour itself, so the next static text must set them again
         if (s.t === 'text' && s.var) { st.font = st.size = undefined; st.color = null; return [e.val ? `${e.fn}(${e.val}.c_str());` : `${e.fn}("${cstr(varText(s))}");`]; }
-        return s.t === 'text' ? textCode(s, st, e) : usesLcb(s) ? lcbWrap(s, e, P => [lcbCall(s, e, P)]) : [codeLine(s, e)];
+        const lines = s.t === 'text' ? textCode(s, st, e) : isPic(s) ? picCode(s, e) : rotOn(s, e) ? rotCode(s, e) : usesLcb(s, e) ? lcbWrap(s, e, P => [lcbCall(s, e, P)]) : [codeLine(s, e)];
+        // see-through: lcbOpacity() for the shape's pixels, then back to opaque
+        return opaOn(s, e) && lines.length ? [`lcbOpacity(${VA(s, e, 'o')});`, ...lines, 'lcbOpacity(255);'] : lines;
     }
     // drawing lines of screen k in draw order; named elements and groups get a «// name» comment; i/k point back at the shape
     function screenLines(k, P, unknown) {
@@ -1641,17 +2020,35 @@
     // PROGMEM arrays of a picture; data rows are marked so the panel can fold them
     const arrCache = new Map();
     function imgArrayLines(s, e) {
+        if (s.t === 'sprite') return spriteArrayLines(s, e);
         const d = imgData(s); if (!d) return [{ t: `// ${s.name}: картинка ещё загружается` }];
-        const key = [s.src, s.w, s.h, s.mode, s.scale, s.thr, s.inv, e.arr, e.mask, s.name].join('|'); let r = arrCache.get(key); if (r) return r;
+        return arrayLines(s, d, s.src, e.arr, e.mask, s.name);
+    }
+    function arrayLines(s, d, srcKey, arr, mask, title) {
+        const key = [srcKey, s.w, s.h, s.mode, s.scale, s.thr, s.inv, arr, mask, title].join('|'); let r = arrCache.get(key); if (r) return r;
         const rows = (vals, per, n) => { const o = []; for (let k = 0; k < vals.length; k += per) o.push({ t: '  ' + Array.from(vals.slice(k, k + per), v => '0x' + v.toString(16).toUpperCase().padStart(n, '0')).join(', ') + ',', data: true }); return o; };
         const icon = s.mode === 'icon';
-        r = [{ t: `// ${s.name}: ${s.w}×${s.h}, ${icon ? '1 бит на пиксель, для drawBitmap' : 'RGB565, для drawRGBBitmap' + (e.mask ? ' + маска прозрачности' : '')}` }];
-        if (icon) r.push({ t: `const uint8_t ${e.arr}[] PROGMEM = {` }, ...rows(d.bits, 16, 2), { t: '};' });
+        r = [{ t: `// ${title}: ${s.w}×${s.h}, ${icon ? '1 бит на пиксель, для drawBitmap' : 'RGB565, для drawRGBBitmap' + (mask ? ' + маска прозрачности' : '')}` }];
+        if (icon) r.push({ t: `const uint8_t ${arr}[] PROGMEM = {` }, ...rows(d.bits, 16, 2), { t: '};' });
         else {
-            r.push({ t: `const uint16_t ${e.arr}[] PROGMEM = {` }, ...rows(d.px, 12, 4), { t: '};' });
-            if (e.mask) r.push({ t: `const uint8_t ${e.mask}[] PROGMEM = {` }, ...rows(d.mask, 16, 2), { t: '};' });
+            r.push({ t: `const uint16_t ${arr}[] PROGMEM = {` }, ...rows(d.px, 12, 4), { t: '};' });
+            if (mask) r.push({ t: `const uint8_t ${mask}[] PROGMEM = {` }, ...rows(d.mask || new Uint8Array(((s.w + 7) >> 3) * s.h).fill(0xFF), 16, 2), { t: '};' }); // a frame without holes: a full mask
         }
-        if (arrCache.size > 32) arrCache.clear(); arrCache.set(key, r); return r;
+        if (arrCache.size > 256) arrCache.clear(); arrCache.set(key, r); return r;
+    }
+    // every frame as a picture; with an animated frame number also the tables the sketch indexes by it
+    function spriteArrayLines(s, e) {
+        const out = [];
+        s.frames.forEach((fr, k) => {
+            const d = frameData(s, k), title = `${s.name}, кадр ${k + 1} из ${s.frames.length}`;
+            if (!d) { out.push({ t: `// ${title}: ещё загружается` }); return; }
+            out.push(...arrayLines(s, d, fr.src || `${S.bg}|${JSON.stringify(fr.shapes)}`, e.frames[k], e.masks && e.masks[k], title), { t: '' });
+        });
+        const type = s.mode === 'icon' ? 'uint8_t' : 'uint16_t';
+        if (e.tab) out.push({ t: `// кадры «${s.name}» по номеру — для анимации` }, { t: `const ${type}* const ${e.tab}[] = { ${e.frames.join(', ')} };` });
+        if (e.mtab) out.push({ t: `const uint8_t* const ${e.mtab}[] = { ${e.masks.join(', ')} };` });
+        if (out.length && out[out.length - 1].t === '') out.pop();
+        return out;
     }
     // void drawTemp(const char* value): erase the block, set the style, place the value by getTextBounds and the block alignment
     function varFnLines(s, e, bg) {
@@ -1659,19 +2056,39 @@
         const er = s.erase === 'color' ? (s.epc && palEntry(s.epc) ? s.epc : fmt565(s.ec)) : bg;
         const cx = s.align === 'center' ? `${x} + (${w} - bw) / 2 - bx` : s.align === 'right' ? `${x} + ${w} - bw - bx` : `${x} - bx`;
         const cy = s.valign === 'middle' ? `${y} + (${h} - bh) / 2 - by` : s.valign === 'bottom' ? `${y} + ${h} - bh - by` : `${y} - by`;
-        const lcb = usesLcb(s);
+        const lcb = usesLcb(s, e), o = opaOf(s);
         return [`// меняющийся текст «${s.var}»${customName(s) ? ' — ' + s.name : ''}`, `void ${e.fn}(const char* value) {`,
-            `  canvas.fillRect(${x}, ${y}, ${w}, ${h}, ${er});  // стереть область блока`,
+            `  canvas.fillRect(${x}, ${y}, ${w}, ${h}, ${er});  // стереть область блока`, ...(o < 255 ? [`  lcbOpacity(${o});`] : []),
             s.font ? `  canvas.setFont(&${s.font});` : '  canvas.setFont();  // встроенный 5×7', `  canvas.setTextSize(${s.size});`, ...(lcb ? [] : [`  canvas.setTextColor(${colStr(s)});`]), '  canvas.setTextWrap(false);',
             ...(FONT_DATA[s.font] && FONT_DATA[s.font].cp ? ['  value = cp1251(value);  // UTF-8 → CP1251 для шрифта с кириллицей'] : []),
             '  // выравнивание считается на плате через getTextBounds', '  int16_t bx, by; uint16_t bw, bh;', '  canvas.getTextBounds(value, 0, 0, &bx, &by, &bw, &bh);',
             ...(lcb ? [...(gradOk(s) ? [`  const LcbPaint p = ${paintLit(s, e)};`] : []), '  ' + lcbTextCall(s, e, gradOk(s) ? 'p' : `lcbSolid(${colStr(s)})`, cx, cy, 'value')]
-                : [`  canvas.setCursor(${cx}, ${cy});`, '  canvas.print(value);']), '}'];
+                : [`  canvas.setCursor(${cx}, ${cy});`, '  canvas.print(value);']), ...(o < 255 ? ['  lcbOpacity(255);'] : []), '}'];
     }
-    // ---------- lcb…: gradients and anti-aliasing in the sketch (C++ twin of paintColor / px / aa… above) ----------
-    const usesLcb = s => gradOk(s) || aaOk(s);
-    function lcbLib(glcd) {
-        const lib = `// ---------- LCD Canvas Builder: градиенты и сглаживание ----------
+    // ---------- lcb…: gradients, anti-aliasing, opacity in the sketch (C++ twin of paintColor / px / aa… above) ----------
+    const usesLcb = (s, e) => gradOk(s) || aaOk(s) || opaOn(s, e) || scrolls(s);
+    // alpha: lcbOpacity() and the per-pixel blend it needs (a buffer of W × H bits); clip: lcbClip() for scrolling text
+    function lcbPutLines(alpha, clip) {
+        const L = [];
+        if (alpha) L.push('uint8_t lcbAlpha_ = 255;               // непрозрачность текущего элемента (lcbOpacity)', 'uint8_t lcbSeen_[(W * H + 7) / 8];     // пиксели, которые элемент уже смешал: каждый смешивается один раз',
+            '// непрозрачность 0…255 для следующих фигур; меньше 255 — каждый пиксель смешивается с тем, что уже на холсте', 'inline void lcbOpacity(uint8_t a) { lcbAlpha_ = a; if (a < 255) memset(lcbSeen_, 0, sizeof(lcbSeen_)); }');
+        if (clip) L.push('int16_t lcbCx0_ = 0, lcbCy0_ = 0, lcbCx1_ = 32767, lcbCy1_ = 32767;   // рамка, за которую не рисуем (бегущая строка)',
+            'inline void lcbClip(int16_t x, int16_t y, int16_t w, int16_t h) { lcbCx0_ = x; lcbCy0_ = y; lcbCx1_ = x + w; lcbCy1_ = y + h; }', 'inline void lcbNoClip() { lcbCx0_ = lcbCy0_ = 0; lcbCx1_ = lcbCy1_ = 32767; }');
+        if (L.length) L.push('');
+        L.push(`// пиксель цвета c с покрытием a из 16${alpha ? ' и непрозрачностью lcbAlpha_' : ''}: если меньше полного — смешивается с тем, что уже на холсте`,
+            'inline void lcbPut(int16_t x, int16_t y, uint16_t c, uint8_t a = 16) {', '  if (!a || x < 0 || y < 0 || x >= canvas.width() || y >= canvas.height()) return;');
+        if (clip) L.push('  if (x < lcbCx0_ || y < lcbCy0_ || x >= lcbCx1_ || y >= lcbCy1_) return;');
+        if (alpha) L.push('  int e = a * lcbAlpha_;   // из 16 × 255 = 4080', '  if (e < 4080) {', '    if (!e) return;',
+            '    if (lcbAlpha_ < 255) { uint32_t i = (uint32_t)y * W + x; uint8_t m = 1 << (i & 7); if (lcbSeen_[i >> 3] & m) return; lcbSeen_[i >> 3] |= m; }',
+            '    uint16_t b = canvas.getPixel(x, y);', '    int br = b >> 11, bg = (b >> 5) & 63, bb = b & 31, fr = c >> 11, fg = (c >> 5) & 63, fb = c & 31;',
+            '    c = (br + (fr - br) * e / 4080) << 11 | (bg + (fg - bg) * e / 4080) << 5 | (bb + (fb - bb) * e / 4080);', '  }');
+        else L.push('  if (a < 16) {', '    uint16_t b = canvas.getPixel(x, y);', '    int br = b >> 11, bg = (b >> 5) & 63, bb = b & 31, fr = c >> 11, fg = (c >> 5) & 63, fb = c & 31;',
+            '    c = (br + (fr - br) * a / 16) << 11 | (bg + (fg - bg) * a / 16) << 5 | (bb + (fb - bb) * a / 16);', '  }');
+        L.push('  canvas.drawPixel(x, y, c);', '}', '// пиксель цветом LcbPaint', 'inline void lcbPx(int16_t x, int16_t y, uint8_t a = 16) { if (x >= 0 && y >= 0 && x < canvas.width() && y < canvas.height()) lcbPut(x, y, lcbColor(x, y), a); }');
+        return L.join('\n');
+    }
+    function lcbLib(glcd, alpha, clip) {
+        const lib = `// ---------- LCD Canvas Builder: градиенты, сглаживание, непрозрачность ----------
 // Свои функции рисования: те же алгоритмы, что у Adafruit GFX, но цвет каждого пикселя берётся из LcbPaint,
 // а сглаженные фигуры смешиваются с тем, что уже нарисовано. Математика целочисленная и совпадает с превью.
 enum : uint8_t { LCB_SOLID, LCB_LINEAR, LCB_RADIAL };
@@ -1720,17 +2137,7 @@ inline uint16_t lcbColor(int16_t x, int16_t y) {
   return r << 11 | g << 5 | bl;
 }
 
-// пиксель с покрытием a из 16: при a < 16 смешивается с тем, что уже на холсте
-inline void lcbPx(int16_t x, int16_t y, uint8_t a = 16) {
-  if (!a || x < 0 || y < 0 || x >= canvas.width() || y >= canvas.height()) return;
-  uint16_t c = lcbColor(x, y);
-  if (a < 16) {
-    uint16_t b = canvas.getPixel(x, y);
-    int br = b >> 11, bg = (b >> 5) & 63, bb = b & 31, fr = c >> 11, fg = (c >> 5) & 63, fb = c & 31;
-    c = (br + (fr - br) * a / 16) << 11 | (bg + (fg - bg) * a / 16) << 5 | (bb + (fb - bb) * a / 16);
-  }
-  canvas.drawPixel(x, y, c);
-}
+${lcbPutLines(alpha, clip)}
 
 // ----- те же алгоритмы, что в Adafruit_GFX.cpp -----
 inline void lcbH(int16_t x, int16_t y, int16_t w) { if (w < 0) { w = -w; x -= w - 1; } for (int16_t i = 0; i < w; i++) lcbPx(x + i, y); }
@@ -1891,6 +2298,28 @@ inline void lcbDrawBitmap(int16_t x, int16_t y, const uint8_t* bitmap, int16_t w
     for (int16_t i = 0; i < w; i++) { if (i & 7) b <<= 1; else b = pgm_read_byte(&bitmap[j * bw + i / 8]); if (b & 0x80) lcbPx(x + i, y + j); }
   }
 }
+// картинка RGB565 (как drawRGBBitmap; mask — маска прозрачности или nullptr) — каждый пиксель через lcbPut
+inline void lcbDrawRGBBitmap(int16_t x, int16_t y, const uint16_t* bitmap, const uint8_t* mask, int16_t w, int16_t h) {
+  int16_t bw = (w + 7) / 8;
+  for (int16_t j = 0; j < h; j++) {
+    uint8_t b = 0;
+    for (int16_t i = 0; i < w; i++) {
+      if (mask) { if (i & 7) b <<= 1; else b = pgm_read_byte(&mask[j * bw + i / 8]); if (!(b & 0x80)) continue; }
+      lcbPut(x + i, y + j, pgm_read_word(&bitmap[j * w + i]));
+    }
+  }
+}
+inline void lcbDrawPixel(int16_t x, int16_t y, const LcbPaint& p) { lcbUse(p, x, y, 1, 1); lcbPx(x, y); }
+// повёрнутый прямоугольник по четырём углам (по кругу): два треугольника или четыре линии; градиент — по рамке углов
+inline void lcbBoxQuad(const LcbPaint& p, int16_t x0, int16_t y0, int16_t x1, int16_t y1, int16_t x2, int16_t y2, int16_t x3, int16_t y3) {
+  lcbBoxPts(p, min(min(x0, x1), min(x2, x3)), max(max(x0, x1), max(x2, x3)), min(min(y0, y1), min(y2, y3)), max(max(y0, y1), max(y2, y3)));
+}
+inline void lcbFillQuad(int16_t x0, int16_t y0, int16_t x1, int16_t y1, int16_t x2, int16_t y2, int16_t x3, int16_t y3, const LcbPaint& p) {
+  lcbBoxQuad(p, x0, y0, x1, y1, x2, y2, x3, y3); lcbFT(x0, y0, x1, y1, x2, y2); lcbFT(x0, y0, x2, y2, x3, y3);
+}
+inline void lcbDrawQuad(int16_t x0, int16_t y0, int16_t x1, int16_t y1, int16_t x2, int16_t y2, int16_t x3, int16_t y3, const LcbPaint& p) {
+  lcbBoxQuad(p, x0, y0, x1, y1, x2, y2, x3, y3); lcbLine(x0, y0, x1, y1); lcbLine(x1, y1, x2, y2); lcbLine(x2, y2, x3, y3); lcbLine(x3, y3, x0, y0);
+}
 // строка шрифтом GFXfont от курсора (x — начало, y — базовая линия), как print(); bx…bh — рамка текстового блока для градиента;
 // aa — сглаженная копия шрифта (только для шрифтов проекта)
 inline void lcbText(int16_t x, int16_t y, const char* s, const GFXfont* f, uint8_t size, const LcbPaint& p, int16_t bx, int16_t by, int16_t bw, int16_t bh, const LcbAlphaFont* aa = nullptr) {
@@ -1948,8 +2377,43 @@ inline void lcbText(int16_t x, int16_t y, const char* s, const GFXfont* f, uint8
             case 'circle': return `lcb${F}Circle(${v('x')}, ${v('y')}, ${v('r')}, ${P}, ${aa});`;
             case 'line': return `lcbDrawLine(${v('x0')}, ${v('y0')}, ${v('x1')}, ${v('y1')}, ${P}, ${aa});`;
             case 'tri': return `lcb${F}Triangle(${v('x0')}, ${v('y0')}, ${v('x1')}, ${v('y1')}, ${v('x2')}, ${v('y2')}, ${P}, ${aa});`;
-            case 'img': return `lcbDrawBitmap(${v('x')}, ${v('y')}, ${e.arr}, ${v('w')}, ${v('h')}, ${P});`;
+            case 'pixel': return `lcbDrawPixel(${v('x')}, ${v('y')}, ${P});`;
         }
+    }
+    // ---------- turning in the sketch (C++ twin of isin / rotPt / rotMap above) ----------
+    // put: how a turned picture writes a pixel — lcbPut when the lcb drawing functions are there (opacity), otherwise straight to the canvas
+    function lcbRotLib(map, paint) {
+        const rows = []; for (let k = 0; k <= 90; k += 10) rows.push('  ' + SIN_T.slice(k, Math.min(91, k + 10)).join(', ') + (k + 10 <= 90 ? ',' : ''));
+        const L = ['// ---------- LCD Canvas Builder: поворот ----------', '// sin целых градусов × 16384 (0…90°); точка поворачивается вокруг оси (ox, oy) по часовой стрелке, округление (v + 8192) >> 14',
+            'const int16_t lcbSinT[91] = {', ...rows, '};',
+            'inline int32_t lcbSin(int32_t a) { a %= 360; if (a < 0) a += 360; return a <= 90 ? lcbSinT[a] : a <= 180 ? lcbSinT[180 - a] : a <= 270 ? -lcbSinT[a - 180] : -lcbSinT[360 - a]; }',
+            'inline LcbPt lcbRot(int32_t x, int32_t y, int32_t ox, int32_t oy, int32_t a) {', '  int32_t s = lcbSin(a), c = lcbSin(a + 90), dx = x - ox, dy = y - oy;',
+            '  LcbPt p = { (int16_t)(ox + ((dx * c - dy * s + 8192) >> 14)), (int16_t)(oy + ((dx * s + dy * c + 8192) >> 14)) };', '  return p;', '}'];
+        if (!map) return L;
+        const put = paint ? 'lcbPut' : 'canvas.drawPixel';
+        L.push('// повёрнутая картинка: каждый пиксель экрана вокруг повёрнутых углов берёт пиксель картинки, из которого он пришёл (ближайший)',
+            'inline void lcbRotCorners(int16_t x, int16_t y, int16_t w, int16_t h, int16_t ox, int16_t oy, int32_t a, int16_t& xa, int16_t& xb, int16_t& ya, int16_t& yb) {',
+            '  LcbPt q[4] = { lcbRot(x, y, ox, oy, a), lcbRot(x + w - 1, y, ox, oy, a), lcbRot(x + w - 1, y + h - 1, ox, oy, a), lcbRot(x, y + h - 1, ox, oy, a) };',
+            '  xa = xb = q[0].x; ya = yb = q[0].y;',
+            '  for (int k = 1; k < 4; k++) { if (q[k].x < xa) xa = q[k].x; if (q[k].x > xb) xb = q[k].x; if (q[k].y < ya) ya = q[k].y; if (q[k].y > yb) yb = q[k].y; }', '}',
+            'template <typename F> inline void lcbRotMap(int16_t x, int16_t y, int16_t w, int16_t h, int16_t ox, int16_t oy, int32_t a, F put) {',
+            '  int32_t s = lcbSin(a), c = lcbSin(a + 90);', '  int16_t xa, xb, ya, yb;', '  lcbRotCorners(x, y, w, h, ox, oy, a, xa, xb, ya, yb);',
+            '  if (--xa < 0) xa = 0;', '  if (--ya < 0) ya = 0;', '  if (++xb > canvas.width() - 1) xb = canvas.width() - 1;', '  if (++yb > canvas.height() - 1) yb = canvas.height() - 1;',
+            '  for (int16_t Y = ya; Y <= yb; Y++) for (int16_t X = xa; X <= xb; X++) {',
+            '    int32_t dx = X - ox, dy = Y - oy, i = ox + ((dx * c + dy * s + 8192) >> 14) - x, j = oy + ((dy * c - dx * s + 8192) >> 14) - y;',
+            '    if (i >= 0 && j >= 0 && i < w && j < h) put(X, Y, i, j);', '  }', '}',
+            'inline void lcbRotRGBBitmap(int16_t x, int16_t y, const uint16_t* bitmap, const uint8_t* mask, int16_t w, int16_t h, int16_t ox, int16_t oy, int32_t a) {',
+            '  int16_t bw = (w + 7) / 8;',
+            '  lcbRotMap(x, y, w, h, ox, oy, a, [&](int16_t X, int16_t Y, int32_t i, int32_t j) {',
+            '    if (mask && !(pgm_read_byte(&mask[j * bw + i / 8]) & (0x80 >> (i & 7)))) return;', `    ${put}(X, Y, pgm_read_word(&bitmap[j * w + i]));`, '  });', '}',
+            'inline void lcbRotBitmap(int16_t x, int16_t y, const uint8_t* bitmap, int16_t w, int16_t h, uint16_t color, int16_t ox, int16_t oy, int32_t a) {',
+            '  int16_t bw = (w + 7) / 8;',
+            `  lcbRotMap(x, y, w, h, ox, oy, a, [&](int16_t X, int16_t Y, int32_t i, int32_t j) { if (pgm_read_byte(&bitmap[j * bw + i / 8]) & (0x80 >> (i & 7))) ${put}(X, Y, color); });`, '}');
+        if (paint) L.push('// то же с градиентом или непрозрачностью: градиент — по рамке повёрнутых углов',
+            'inline void lcbRotBitmap(int16_t x, int16_t y, const uint8_t* bitmap, int16_t w, int16_t h, const LcbPaint& p, int16_t ox, int16_t oy, int32_t a) {',
+            '  int16_t bw = (w + 7) / 8, xa, xb, ya, yb;', '  lcbRotCorners(x, y, w, h, ox, oy, a, xa, xb, ya, yb);', '  lcbBoxPts(p, xa, xb, ya, yb);',
+            '  lcbRotMap(x, y, w, h, ox, oy, a, [&](int16_t X, int16_t Y, int32_t i, int32_t j) { if (pgm_read_byte(&bitmap[j * bw + i / 8]) & (0x80 >> (i & 7))) lcbPx(X, Y); });', '}');
+        return L;
     }
     // one call, or a block with the gradient as a local constant
     const lcbWrap = (s, e, body) => gradOk(s) ? [`{ const LcbPaint p = ${paintLit(s, e)};`, ...body('p').map((l, k, a) => '  ' + l + (k === a.length - 1 ? ' }' : ''))] : body(`lcbSolid(${colE(s, e)})`);
@@ -2068,19 +2532,21 @@ inline uint32_t lcbTime(const LcbAnim& a) {
         const L = t => ({ t, i: -1 }), ind = l => ({ ...l, t: l.t ? '  ' + l.t : l.t });
         const pal = S.palette.map(p => L(`constexpr uint16_t ${p.n} = ${fmt565(p.c)};`));
         const all = P.vis.flatMap((v, k) => v.map(s => ({ s, k, e: P.shapes.get(s) })));
-        const imgs = all.filter(o => o.s.t === 'img'), vars = all.filter(o => o.s.t === 'text' && o.s.var), header = S.imgHeader && imgs.length > 0;
-        const arrays = () => imgs.flatMap(o => [...imgArrayLines(o.s, o.e).map(l => ({ i: -1, ...l })), L('')]);
+        const imgs = all.filter(o => isPic(o.s)), vars = all.filter(o => o.s.t === 'text' && o.s.var), header = S.imgHeader && imgs.length > 0;
+        const arrays = () => imgs.flatMap(o => [...withScreen(o.k, () => imgArrayLines(o.s, o.e)).map(l => ({ i: -1, ...l })), L('')]);
         if (S.codeMode === 'images' && header) return [L('// images.h — картинки для скетча'), L('#pragma once'), L('#include <Arduino.h>'), L(''), ...arrays()];
         if (S.codeMode === 'snippet') {
-            const cur = P.vis[S.cur], notes = [];
-            if (cur.some(s => s.t === 'img')) notes.push(L(`// массивы картинок — в режиме «весь скетч»${header ? ' (images.h)' : ''}`));
+            const cur = P.vis[S.cur], notes = [], E = s => P.shapes.get(s);
+            if (cur.some(isPic)) notes.push(L(`// массивы картинок — в режиме «весь скетч»${header ? ' (images.h)' : ''}`));
             if (cur.some(s => s.t === 'text' && s.var)) notes.push(L('// функции меняющегося текста — в режиме «весь скетч»'));
-            if (cur.some(usesLcb)) notes.push(L('// функции lcb… (градиенты и сглаживание) — в режиме «весь скетч»'));
+            if (cur.some(s => usesLcb(s, E(s)))) notes.push(L(`// функции lcb… (градиенты и сглаживание${cur.some(s => opaOn(s, E(s)) || scrolls(s)) ? ', непрозрачность, бегущая строка' : ''}) — в режиме «весь скетч»`));
+            if (cur.some(s => rotOn(s, E(s)))) notes.push(L('// поворот: LcbPt и lcbRot… — в режиме «весь скетч»'));
             if (S.screens[S.cur].anims.some(a => a.tracks.length)) notes.push(L('// анимации — в режиме «весь скетч»; здесь — кадр, на котором стоит бегунок'));
             const pre = [...pal, ...constLines(cur, P).map(L), ...notes], body = screenLines(S.cur, P, false);
             return pre.length ? [...pre, L(''), ...body] : body;
         }
         const fonts = [...new Set(all.filter(o => o.s.t === 'text' && o.s.font).map(o => o.s.font))], consts = all.flatMap(o => constLines([o.s], P)).map(L);
+        const paint = all.some(o => usesLcb(o.s, o.e)), rot = all.some(o => rotOn(o.s, o.e));
         const out = [
             L('#include <Waveshare_LCD147.h>'), L('#include <Adafruit_GFX.h>'), ...fonts.map(f => L(FONT_DATA[f] && FONT_DATA[f].custom ? `#include "${f}.h"  // шрифт проекта, файл — в разделе «Шрифты»` : `#include <Fonts/${f}.h>`)), ...(header ? [L('#include "images.h"')] : []), L(''),
             L(`constexpr int W = ${S.W};   // ширина экрана`), L(`constexpr int H = ${S.H};   // высота экрана`), L(''),
@@ -2089,7 +2555,9 @@ inline uint32_t lcbTime(const LcbAnim& a) {
             L('St7789* lcd;                 // драйвер (твоя библиотека)'), L('GFXcanvas16 canvas(W, H);    // холст в памяти, на нём рисуем'), L(''),
             ...(header ? [] : arrays()),
             ...(P.ticks.some(Boolean) ? [...lcbAnimTypes().map(t => ({ t, i: -1, lib: true })), L('')] : []),
-            ...(all.some(o => usesLcb(o.s)) ? [...lcbLib(all.some(o => o.s.t === 'text' && usesLcb(o.s) && !FONT_DATA[o.s.font])).map(t => ({ t, i: -1, lib: true })), L('')] : []),
+            ...(rot ? [L('struct LcbPt { int16_t x, y; };   // точка после поворота lcbRot() (типы — выше всех функций скетча)'), L('')] : []),
+            ...(paint ? [...lcbLib(all.some(o => o.s.t === 'text' && usesLcb(o.s, o.e) && !FONT_DATA[o.s.font]), all.some(o => opaOn(o.s, o.e)), all.some(o => scrolls(o.s))).map(t => ({ t, i: -1, lib: true })), L('')] : []),
+            ...(rot ? [...lcbRotLib(all.some(o => isPic(o.s) && rotOn(o.s, o.e)), paint).map(t => ({ t, i: -1, lib: true })), L('')] : []),
             ...(P.ticks.some(Boolean) ? [...lcbAnimLib().map(t => ({ t, i: -1, lib: true })), L('')] : []),
             L('// Показать холст на экране'), L('void present() {'), L('  lcd->drawImage(0, 0, W, H, canvas.getBuffer());'), L('}'), L(''),
             ...vars.flatMap(o => [...(o.e.val ? [L(`String ${o.e.val} = "${cstr(varText(o.s))}";  // значение «${o.s.var}»: экран с анимацией перерисовывается целиком каждый кадр`)] : []), ...varFnLines(o.s, o.e, bgExpr(S.screens[o.k])).map(L), L('')]),
@@ -2119,7 +2587,7 @@ inline uint32_t lcbTime(const LcbAnim& a) {
         out.push(L('}'));
         return out;
     }
-    const hasHeaderMode = () => S.imgHeader && S.screens.some(sc => sc.shapes.some(s => s.t === 'img'));
+    const hasHeaderMode = () => S.imgHeader && S.screens.some(sc => sc.shapes.some(isPic));
     function renderCode() {
         if (S.codeMode === 'images' && !hasHeaderMode()) S.codeMode = 'full';
         const lines = buildLines(), sel = new Set(S.sel), html = [];
@@ -2215,6 +2683,7 @@ inline uint32_t lcbTime(const LcbAnim& a) {
             v.align = !/\bbw\b/.test(a[0]) ? 'left' : /\/\s*2/.test(a[0]) ? 'center' : 'right'; v.valign = !/\bbh\b/.test(a[1] || '') ? 'top' : /\/\s*2/.test(a[1]) ? 'middle' : 'bottom';
             if (P) { v.c = P.c; v.pc = P.pc; v.grad = P.grad; } v.aa = !lt[1] && a.length > 10;
         }
+        const op = f.body.match(/\blcbOpacity\s*\(\s*(\d+)\s*\)/); if (op && +op[1] < 255) v.o = +op[1];
         return rect ? v : null;
     }
     // body of a block that starts at `from` (just after its '{'), braces matched outside string literals → index after the closing '}'
@@ -2266,12 +2735,15 @@ inline uint32_t lcbTime(const LcbAnim& a) {
             const x = Math.min(...g.lines.map(l => l.left)), r = Math.max(...g.lines.map(l => l.right));
             const align = g.lines.every(l => l.left === g.lines[0].left) ? 'left' : g.lines.every(l => l.right === g.lines[0].right) ? 'right' : 'center';
             const sh = { t: 'text', x, y: g.top, w: Math.max(1, r - x), h: fontMetrics(g.font, g.size).block(g.lines.length), text: g.lines.map(l => l.t).join('\n'), font: g.font, size: g.size, align, valign: 'top', c: g.c };
-            if (g.pc) sh.pc = g.pc; out.push(sh);
+            if (g.pc) sh.pc = g.pc; add(sh);
         };
         // canvas.fn(args); or a call of a changing-text function: drawTemp("example");
         // canvas.fn(…); | const LcbPaint p = {…}; | lcbFill…/lcbDraw…/lcbText…(…); | a changing-text call drawTemp("example");
-        const re = /canvas\s*\.\s*(\w+)\s*\(((?:"(?:\\.|[^"\\])*"|[^;"])*)\)\s*;|const\s+LcbPaint\s+(\w+)\s*=\s*\{((?:[^{};]|\{[^{}]*\})*)\}\s*;|\b(lcb(?:Fill|Draw)\w+|lcbText\w*)\s*\(((?:"(?:\\.|[^"\\])*"|[^;"])*)\)\s*;|\b([A-Za-z_]\w*)\s*\(\s*"((?:\\.|[^"\\])*)"\s*\)\s*;/g; let m;
-        const paints = {}; let tg = null;
+        // … | lcbOpacity(a); lcbClip(…); lcbRot…Bitmap(…); | const LcbPt p0 = lcbRot(…), p1 = …; (turned points: p0.x / p0.y in the calls after it)
+        const re = /canvas\s*\.\s*(\w+)\s*\(((?:"(?:\\.|[^"\\])*"|[^;"])*)\)\s*;|const\s+LcbPaint\s+(\w+)\s*=\s*\{((?:[^{};]|\{[^{}]*\})*)\}\s*;|\b(lcb(?:Fill|Draw|Rot)\w+|lcbText\w*|lcbOpacity|lcbClip|lcbNoClip)\s*\(((?:"(?:\\.|[^"\\])*"|[^;"])*)\)\s*;|\b([A-Za-z_]\w*)\s*\(\s*"((?:\\.|[^"\\])*)"\s*\)\s*;|const\s+LcbPt\s+([^;]*);/g; let m;
+        const paints = {}, pts = {}; let tg = null, opaCur = 255;
+        const sub = t => t && t.replace(/\b([A-Za-z_]\w*)\s*\.\s*([xy])\b/g, (q, n, k) => pts[n] ? String(pts[n][k === 'x' ? 0 : 1]) : q);
+        const add = sh => { if (opaCur < 255) sh.o = opaCur; out.push(sh); };
         // consecutive lcbText lines of one block → one text block; its alignment is the one whose layout gives exactly these cursors
         const flushT = () => {
             if (!tg) return; const g = tg; tg = null;
@@ -2280,11 +2752,23 @@ inline uint32_t lcbTime(const LcbAnim& a) {
                 const L = layoutText({ ...sh, align: al, valign: va });
                 if (L.length === g.lines.length && L.every((l, k) => l.t === g.lines[k].t && l.cx === g.lines[k].cx && l.cy === g.lines[k].cy)) { sh.align = al; sh.valign = va; break search; }
             }
-            setPaint(sh, g.P); if (g.aa) sh.aa = true; out.push(sh);
+            setPaint(sh, g.P); if (g.aa) sh.aa = true; add(sh);
         };
         const lcbShape = (fn, a) => {
             const num = t => evalNum(t, pal, vars);
-            if (fn === 'lcbDrawBitmap') { ctx.imgSkipped++; return; }
+            if (/Bitmap$/.test(fn)) { ctx.imgSkipped++; return; }
+            if (fn === 'lcbOpacity') { flush(); flushT(); const o = num(a[0] || ''); opaCur = o == null ? 255 : Math.max(0, Math.min(255, o)); return; }
+            if (fn === 'lcbClip' || fn === 'lcbNoClip') return; // a scrolling text comes in as plain text where it stands
+            if (fn === 'lcbDrawPixel') { const n = a.slice(0, 2).map(num), P = paintArg(a[2], ctx, paints); if (n.some(x => x == null) || !P) { ctx.skipped++; return; } flush(); flushT(); const sh = { t: 'pixel', x: n[0], y: n[1] }; setPaint(sh, P); delete sh.grad; add(sh); return; }
+            // a turned rectangle: its four corners → two triangles / four lines
+            const q = fn.match(/^lcb(Fill|Draw)Quad$/);
+            if (q) {
+                const n = a.slice(0, 8).map(num), P = paintArg(a[8], ctx, paints); if (n.length < 8 || n.some(x => x == null) || !P) { ctx.skipped++; return; }
+                flush(); flushT(); const p = k => [n[2 * k], n[2 * k + 1]];
+                const parts = q[1] === 'Fill' ? [[0, 1, 2], [0, 2, 3]].map(([i, j, k]) => ({ t: 'tri', fill: true, x0: p(i)[0], y0: p(i)[1], x1: p(j)[0], y1: p(j)[1], x2: p(k)[0], y2: p(k)[1] }))
+                    : [[0, 1], [1, 2], [2, 3], [3, 0]].map(([i, j]) => ({ t: 'line', x0: p(i)[0], y0: p(i)[1], x1: p(j)[0], y1: p(j)[1] }));
+                for (const sh of parts) { setPaint(sh, P); add(sh); } return;
+            }
             if (fn === 'lcbText' || fn === 'lcbTextGlcd') {
                 const glcd = fn === 'lcbTextGlcd', o = glcd ? 3 : 4, t = strArg(a[2]), font = glcd ? '' : (a[3] || '').replace(/^&/, '');
                 const nums = [a[0], a[1], a[o], a[o + 2], a[o + 3], a[o + 4], a[o + 5]].map(num), P = paintArg(a[o + 1], ctx, paints);
@@ -2302,18 +2786,26 @@ inline uint32_t lcbTime(const LcbAnim& a) {
             flush(); flushT();
             const sh = { t: D[0] }; if (META[D[0]].canFill) sh.fill = k[1] === 'Fill'; D[1].forEach((key, i) => sh[key] = nums[i]); setPaint(sh, P);
             if (/^\s*true\s*$/.test(a[D[1].length + 1] || '')) sh.aa = true;
-            out.push(sh);
+            add(sh);
         };
         while ((m = re.exec(src))) {
+            if (m[9]) { // turned points are worked out here, as lcbRot() does on the board
+                for (const d of splitArgs(m[9])) {
+                    const r = d.match(/^(\w+)\s*=\s*lcbRot\s*\((.*)\)$/s); if (!r) continue;
+                    const a = splitArgs(sub(r[2])).map(t => evalNum(t, pal, vars)); if (a.length === 5 && a.every(x => x != null)) pts[r[1]] = rotPt(...a);
+                }
+                continue;
+            }
+            m[2] = sub(m[2]); m[6] = sub(m[6]);
             if (m[3]) { const g = parsePaint(m[4], ctx); if (g) paints[m[3]] = g; continue; }
             if (m[5]) { lcbShape(m[5], splitArgs(m[6])); continue; }
             if (m[7]) { m[3] = m[7]; m[4] = m[8]; }
             if (m[3]) {
                 const v = ctx.varFns[m[3]]; if (!v) continue; flush(); flushT();
                 const sh = { t: 'text', x: v.x, y: v.y, w: v.w, h: v.h, text: cunesc(m[4]), font: v.font, size: v.size, align: v.align, valign: v.valign, c: v.c, var: m[3].replace(/^draw(?=\w)/, '').replace(/^\w/, ch => ch.toLowerCase()) };
-                if (v.pc) sh.pc = v.pc; if (v.grad) sh.grad = JSON.parse(JSON.stringify(v.grad)); if (v.aa) sh.aa = true;
+                if (v.pc) sh.pc = v.pc; if (v.grad) sh.grad = JSON.parse(JSON.stringify(v.grad)); if (v.aa) sh.aa = true; if (v.o != null) sh.o = v.o;
                 if (v.eraseExpr === bgRaw) sh.erase = 'bg'; else { sh.erase = 'color'; sh.ec = v.ec; if (v.epc) sh.epc = v.epc; }
-                out.push(sh); ts.font = v.font; ts.size = v.size; ts.c = v.c; ts.pc = v.pc; continue;
+                add(sh); ts.font = v.font; ts.size = v.size; ts.c = v.c; ts.pc = v.pc; continue;
             }
             const fn = m[1], raw = m[2].trim(); flushT(); // keep the order of blocks
             if (fn === 'print' || fn === 'println') {
@@ -2347,7 +2839,7 @@ inline uint32_t lcbTime(const LcbAnim& a) {
             const D = T[k[2]]; if (args.length !== D[1].length + 1) { ctx.skipped++; continue; }
             flush(); flushT();
             const sh = { t: D[0] }; if (META[D[0]].canFill) sh.fill = k[1] === 'fill'; D[1].forEach((key, i) => sh[key] = args[i]); sh.c = args[args.length - 1];
-            const pc = pcOf(parts[parts.length - 1]); if (pc) sh.pc = pc; out.push(sh);
+            const pc = pcOf(parts[parts.length - 1]); if (pc) sh.pc = pc; add(sh);
         }
         flush(); flushT();
         return { out, bg, bgPc };
@@ -2474,7 +2966,7 @@ inline uint32_t lcbTime(const LcbAnim& a) {
         if (h !== tlHtml) { tlEl.innerHTML = tlHtml = h; }
         renderPlayhead();
     }
-    function keyValue(tr, k) { return tr.p === 'vis' ? (k.v ? 'видна' : 'скрыта') : tr.p === 'text' ? '«' + k.v + '»' : COLOR_P(tr.p) ? (k.pc || fmt565(k.v)) : String(k.v); }
+    function keyValue(tr, k) { return tr.p === 'vis' ? (k.v ? 'видна' : 'скрыта') : tr.p === 'text' ? '«' + k.v + '»' : COLOR_P(tr.p) ? (k.pc || fmt565(k.v)) : tr.p === 'f' ? 'кадр ' + (k.v + 1) : String(k.v); }
     // selected keys: one → time, value and easing; several → common easing
     function keyEditor(a) {
         if (!AN.sel.length) return '';
@@ -2485,7 +2977,7 @@ inline uint32_t lcbTime(const LcbAnim& a) {
         if (tr.p === 'vis') val = `<label class="set"><input type="checkbox" id="kfVis"${k.v ? ' checked' : ''}> видна</label>`;
         else if (tr.p === 'text') val = `<input type="text" id="kfText" value="${escA(k.v)}" style="width:160px" aria-label="Текст">`;
         else if (COLOR_P(tr.p)) val = `<input type="color" id="kfC" value="${toHex(k.v)}" aria-label="Цвет">${S.palette.length ? `<select id="kfPc" aria-label="Из палитры"><option value="">${fmt565(k.v)}</option>${S.palette.map(p => `<option${p.n === k.pc ? ' selected' : ''}>${p.n}</option>`).join('')}</select>` : `<span class="spec">${fmt565(k.v)}</span>`}`;
-        else val = `<input type="number" id="kfV" value="${k.v}" style="width:64px" aria-label="Значение">`;
+        else val = `<input type="number" id="kfV" value="${tr.p === 'f' ? k.v + 1 : k.v}" style="width:64px" aria-label="${tr.p === 'f' ? 'Номер кадра' : 'Значение'}">`;
         return `<div class="tl-key"><span class="set"><b>${esc(s.name)}</b> · ${esc(propName(s, tr.p))}</span><label class="set">${a.mode === 'value' ? 'значение' : 'время, мс'} <input type="number" id="kfT" value="${a.mode === 'value' ? tValue(a, k.t) : k.t}" style="width:72px"></label>${val}${eSel}<button class="btn danger" id="kfDel">Удалить</button></div>`;
     }
     function renderPlayhead() {
@@ -2576,7 +3068,7 @@ inline uint32_t lcbTime(const LcbAnim& a) {
             let t = num(a.mode === 'value' ? Math.min(a.lo, a.hi) : 0, a.mode === 'value' ? Math.max(a.lo, a.hi) : a.dur);
             if (t != null) { if (a.mode === 'value') t = valueT(a, t); if (t !== k.t) { push(); moveKeys(new Map([[k, t]])); } }
         }
-        if (tr && id === 'kfV') { const v = num(-32768, 32767); if (v != null) { push(); k.v = v; } }
+        if (tr && id === 'kfV') { const v = num(-32768, 32767); if (v != null) { push(); k.v = tr.p === 'f' ? Math.max(0, v - 1) : v; } }
         if (tr && id === 'kfText') { push(); k.v = e.target.value; }
         if (tr && id === 'kfVis') { push(); k.v = e.target.checked ? 1 : 0; }
         if (tr && id === 'kfPc') { const p = palEntry(e.target.value); push(); if (p) { k.v = p.c; k.pc = p.n; } else delete k.pc; }
@@ -2655,37 +3147,70 @@ inline uint32_t lcbTime(const LcbAnim& a) {
     function flash(t) { stageMsg.textContent = t; clearTimeout(flashT); flashT = setTimeout(() => { stageMsg.textContent = saveBad ? SAVE_ERR : ''; }, 4000); }
     const SAVE_ERR = 'Не удалось сохранить в localStorage: не хватает места (скорее всего, из-за картинок). Изменения пропадут после перезагрузки.';
     function saveFailed(bad) { if (bad === saveBad) return; saveBad = bad; const el = document.getElementById('stageMsg'); if (el) el.textContent = bad ? SAVE_ERR : ''; }
-    function addImageFile(file, at) {
-        if (!file || !/^image\/(png|jpeg|svg\+xml|gif|webp)$/.test(file.type)) { flash('Нужна картинка PNG, JPG или SVG.'); return; }
-        const rd = new FileReader(); rd.onload = () => addImageUrl(rd.result, file.name, at); rd.readAsDataURL(file);
+    const readUrl = f => new Promise((ok, no) => { const rd = new FileReader(); rd.onload = () => ok(rd.result); rd.onerror = no; rd.readAsDataURL(f); });
+    // → {id, nw, nh}: the picture becomes an asset; big rasters are kept downscaled so that localStorage holds them
+    function loadPicture(url) {
+        return new Promise((ok, no) => {
+            const img = new Image();
+            img.onload = () => {
+                let nw = img.naturalWidth || 64, nh = img.naturalHeight || 64;
+                if (!url.startsWith('data:image/svg') && Math.max(nw, nh) > 1024) {
+                    const k = 1024 / Math.max(nw, nh), c = document.createElement('canvas'); c.width = Math.round(nw * k); c.height = Math.round(nh * k);
+                    c.getContext('2d').drawImage(img, 0, 0, c.width, c.height); url = c.toDataURL('image/png'); nw = c.width; nh = c.height;
+                }
+                const id = 'a' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7); S.assets[id] = url; assetsVer++;
+                ok({ id, nw, nh });
+            };
+            img.onerror = no; img.src = url;
+        });
     }
-    function addImageUrl(url, fname, at) {
-        const img = new Image();
-        img.onload = () => {
-            let nw = img.naturalWidth || 64, nh = img.naturalHeight || 64;
-            // big rasters are kept downscaled so that localStorage holds them
-            if (!url.startsWith('data:image/svg') && Math.max(nw, nh) > 1024) {
-                const k = 1024 / Math.max(nw, nh), c = document.createElement('canvas'); c.width = Math.round(nw * k); c.height = Math.round(nh * k);
-                c.getContext('2d').drawImage(img, 0, 0, c.width, c.height); url = c.toDataURL('image/png'); nw = c.width; nh = c.height;
+    // an animated GIF → its frames (composited) with their durations; null when it has one frame or the browser can't decode it
+    async function gifFrames(file) {
+        if (file.type !== 'image/gif' || !('ImageDecoder' in window)) return null;
+        try {
+            const dec = new ImageDecoder({ data: await file.arrayBuffer(), type: 'image/gif' }); await dec.tracks.ready;
+            const n = Math.min(120, dec.tracks.selectedTrack.frameCount); if (n < 2) return null;
+            const out = [];
+            for (let k = 0; k < n; k++) {
+                const { image } = await dec.decode({ frameIndex: k }), c = document.createElement('canvas'); c.width = image.displayWidth; c.height = image.displayHeight;
+                c.getContext('2d').drawImage(image, 0, 0); out.push({ url: c.toDataURL('image/png'), d: Math.max(10, Math.round((image.duration || 100000) / 1000)) }); image.close();
             }
-            const k = Math.min(1, S.W / nw, S.H / nh), w = Math.max(1, Math.round(nw * k)), h = Math.max(1, Math.round(nh * k));
-            const id = 'a' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7); S.assets[id] = url; assetsVer++;
-            const x = at ? at.x - (w >> 1) : Math.round((S.W - w) / 2), y = at ? at.y - (h >> 1) : Math.round((S.H - h) / 2);
-            push(); const s = { t: 'img', x, y, w, h, src: id, nw, nh, mode: 'color', scale: 'avg', thr: 128, inv: false, c: S.color }; addShape(s);
-            const base = (fname || '').replace(/\.[^.]*$/, '').trim(); if (base) s.name = base;
-            S.tool = 'select'; update();
-        };
-        img.onerror = () => flash('Не удалось прочитать картинку.');
-        img.src = url;
+            return out;
+        } catch (e) { return null; }
     }
-    fileIn.addEventListener('change', () => { if (fileIn.files[0]) addImageFile(fileIn.files[0]); fileIn.value = ''; });
-    document.getElementById('imgBtn').addEventListener('click', () => fileIn.click());
+    // one picture → a picture; several files or an animated GIF → a sprite (frames in file name order); spriteFiles: add them as frames to that sprite
+    let spriteFiles = null;
+    async function addImageFiles(files, at) {
+        const target = spriteFiles; spriteFiles = null;
+        files = files.filter(f => /^image\/(png|jpeg|svg\+xml|gif|webp)$/.test(f.type)).sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+        if (!files.length) { flash('Нужна картинка PNG, JPG, GIF или SVG.'); return; }
+        try {
+            const gif = files.length === 1 ? await gifFrames(files[0]) : null;
+            const srcs = gif || (await Promise.all(files.map(readUrl))).map(url => ({ url, d: 100 }));
+            const pics = []; for (const f of srcs) pics.push({ ...(await loadPicture(f.url)), d: f.d });
+            if (target && S.shapes.includes(target)) {
+                push(); const d = target.frames.length ? target.frames[target.frames.length - 1].d : 100;
+                target.frames.push(...pics.map(p => ({ d: gif ? p.d : d, src: p.id, nw: p.nw, nh: p.nh }))); rebuildSpriteKeys(target); update(); return;
+            }
+            const { nw, nh } = pics[0], k = Math.min(1, S.W / nw, S.H / nh), w = Math.max(1, Math.round(nw * k)), h = Math.max(1, Math.round(nh * k));
+            const x = at ? at.x - (w >> 1) : Math.round((S.W - w) / 2), y = at ? at.y - (h >> 1) : Math.round((S.H - h) / 2), base = files[0].name.replace(/\.[^.]*$/, '').trim();
+            push(); let s;
+            if (pics.length === 1) { s = { t: 'img', x, y, w, h, src: pics[0].id, nw, nh, mode: 'color', scale: 'avg', thr: 128, inv: false, c: S.color }; addShape(s); }
+            else { s = addSprite(pics.map(p => ({ d: p.d, src: p.id, nw: p.nw, nh: p.nh })), x, y, nw, nh, w, h); s.scale = 'avg'; setSelObjs([s]); }
+            if (base && (pics.length === 1 || gif)) s.name = base;
+            S.tool = 'select'; update();
+        } catch (e) { flash('Не удалось прочитать картинку.'); }
+    }
+    const addImageFile = (file, at) => addImageFiles(file ? [file] : [], at);
+    fileIn.addEventListener('change', () => { const fs = [...fileIn.files]; fileIn.value = ''; fileIn.multiple = true; if (fs.length) addImageFiles(fs); else spriteFiles = null; });
+    fileIn.addEventListener('cancel', () => { spriteFiles = null; });
+    document.getElementById('imgBtn').addEventListener('click', () => { spriteFiles = null; fileIn.click(); });
     stage.addEventListener('dragover', e => { if ([...e.dataTransfer.types].includes('Files')) { e.preventDefault(); stage.classList.add('drop'); } });
     stage.addEventListener('dragleave', e => { if (!stage.contains(e.relatedTarget)) stage.classList.remove('drop'); });
     stage.addEventListener('drop', e => {
-        stage.classList.remove('drop'); const f = [...e.dataTransfer.files][0]; if (!f) return; e.preventDefault();
+        stage.classList.remove('drop'); const fs = [...e.dataTransfer.files]; if (!fs.length) return; e.preventDefault(); spriteFiles = null;
         const r = view.getBoundingClientRect(), inside = e.clientX >= r.left && e.clientX < r.right && e.clientY >= r.top && e.clientY < r.bottom;
-        addImageFile(f, inside ? { x: Math.floor((e.clientX - r.left) / scale), y: Math.floor((e.clientY - r.top) / scale) } : null);
+        addImageFiles(fs, inside ? { x: Math.floor((e.clientX - r.left) / scale), y: Math.floor((e.clientY - r.top) / scale) } : null);
     });
     // Ctrl/⌘+V pastes the internal clipboard at once; if the same keystroke brings an image from the system clipboard, that paste is taken back and the image wins
     let justPasted = false, sysCopy = false, clipText = '';
@@ -2812,7 +3337,7 @@ inline uint32_t lcbTime(const LcbAnim& a) {
         if (b.dataset.a === 'dl') download(f.n + '.h', fontHeader(f));
         if (b.dataset.a === 'copy') navigator.clipboard.writeText(fontHeader(f)).then(() => { fontMsg.textContent = `Скопировано: ${f.n}.h`; }, () => download(f.n + '.h', fontHeader(f)));
         if (b.dataset.a === 'del') {
-            const used = S.screens.some(sc => sc.shapes.some(s => s.t === 'text' && s.font === f.n));
+            const used = S.screens.some(sc => deepShapes(sc.shapes).some(s => s.t === 'text' && s.font === f.n));
             if (used) { fontMsg.textContent = `${f.n} используется в тексте — сначала выбери там другой шрифт.`; return; }
             S.fonts = S.fonts.filter(x => x !== f); delete FONT_DATA[f.n]; if (S.textFont === f.n) S.textFont = ''; fontMsg.textContent = ''; update();
         }
@@ -3116,7 +3641,7 @@ void loop() {
         const map = { v: 'select', r: 'rect', o: 'rrect', c: 'circle', l: 'line', y: 'tri', p: 'pixel', t: 'text' };
         if (map[k.toLowerCase()]) { setTool(map[k.toLowerCase()]); return; }
         if (k.toLowerCase() === 'f') { toggleFill(); return; }
-        if (e.code === 'KeyI') { fileIn.click(); return; }
+        if (e.code === 'KeyI') { spriteFiles = null; fileIn.click(); return; }
         if (k === 'Escape') { triPts = null; preview = null; S.sel = []; AN.sel = []; update(); return; }
         if ((k === 'Delete' || k === 'Backspace') && S.sel.length) { e.preventDefault(); act('del'); return; }
         const arrows = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
@@ -3131,7 +3656,7 @@ void loop() {
         animDetect(); syncPalette(); animClean(); animFix(); animApply();
         renderTimeline(); render(); status(); renderCode(); renderLayers(); renderPalette(); renderBgPc(); renderTabs(); renderFonts();
         if (!fast || !insBody.contains(document.activeElement)) renderInspector();
-        else { const s = one(); if (s) insBody.querySelectorAll('input[data-k]').forEach(inp => { if (inp !== document.activeElement) inp.value = s[inp.dataset.k]; }); }
+        else { const s = one(); if (s) insBody.querySelectorAll('input[data-k]').forEach(inp => { if (inp !== document.activeElement) inp.value = fieldVal(s, inp.dataset.k); }); }
         rail.querySelectorAll('[data-tool]').forEach(b => b.setAttribute('aria-pressed', b.dataset.tool === S.tool));
         const ss = selShapes(), fb = document.getElementById('fillBtn'), f0 = ss.find(s => META[s.t].canFill), fillOn = f0 ? f0.fill : S.fill;
         fb.setAttribute('aria-pressed', !!fillOn); fb.textContent = fillOn ? 'fill' : 'draw';
