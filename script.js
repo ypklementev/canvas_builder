@@ -1410,8 +1410,7 @@
         insTitle.textContent = !S.sel.length ? `Экран «${S.screens[S.cur].name}»` : s ? 'Фигура' : 'Выделение';
         if (!S.sel.length) {
             insBtns.innerHTML = '';
-            insBody.innerHTML = `<div class="empty">Ничего не выбрано — здесь настройки экрана. Новые фигуры: <b>${S.fill ? 'заливка' : 'контур'}</b>, цвет ${S.colorPc || fmt565(S.color)}, радиус скругления <input type="number" id="inRad" value="${S.radius}" style="width:52px" aria-label="Радиус для новых скруглённых">.</div>`;
-            document.getElementById('inRad').onchange = e => { S.radius = Math.max(0, +e.target.value | 0); save(); };
+            insBody.innerHTML = `<div class="empty">Ничего не выбрано — здесь настройки экрана. Новые фигуры: <b>${S.fill ? 'заливка' : 'контур'}</b>, цвет ${S.colorPc || fmt565(S.color)}.</div>`;
             return;
         }
         if (!s) return renderMulti();
@@ -1440,6 +1439,7 @@
             push('f' + i + k);
             if (k === 'o') v = Math.max(0, Math.min(255, v));
             if (k === 'rot' || k === 'ox' || k === 'oy') enableRot(s);
+            if (s.t === 'rrect' && k === 'r') S.radius = Math.max(0, v); // the next rounded rectangle takes the last radius set
             setP(s, k, v, ''); update(true);
         }));
     }
